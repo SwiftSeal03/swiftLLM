@@ -11,7 +11,6 @@ class EngineConfig:
     use_dummy: bool
 
     # PagedAttention-related parameters
-    block_size: int
     gpu_mem_utilization: float
     num_cpu_blocks: int
     max_seqs_in_block_table: int

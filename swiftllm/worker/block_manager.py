@@ -15,10 +15,9 @@ class BlockManager:
     kernels for fast operations.
     """
 
-    def __init__(self, num_blocks: int, max_seqs_in_block_table: int, max_blocks_per_seq: int, block_size: int):
+    def __init__(self, num_blocks: int, max_seqs_in_block_table: int, max_blocks_per_seq: int):
         self.num_free_blocks = num_blocks
         self.num_blocks = num_blocks
-        self.block_size = block_size
 
         # seq_id |-> number of blocks allocated for this sequence
         self.num_seq_allocated_blocks = torch.zeros(
@@ -59,7 +58,7 @@ class BlockManager:
         self.is_block_free[block_ids] = True
     
     def allocate_blocks_for_seqs(self, seq_ids: torch.Tensor, target_lens: torch.Tensor):
-        target_num_blocks = (target_lens + (self.block_size-1)) // self.block_size
+        target_num_blocks = target_lens
         assert (self.num_seq_allocated_blocks[seq_ids] <= target_num_blocks).all(), \
             f"Logic error: Some sequences have more blocks already allocated than needed. seq_ids: {seq_ids}, target_lens: {target_lens}, target_num_blocks: {target_num_blocks}, self.num_seq_allocated_blocks: {self.num_seq_allocated_blocks}"
         block_needed = target_num_blocks - self.num_seq_allocated_blocks[seq_ids]

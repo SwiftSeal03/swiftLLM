@@ -120,7 +120,7 @@ class LlamaModel:
         free_memory, total_memory = torch.cuda.mem_get_info()
         peak_memory = total_memory - free_memory
         print(f"[Model.profile] GPU total memory: {total_memory/GB:.2f} GB, runtime peak memory: {peak_memory/GB:.2f} GB")
-        block_size_bytes = self.engine_config.block_size * self.model_config.get_kvslot_size()
+        block_size_bytes = self.model_config.get_kvslot_size()
         num_gpu_blocks = math.floor((total_memory*self.engine_config.gpu_mem_utilization - peak_memory) / block_size_bytes)
 
         torch.cuda.empty_cache()
@@ -135,7 +135,6 @@ class LlamaModel:
             self.num_blocks,
             self.model_config.num_layers,
             self.model_config.num_kv_heads,
-            self.engine_config.block_size,
             self.model_config.head_dim
         )
         # Here we use torch.zeros instead of torch.empty, since that torch.empty
@@ -148,7 +147,6 @@ class LlamaModel:
             self.engine_config.num_cpu_blocks,
             self.model_config.num_layers,
             self.model_config.num_kv_heads,
-            self.engine_config.block_size,
             self.model_config.head_dim
         )
         self.k_swap = torch.zeros(kvswap_shape, dtype=torch.float16, device="cpu")
@@ -159,7 +157,6 @@ class LlamaModel:
             self.num_blocks,
             self.engine_config.max_seqs_in_block_table,
             self.engine_config.max_blocks_per_seq,
-            self.engine_config.block_size
         )
 
     def _init_to_get_rotary(self):

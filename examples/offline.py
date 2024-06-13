@@ -5,13 +5,12 @@ from transformers import AutoTokenizer
 import swiftllm
 
 if __name__ == '__main__':
-    model_path = "/data/shared/weights/Llama-3-8B-Instruct-Gradient-1048k/"
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--model-path",
         help="Path to the model. Note: please download the model weights from HuggingFace in advance and specify the path here.",
         type=str,
-        required=True
+        required=True,
     )
     model_path = parser.parse_args().model_path
 
@@ -19,7 +18,6 @@ if __name__ == '__main__':
         model_path = model_path,
         use_dummy = False,
         
-        block_size = 1,
         gpu_mem_utilization = 0.99,
         num_cpu_blocks = 0,
         max_seqs_in_block_table = 128,
