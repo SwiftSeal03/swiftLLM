@@ -6,13 +6,13 @@ from swiftllm.engine_config import EngineConfig
 from swiftllm.worker.model import LlamaModel
 
 if __name__ == '__main__':
-    model_path = "/data/weights/Llama-3-8B-Instruct-Gradient-1048k/"
+    model_path = "/data/shared/weights/Llama-3-8B-Instruct-Gradient-1048k/"
 
     engine_config = EngineConfig(
         model_path = model_path,
         use_dummy = False,
         
-        block_size = 16,
+        block_size = 1,
         gpu_mem_utilization = 0.99,
         num_cpu_blocks = 0,
         max_seqs_in_block_table = 128,

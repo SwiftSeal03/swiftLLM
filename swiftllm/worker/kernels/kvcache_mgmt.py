@@ -21,7 +21,6 @@ def _fwd_kvcache_mgmt_prefill_kernel(
 
     num_layers: tl.constexpr,
     num_kv_heads: tl.constexpr,
-    block_size: tl.constexpr,
     head_dim: tl.constexpr,
     max_blocks_per_seq: tl.constexpr,
 ):
@@ -30,22 +29,20 @@ def _fwd_kvcache_mgmt_prefill_kernel(
     my_block_id = tl.program_id(1)
     my_seq_len = tl.load(prefill_seq_lens + my_batch_id)
     my_seq_start_loc = tl.load(prefill_seq_start_locs + my_batch_id)
-    if my_block_id*block_size >= my_seq_len:
+    if my_block_id >= my_seq_len:
         return
     
-    my_token_range = tl.arange(0, block_size).to(tl.int64) + my_block_id*block_size + my_seq_start_loc
+    my_token_loc = my_block_id + my_seq_start_loc
     my_seq_id = tl.load(seq_ids + my_batch_id)
-    my_block_index = tl.load(block_table + my_seq_id*max_blocks_per_seq + my_block_id).to(tl.int64)
+    my_block_index = tl.load(block_table + my_seq_id * max_blocks_per_seq + my_block_id).to(tl.int64)
 
-    offs_kv = (my_token_range*num_kv_heads*head_dim).to(tl.int64)[:, None, None] + (tl.arange(0, num_kv_heads)*head_dim)[None, :, None] + tl.arange(0, head_dim)[None, None, :]
-    offs_kvcache = (my_block_index*num_layers+cur_layer)*num_kv_heads*block_size*head_dim + \
-        (tl.arange(0, num_kv_heads)*block_size*head_dim)[None, :, None] + \
-        (tl.arange(0, block_size)*head_dim)[:, None, None] + \
-        tl.arange(0, head_dim)[None, None, :]
+    offs_kv = my_token_loc * num_kv_heads * head_dim + \
+        tl.arange(0, num_kv_heads * head_dim)
+    offs_kvcache = (my_block_index * num_layers + cur_layer) * num_kv_heads * head_dim + \
+        tl.arange(0, num_kv_heads * head_dim)
     
-    mask = (my_token_range < my_seq_len + my_seq_start_loc)[:, None, None]
-    tl.store(k_cache + offs_kvcache, tl.load(k + offs_kv, mask=mask), mask=mask)
-    tl.store(v_cache + offs_kvcache, tl.load(v + offs_kv, mask=mask), mask=mask)
+    tl.store(k_cache + offs_kvcache, tl.load(k + offs_kv))
+    tl.store(v_cache + offs_kvcache, tl.load(v + offs_kv))
 
 @triton.jit
 def _fwd_kvcache_mgmt_decoding_kernel(
@@ -60,7 +57,6 @@ def _fwd_kvcache_mgmt_decoding_kernel(
 
     num_layers: tl.constexpr,
     num_kv_heads: tl.constexpr,
-    block_size: tl.constexpr,
     head_dim: tl.constexpr,
     max_blocks_per_seq: tl.constexpr,
 ):
@@ -68,12 +64,13 @@ def _fwd_kvcache_mgmt_decoding_kernel(
     my_batch_id = tl.program_id(0).to(tl.int64)
     my_seq_id = tl.load(decoding_seq_ids + my_batch_id)
     my_seq_len = tl.load(decoding_seq_lens + my_batch_id)
-    my_block_id = (my_seq_len-1) // block_size
-    my_block_offset = (my_seq_len-1) % block_size
+    my_block_id = my_seq_len - 1
     my_block_index = tl.load(block_table + my_seq_id*max_blocks_per_seq + my_block_id).to(tl.int64)
 
-    offs_kv = my_batch_id*num_kv_heads*head_dim + (tl.arange(0, num_kv_heads)*head_dim)[:, None] + tl.arange(0, head_dim)[None, :]
-    offs_kvcache = (my_block_index*num_layers+cur_layer)*num_kv_heads*block_size*head_dim + (tl.arange(0, num_kv_heads)*block_size*head_dim)[:, None] + my_block_offset*head_dim + tl.arange(0, head_dim)[None, :]
+    offs_kv = my_batch_id * num_kv_heads * head_dim + \
+        tl.arange(0, num_kv_heads * head_dim)
+    offs_kvcache = (my_block_index * num_layers + cur_layer) * num_kv_heads * head_dim + \
+        tl.arange(0, num_kv_heads * head_dim)
 
     tl.store(k_cache + offs_kvcache, tl.load(k + offs_kv))
     tl.store(v_cache + offs_kvcache, tl.load(v + offs_kv))
@@ -105,7 +102,11 @@ def store_kvcache(
             block_table,
             infer_state.seq_ids, infer_state.prefill_seq_start_locs, infer_state.prefill_seq_lens,
             cur_layer,
-            model_config.num_layers, model_config.num_kv_heads, engine_config.block_size, model_config.head_dim, engine_config.max_blocks_per_seq
+
+            model_config.num_layers, 
+            model_config.num_kv_heads, 
+            model_config.head_dim, 
+            engine_config.max_blocks_per_seq
         )
 
     if infer_state.num_decoding_seqs > 0:
@@ -118,7 +119,11 @@ def store_kvcache(
             infer_state.seq_ids[infer_state.num_prefill_seqs:],
             infer_state.decoding_seq_lens,
             cur_layer,
-            model_config.num_layers, model_config.num_kv_heads, engine_config.block_size, model_config.head_dim, engine_config.max_blocks_per_seq
+
+            model_config.num_layers, 
+            model_config.num_kv_heads, 
+            model_config.head_dim, 
+            engine_config.max_blocks_per_seq
         )
 
         # for my_batch_id in range(infer_state.num_decoding_seqs):
