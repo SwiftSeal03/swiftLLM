@@ -24,7 +24,6 @@ def _fwd_paged_attention_phase1(
     num_q_heads: tl.constexpr,
     num_kv_heads: tl.constexpr,
     num_my_heads: tl.constexpr,
-    block_size: tl.constexpr,
     head_dim: tl.constexpr,
     seq_block_size: tl.constexpr,
     max_blocks_per_seq: tl.constexpr,
@@ -165,7 +164,6 @@ def paged_attention(
     assert k_cache.is_contiguous()
     assert v_cache.is_contiguous()
     assert block_table.is_contiguous()
-    assert infer_state.seq_block_size % engine_config.block_size == 0
     assert o.is_contiguous()
 
     mid_o = torch.empty((
@@ -203,7 +201,6 @@ def paged_attention(
         model_config.num_q_heads,
         model_config.num_kv_heads,
         model_config.num_q_heads // model_config.num_kv_heads,
-        engine_config.block_size,
         model_config.head_dim,
         infer_state.seq_block_size,
         engine_config.max_blocks_per_seq,

@@ -95,7 +95,7 @@ def store_kvcache(
     assert infer_state.decoding_seq_lens.is_contiguous()
 
     if infer_state.num_prefill_seqs > 0:
-        grid = (infer_state.num_prefill_seqs, cdiv(infer_state.max_prefill_len, engine_config.block_size))
+        grid = (infer_state.num_prefill_seqs, infer_state.max_prefill_len)
         _fwd_kvcache_mgmt_prefill_kernel[grid](
             k_cache, v_cache,
             k, v,
