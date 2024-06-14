@@ -36,6 +36,8 @@ class LlamaTransformerLayer:
         v_cache: torch.Tensor,
         block_table: torch.Tensor,
         infer_state: LlamaInferState,
+        attn_start_event: torch.cuda.Event | None,
+        attn_end_event: torch.cuda.Event | None
     ) -> torch.Tensor:
         # (fused) Add last layer's residual, and perform RMSNorm
         # Before: input_embds is the output of the last FFN block, and residual_buf
@@ -79,6 +81,9 @@ class LlamaTransformerLayer:
         store_kvcache_event.record()
 
         # Attention
+        if attn_start_event is not None:
+            attn_start_event.record()
+
         o = input_embds    # [num_total_tokens, hidden_size]
         if infer_state.num_prefill_seqs > 0:
             # Here the performance of vLLM's flash attention is better than us,
@@ -112,6 +117,9 @@ class LlamaTransformerLayer:
                 event = torch.cuda.Event()
                 event.record()
             torch.cuda.default_stream().wait_event(event)
+            
+        if attn_end_event is not None:
+            attn_end_event.record()
         
         # Output GEMM
         o = linear(o, self.weight.o_proj)	# [num_total_tokens, hidden_size]

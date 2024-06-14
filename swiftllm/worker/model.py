@@ -181,6 +181,13 @@ class LlamaModel:
         """
         Run a forward pass of the LlamaModel.
         """
+        infer_start_event = torch.cuda.Event()
+        infer_end_event = torch.cuda.Event()
+        attn_start_events = [torch.cuda.Event() for _ in range(self.model_config.num_layers)]
+        attn_end_events = [torch.cuda.Event() for _ in range(self.model_config.num_layers)]
+
+        infer_start_event.record()
+
         input_embds = self.pre_layer.forward(input_ids)
         residual_buf = torch.zeros_like(input_embds)
         for layer in self.transformer_layers:
@@ -191,9 +198,23 @@ class LlamaModel:
                 self.v_cache,
                 self.block_manager.block_table if not infer_state.ignore_kvcache else None,
                 infer_state,
+                attn_start_events[layer.layer_id],
+                attn_end_events[layer.layer_id]
             )
         input_embds += residual_buf
         output_tokens = self.post_layer.forward(input_embds, infer_state)
+
+        infer_end_event.record()
+        torch.cuda.synchronize()
+
+        infer_total_time = infer_end_event.elapsed_time(infer_start_event)
+        attention_total_time = sum(
+            attn_start_event.elapsed_time(attn_end_event)
+            for attn_start_event, attn_end_event in zip(attn_start_events, attn_end_events)
+        )
+
+        print(f"[Model._forward] Infer time: {infer_total_time:.2f} ms, Attention time: {attention_total_time:.2f} ms")
+
         return output_tokens
     
     @torch.inference_mode()
