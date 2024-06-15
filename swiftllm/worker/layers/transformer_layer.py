@@ -36,8 +36,8 @@ class LlamaTransformerLayer:
         v_cache: torch.Tensor,
         block_table: torch.Tensor,
         infer_state: LlamaInferState,
-        attn_start_event: torch.cuda.Event | None,
-        attn_end_event: torch.cuda.Event | None
+        attn_start_event: torch.cuda.Event | None = None,
+        attn_end_event: torch.cuda.Event | None = None,
     ) -> torch.Tensor:
         # (fused) Add last layer's residual, and perform RMSNorm
         # Before: input_embds is the output of the last FFN block, and residual_buf

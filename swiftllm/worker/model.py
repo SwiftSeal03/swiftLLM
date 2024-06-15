@@ -181,10 +181,10 @@ class LlamaModel:
         """
         Run a forward pass of the LlamaModel.
         """
-        infer_start_event = torch.cuda.Event()
-        infer_end_event = torch.cuda.Event()
-        attn_start_events = [torch.cuda.Event() for _ in range(self.model_config.num_layers)]
-        attn_end_events = [torch.cuda.Event() for _ in range(self.model_config.num_layers)]
+        infer_start_event = torch.cuda.Event(enable_timing=True)
+        infer_end_event = torch.cuda.Event(enable_timing=True)
+        attn_start_events = [torch.cuda.Event(enable_timing=True) for _ in range(self.model_config.num_layers)]
+        attn_end_events = [torch.cuda.Event(enable_timing=True) for _ in range(self.model_config.num_layers)]
 
         infer_start_event.record()
 
@@ -207,7 +207,7 @@ class LlamaModel:
         infer_end_event.record()
         torch.cuda.synchronize()
 
-        infer_total_time = infer_end_event.elapsed_time(infer_start_event)
+        infer_total_time = infer_start_event.elapsed_time(infer_end_event)
         attention_total_time = sum(
             attn_start_event.elapsed_time(attn_end_event)
             for attn_start_event, attn_end_event in zip(attn_start_events, attn_end_events)
@@ -291,6 +291,9 @@ class LlamaModel:
         while self.model_config.num_kv_heads*(decoding_seq_lens_sum/seq_block_size) < 1024 and seq_block_size//2 >= 64 and \
             max_decoding_len / (seq_block_size//2) <= 128:
             seq_block_size //= 2
+
+        if decoding_seq_lens_list:
+            print("[Model.forward] decoding seq len: ", decoding_seq_lens_list[0])
 
         infer_state = LlamaInferState(
             batch_size = batch_size,

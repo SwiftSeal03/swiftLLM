@@ -1,0 +1,13 @@
+Answer the question using information given in the passage.
+
+Question: How are glacier caves normally formed?
+
+Passage: Most glacier caves are started by water running through or under the glacier. This water often originates on the glacier's surface through melting, entering the ice at a moulin and exiting at the glacier's snout at base level. Heat transfer from the water can cause sufficient melting to create an air-filled cavity, sometimes aided by solifluction. Air movement can then assist enlargement through melting in summer and sublimation in winter.
+
+Some glacier caves are formed by geothermal heat from volcanic vents or hotsprings beneath the ice. An extreme example is the Kverkfjöll glacier cave in the Vatnajökull glacier in Iceland, measured in the 1980s at 2.8 kilometres (1.7 mi) long with a vertical range of 525 metres (1,722 ft).
+
+Some glacier caves are relatively unstable due to melting and glacial motion, and are subject to localized or complete collapse, as well as elimination by glacial retreat. An example of the dynamic nature of glacier caves is the former Paradise Ice Caves, located on Mount Rainier in the United States. Known since the early 1900s, the caves were thought to have disappeared altogether in the mid-1940s, yet in 1978 cavers measured 13.25 kilometres (8.23 mi) of passageways in glacier caves there, and it was then considered the longest glacier cave system in the world. The Paradise Ice Caves collapsed and vanished in the 1990s, and the lower lobe of the glacier which once contained the caves has also vanished entirely between 2004 and 2006.
+
+Glacier caves may be used by glaciologists to gain access to the interior of glaciers. The study of glacier caves themselves is sometimes called "glaciospeleology".
+
+Answer: 
