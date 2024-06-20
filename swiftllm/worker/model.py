@@ -8,6 +8,7 @@ from swiftllm.model_config import LlamaModelConfig
 from swiftllm.worker.weight import load_weights
 from swiftllm.worker.block_manager import BlockManager
 from swiftllm.utils import GB
+import swiftllm_c
 
 from .layers.pre_layer import LlamaPreLayer
 from .layers.transformer_layer import LlamaTransformerLayer
@@ -56,7 +57,7 @@ class LlamaModel:
         self.k_swap = self.v_swap = None
 
         # Block manager
-        self.block_manager = None
+        self.cpu_block_manager = self.gpu_block_manager = None
         
     @torch.inference_mode()
     def load_weights(self):
@@ -119,9 +120,12 @@ class LlamaModel:
         # total_memory = torch.cuda.get_device_properties(0).total_memory
         free_memory, total_memory = torch.cuda.mem_get_info()
         peak_memory = total_memory - free_memory
+        useable_memory = total_memory*self.engine_config.gpu_mem_utilization
         print(f"[Model.profile] GPU total memory: {total_memory/GB:.2f} GB, runtime peak memory: {peak_memory/GB:.2f} GB")
+        if useable_memory < peak_memory:
+            raise RuntimeError(f"Peak memory {peak_memory/GB:.2f} GB exceeds usable memory {useable_memory/GB:.2f} GB ({total_memory/GB:.2f} GB * {self.engine_config.gpu_mem_utilization})")
         block_size_bytes = self.model_config.get_kvslot_size()
-        num_gpu_blocks = math.floor((total_memory*self.engine_config.gpu_mem_utilization - peak_memory) / block_size_bytes)
+        num_gpu_blocks = math.floor((useable_memory - peak_memory) / block_size_bytes)
 
         torch.cuda.empty_cache()
         return num_gpu_blocks
@@ -153,8 +157,15 @@ class LlamaModel:
         self.v_swap = torch.zeros(kvswap_shape, dtype=torch.float16, device="cpu")
 
         # Initialize block manager
-        self.block_manager = BlockManager(
+        self.gpu_block_manager = BlockManager(
+            "GPU",
             self.num_blocks,
+            self.engine_config.max_seqs_in_block_table,
+            self.engine_config.max_blocks_per_seq,
+        )
+        self.cpu_block_manager = BlockManager(
+            "CPU",
+            self.engine_config.num_cpu_blocks,
             self.engine_config.max_seqs_in_block_table,
             self.engine_config.max_blocks_per_seq,
         )
@@ -196,7 +207,7 @@ class LlamaModel:
                 residual_buf,
                 self.k_cache,
                 self.v_cache,
-                self.block_manager.block_table if not infer_state.ignore_kvcache else None,
+                self.gpu_block_manager.block_table if not infer_state.ignore_kvcache else None,
                 infer_state,
                 attn_start_events[layer.layer_id],
                 attn_end_events[layer.layer_id]
@@ -266,7 +277,7 @@ class LlamaModel:
         ), dim=0)
 
         if not ignore_kvcache:
-            self.block_manager.allocate_blocks_for_seqs(
+            self.gpu_block_manager.allocate_blocks_for_seqs(
                 seq_ids,
                 seq_lengths
             )
@@ -330,10 +341,51 @@ class LlamaModel:
             infer_state
         ).tolist()
 
+    def _swap(
+        self,
+        seq_ids_list: list[int],
+        is_swap_in: bool
+    ):
+        src_block_manager = self.cpu_block_manager if is_swap_in else self.gpu_block_manager
+        dst_block_manager = self.gpu_block_manager if is_swap_in else self.cpu_block_manager
+        seq_ids = torch.tensor(seq_ids_list, dtype=torch.int32, device="cuda")
+        seq_lengths = src_block_manager.get_num_allocated_blocks(seq_ids)
+        src_block_ids = src_block_manager.gather_allocated_blocks_and_free(seq_ids)
+        dst_block_ids = dst_block_manager.allocate_blocks_for_seqs(seq_ids, seq_lengths)
+        swiftllm_c.swap_blocks(
+            src_block_ids.tolist(),
+            dst_block_ids.tolist(),
+            is_swap_in,
+
+            self.k_cache, self.v_cache,
+            self.k_swap, self.v_swap
+        )
+        
+    @torch.inference_mode()
+    def swap_in_seqs(
+        self,
+        seq_ids_list: list[int]
+    ):
+        """
+        Swap in (move blocks from CPU to GPU) the specified sequences.
+        """
+        self._swap(seq_ids_list, True)
+    
+    @torch.inference_mode()
+    def swap_out_seqs(
+        self,
+        seq_ids_list: list[int]
+    ):
+        """
+        Swap out (move blocks from GPU to CPU) the specified sequences.
+        """
+        self._swap(seq_ids_list, False)
+
     @torch.inference_mode()
     def free_seqs_resources(self, seq_ids_list: list[int]):
         """
         Free the resources of the specified sequences.
         """
         seq_ids = torch.tensor(seq_ids_list, dtype=torch.int32, device="cuda")
-        self.block_manager.free_blocks_for_seqs(seq_ids)
+        self.gpu_block_manager.free_blocks_for_seqs(seq_ids)
+        self.cpu_block_manager.free_blocks_for_seqs(seq_ids)
