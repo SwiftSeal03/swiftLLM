@@ -21,14 +21,19 @@ if __name__ == '__main__':
 
         # The following are not used in the offline example
         max_batch_size = 16,
-        max_tokens_in_batch = 2048*16
+        max_tokens_in_batch = 2048*16,
+
+        offload_attn_to_cpu = False,
     )
 
     start_time = time.perf_counter()
     model = swiftllm.LlamaModel(engine_config)
     model.load_weights()
-    num_blocks = model.profile_num_blocks()
-    print("Number of blocks:", num_blocks)
+    if not engine_config.offload_attn_to_cpu:
+        num_blocks = model.profile_num_blocks()
+        print("Number of blocks:", num_blocks)
+    else:
+        num_blocks = 0
     model.init_kvcache_and_swap(num_blocks)
     model_creation_time = time.perf_counter()
     print(f"Model creation time: {model_creation_time - start_time:.2f} seconds")

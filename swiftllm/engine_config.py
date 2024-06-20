@@ -19,3 +19,6 @@ class EngineConfig:
     # Scheduling-related parameters
     max_batch_size: int
     max_tokens_in_batch: int
+
+    # For CPU offloading
+    offload_attn_to_cpu: bool

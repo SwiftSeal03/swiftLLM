@@ -28,6 +28,67 @@ class LlamaTransformerLayer:
         self.decoding_piggyback_stream = decoding_piggyback_stream
         self.layer_id = layer_id
     
+    def attention_gpu(
+        self,
+        input_embds: torch.Tensor,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        block_table: torch.Tensor,
+        infer_state: LlamaInferState,
+    ) -> torch.Tensor:
+        if not infer_state.ignore_kvcache:
+            store_kvcache(
+                k, v,
+                k_cache, v_cache,
+                block_table,
+                self.model_config,
+                self.engine_config,
+                infer_state,
+                self.layer_id
+            )
+        store_kvcache_event = torch.cuda.Event()
+        store_kvcache_event.record()
+
+        o = input_embds    # [num_total_tokens, hidden_size]
+        if infer_state.num_prefill_seqs > 0:
+            # Here the performance of vLLM's flash attention is better than us,
+            # so use vllm_flash_attn
+            o[:infer_state.num_prefill_tokens, :] = vllm_flash_attn.flash_attn_varlen_func(
+                q[:infer_state.num_prefill_tokens, :, :],
+                k[:infer_state.num_prefill_tokens, :, :],
+                v[:infer_state.num_prefill_tokens, :, :],
+                infer_state.prefill_seq_start_locs_with_end,
+                infer_state.prefill_seq_start_locs_with_end,
+                infer_state.max_prefill_len,
+                infer_state.max_prefill_len,
+                softmax_scale=infer_state.softmax_scale,
+                causal=True
+            ).reshape(-1, self.model_config.hidden_size)
+            # prefill_attention(
+            #     q, k, v, o[:infer_state.num_prefill_tokens, :],
+            #     self.model_config, self.engine_config, infer_state
+            # )
+        if infer_state.num_decoding_seqs > 0:
+            assert not infer_state.ignore_kvcache
+            with torch.cuda.stream(self.decoding_piggyback_stream):
+                torch.cuda.current_stream().wait_event(store_kvcache_event)
+                paged_attention(
+                    q[infer_state.num_prefill_tokens:, :, :],
+                    k_cache, v_cache, block_table,
+                    self.model_config, self.engine_config, infer_state,
+                    self.layer_id,
+                    o[infer_state.num_prefill_tokens:, :],
+                )
+                event = torch.cuda.Event()
+                event.record()
+            torch.cuda.default_stream().wait_event(event)
+        
+        return o
+        
+
     def forward(
         self,
         input_embds: torch.Tensor,  # [num_tokens, hidden_size]
@@ -67,56 +128,23 @@ class LlamaTransformerLayer:
             infer_state
         )
 
-        if not infer_state.ignore_kvcache:
-            store_kvcache(
-                k, v,
-                k_cache, v_cache,
-                block_table,
-                self.model_config,
-                self.engine_config,
-                infer_state,
-                self.layer_id
-            )
-        store_kvcache_event = torch.cuda.Event()
-        store_kvcache_event.record()
-
         # Attention
         if attn_start_event is not None:
             attn_start_event.record()
 
-        o = input_embds    # [num_total_tokens, hidden_size]
-        if infer_state.num_prefill_seqs > 0:
-            # Here the performance of vLLM's flash attention is better than us,
-            # so use vllm_flash_attn
-            o[:infer_state.num_prefill_tokens, :] = vllm_flash_attn.flash_attn_varlen_func(
-                q[:infer_state.num_prefill_tokens, :, :],
-                k[:infer_state.num_prefill_tokens, :, :],
-                v[:infer_state.num_prefill_tokens, :, :],
-                infer_state.prefill_seq_start_locs_with_end,
-                infer_state.prefill_seq_start_locs_with_end,
-                infer_state.max_prefill_len,
-                infer_state.max_prefill_len,
-                softmax_scale=infer_state.softmax_scale,
-                causal=True
-            ).reshape(-1, self.model_config.hidden_size)
-            # prefill_attention(
-            #     q, k, v, o[:infer_state.num_prefill_tokens, :],
-            #     self.model_config, self.engine_config, infer_state
-            # )
-        if infer_state.num_decoding_seqs > 0:
-            assert not infer_state.ignore_kvcache
-            with torch.cuda.stream(self.decoding_piggyback_stream):
-                torch.cuda.current_stream().wait_event(store_kvcache_event)
-                paged_attention(
-                    q[infer_state.num_prefill_tokens:, :, :],
-                    k_cache, v_cache, block_table,
-                    self.model_config, self.engine_config, infer_state,
-                    self.layer_id,
-                    o[infer_state.num_prefill_tokens:, :],
-                )
-                event = torch.cuda.Event()
-                event.record()
-            torch.cuda.default_stream().wait_event(event)
+        if self.engine_config.offload_attn_to_cpu:
+            raise NotImplementedError("CPU offloading is not supported in this version")
+        else:
+            o = self.attention_gpu(
+                input_embds,
+                q,
+                k,
+                v,
+                k_cache,
+                v_cache,
+                block_table,
+                infer_state
+            )
             
         if attn_end_event is not None:
             attn_end_event.record()

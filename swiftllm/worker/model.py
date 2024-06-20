@@ -292,8 +292,8 @@ class LlamaModel:
             max_decoding_len / (seq_block_size//2) <= 128:
             seq_block_size //= 2
 
-        if decoding_seq_lens_list:
-            print("[Model.forward] decoding seq len: ", decoding_seq_lens_list[0])
+        # if decoding_seq_lens_list:
+        #     print("[Model.forward] decoding seq len: ", decoding_seq_lens_list[0])
 
         infer_state = LlamaInferState(
             batch_size = batch_size,
