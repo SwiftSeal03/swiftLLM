@@ -57,6 +57,7 @@ class LlamaModel:
         self.k_swap = self.v_swap = None
 
         # Block manager
+        self.block_table_device = self.engine_config.offload_attn_to_cpu and "cpu" or "cuda"
         self.cpu_block_manager = self.gpu_block_manager = None
         
     @torch.inference_mode()
@@ -159,12 +160,14 @@ class LlamaModel:
         # Initialize block manager
         self.gpu_block_manager = BlockManager(
             "GPU",
+            self.block_table_device,
             self.num_blocks,
             self.engine_config.max_seqs_in_block_table,
             self.engine_config.max_blocks_per_seq,
         )
         self.cpu_block_manager = BlockManager(
             "CPU",
+            self.block_table_device,
             self.engine_config.num_cpu_blocks,
             self.engine_config.max_seqs_in_block_table,
             self.engine_config.max_blocks_per_seq,
@@ -196,18 +199,20 @@ class LlamaModel:
         infer_end_event = torch.cuda.Event(enable_timing=True)
         attn_start_events = [torch.cuda.Event(enable_timing=True) for _ in range(self.model_config.num_layers)]
         attn_end_events = [torch.cuda.Event(enable_timing=True) for _ in range(self.model_config.num_layers)]
+        block_table_cuda = self.gpu_block_manager.block_table.cuda() if not infer_state.ignore_kvcache else None
 
         infer_start_event.record()
 
         input_embds = self.pre_layer.forward(input_ids)
         residual_buf = torch.zeros_like(input_embds)
+        
         for layer in self.transformer_layers:
             input_embds = layer.forward(
                 input_embds,
                 residual_buf,
                 self.k_cache,
                 self.v_cache,
-                self.gpu_block_manager.block_table if not infer_state.ignore_kvcache else None,
+                block_table_cuda,
                 infer_state,
                 attn_start_events[layer.layer_id],
                 attn_end_events[layer.layer_id]
@@ -249,8 +254,8 @@ class LlamaModel:
         flattened_input_ids = list(itertools.chain(*input_ids_list))
         seq_lengths_list = [len(seq) for seq in input_ids_list[:num_prefill_seqs]] + decoding_seq_lens_list
 
-        seq_ids = torch.tensor(seq_ids_list, dtype=torch.int32, device="cuda")
-        seq_lengths = torch.tensor(seq_lengths_list, dtype=torch.int32, device="cuda")
+        seq_ids = torch.tensor(seq_ids_list, dtype=torch.int32, device=self.block_table_device)
+        seq_lengths = torch.tensor(seq_lengths_list, dtype=torch.int32, device=self.block_table_device)
 
         batch_size = len(input_ids_list)
         num_tokens = len(flattened_input_ids)
@@ -277,7 +282,8 @@ class LlamaModel:
         ), dim=0)
 
         if not ignore_kvcache:
-            self.gpu_block_manager.allocate_blocks_for_seqs(
+            primary_block_manager = self.engine_config.offload_attn_to_cpu and self.cpu_block_manager or self.gpu_block_manager
+            primary_block_manager.allocate_blocks_for_seqs(
                 seq_ids,
                 seq_lengths
             )
@@ -310,7 +316,7 @@ class LlamaModel:
             batch_size = batch_size,
             num_tokens = num_tokens,
 
-            seq_ids = seq_ids,
+            seq_ids = seq_ids.cuda(),
             softmax_scale = self.model_config.head_dim ** -0.5,
 
             num_prefill_seqs = num_prefill_seqs,
@@ -346,6 +352,8 @@ class LlamaModel:
         seq_ids_list: list[int],
         is_swap_in: bool
     ):
+        assert not self.engine_config.offload_attn_to_cpu, "Offloading attention to CPU is enabled, swapping makes no sense."
+        
         src_block_manager = self.cpu_block_manager if is_swap_in else self.gpu_block_manager
         dst_block_manager = self.gpu_block_manager if is_swap_in else self.cpu_block_manager
         seq_ids = torch.tensor(seq_ids_list, dtype=torch.int32, device="cuda")

@@ -15,8 +15,16 @@ class BlockManager:
     kernels for fast operations.
     """
 
-    def __init__(self, device_name: str, num_blocks: int, max_seqs_in_block_table: int, max_blocks_per_seq: int):
-        self.device_name = device_name
+    def __init__(
+        self, 
+        block_device_name: str,
+        table_device_name: str,
+        num_blocks: int, 
+        max_seqs_in_block_table: int, 
+        max_blocks_per_seq: int
+    ):
+        self.block_device_name = block_device_name
+        self.table_device_name = table_device_name
         self.num_free_blocks = num_blocks
         self.num_blocks = num_blocks
 
@@ -24,19 +32,19 @@ class BlockManager:
         self.num_seq_allocated_blocks = torch.zeros(
             (max_seqs_in_block_table,),
             dtype=torch.int32,
-            device="cuda"
+            device=table_device_name
         )
         # (seq_id, block_index) |-> block_id
         self.block_table = torch.empty(
             (max_seqs_in_block_table, max_blocks_per_seq),
             dtype=torch.int32,
-            device="cuda",
+            device=table_device_name
         )
         # block_id |-> whether this block is free or not
         self.is_block_free = torch.ones(
             (num_blocks,),
             dtype=torch.bool,
-            device="cuda"
+            device=table_device_name
         )
     
     def _allocate_blocks(self, num_blocks: int) -> torch.Tensor:
@@ -45,7 +53,7 @@ class BlockManager:
         return the block IDs.
         """
         if num_blocks > self.num_free_blocks:
-            raise RuntimeError(f"No enough free blocks available on {self.device_name} ({self.num_blocks} in total, {self.num_free_blocks} free, {num_blocks} requested)")
+            raise RuntimeError(f"No enough free blocks available on {self.block_device_name} ({self.num_blocks} in total, {self.num_free_blocks} free, {num_blocks} requested)")
         selected_blocks = torch.nonzero(self.is_block_free)[:num_blocks].view(-1)
         self.num_free_blocks -= num_blocks
         self.is_block_free[selected_blocks] = False
@@ -58,7 +66,11 @@ class BlockManager:
         self.num_free_blocks += len(block_ids)
         self.is_block_free[block_ids] = True
     
-    def allocate_blocks_for_seqs(self, seq_ids: torch.Tensor, target_lens: torch.Tensor) -> torch.Tensor:
+    def allocate_blocks_for_seqs(
+        self, 
+        seq_ids: torch.Tensor, 
+        target_lens: torch.Tensor
+    ) -> torch.Tensor:
         """
         Allocate blocks for sequences, making sure that seq #i has at least 
         ceil(target_lengths[i] / block_size) blocks allocated.
@@ -67,13 +79,21 @@ class BlockManager:
         """
         target_num_blocks = target_lens
         assert (self.num_seq_allocated_blocks[seq_ids] <= target_num_blocks).all(), \
-            f"""(On {self.device_name}) Logic error: Some sequences have more blocks already allocated than needed.
+            f"""(On {self.block_device_name}) Logic error: Some sequences have more blocks already allocated than needed.
                 seq_ids: {seq_ids}, target_lens: {target_lens}, target_num_blocks: {target_num_blocks},
                 self.num_seq_allocated_blocks[seq_ids]: {self.num_seq_allocated_blocks[seq_ids]}"""
         block_needed = target_num_blocks - self.num_seq_allocated_blocks[seq_ids]
+        block_needed_cum = block_needed.cumsum(0)
         new_blocks = self._allocate_blocks(torch.sum(block_needed))
 
-        set_block_table_and_num_seq_alloc_blocks(self.num_seq_allocated_blocks, self.block_table, new_blocks, seq_ids, block_needed)
+        if self.table_device_name == "cuda":
+            set_block_table_and_num_seq_alloc_blocks(self.num_seq_allocated_blocks, self.block_table, new_blocks, seq_ids, block_needed)
+        else:
+            for i, seq_id in enumerate(seq_ids):
+                old_num_blocks = self.num_seq_allocated_blocks[seq_id].item()
+                new_num_blocks = old_num_blocks + block_needed[i]
+                self.num_seq_allocated_blocks[seq_id] = new_num_blocks
+                self.block_table[seq_id, old_num_blocks:new_num_blocks] = new_blocks[block_needed_cum[i] - block_needed[i]:block_needed_cum[i]]
 
         return new_blocks
         
@@ -82,7 +102,14 @@ class BlockManager:
         Free blocks for sequences.
         """
         self.num_free_blocks += torch.sum(self.num_seq_allocated_blocks[seq_ids])
-        unset_block_table_and_num_seq_alloc_blocks(self.num_seq_allocated_blocks, self.block_table, seq_ids, self.is_block_free)
+
+        if self.table_device_name == "cuda":
+            unset_block_table_and_num_seq_alloc_blocks(self.num_seq_allocated_blocks, self.block_table, seq_ids, self.is_block_free)
+        else:
+            for seq_id in seq_ids:
+                num_blocks = self.num_seq_allocated_blocks[seq_id]
+                self.is_block_free[self.block_table[seq_id, :num_blocks]] = True
+                self.num_seq_allocated_blocks[seq_id] = 0
 
     def gather_allocated_blocks_and_free(self, seq_ids: torch.Tensor) -> torch.Tensor:
         """
@@ -90,6 +117,8 @@ class BlockManager:
 
         Useful fow swapping in/out
         """
+        assert self.table_device_name == "cuda", "swapping is only needed for GPU block table"
+
         gathered_block_ids = gather_allocated_blocks_and_unset(self.num_seq_allocated_blocks, self.block_table, seq_ids, self.is_block_free)
         self.num_free_blocks += len(gathered_block_ids)
         return gathered_block_ids

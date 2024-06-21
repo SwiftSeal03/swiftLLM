@@ -15,7 +15,7 @@ if __name__ == '__main__':
         use_dummy = False,
         
         gpu_mem_utilization = 0.99,
-        num_cpu_blocks = 0,
+        num_cpu_blocks = 8000,
         max_seqs_in_block_table = 128,
         max_blocks_per_seq = 2048,
 
