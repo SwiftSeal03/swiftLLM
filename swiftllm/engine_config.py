@@ -21,6 +21,9 @@ class EngineConfig:
     max_batch_size: int
     max_tokens_in_batch: int
 
+    # Offloading-related parameters
+    offload_attn_to_cpu: bool
+
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
         """
