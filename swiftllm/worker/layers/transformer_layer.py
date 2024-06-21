@@ -39,18 +39,8 @@ class LlamaTransformerLayer:
         block_table: torch.Tensor,
         infer_state: LlamaInferState,
     ) -> torch.Tensor:
-        if not infer_state.ignore_kvcache:
-            store_kvcache(
-                k, v,
-                k_cache, v_cache,
-                block_table,
-                self.model_config,
-                self.engine_config,
-                infer_state,
-                self.layer_id
-            )
-        store_kvcache_event = torch.cuda.Event()
-        store_kvcache_event.record()
+        kv_computed_event = torch.cuda.Event()
+        kv_computed_event.record()
 
         o = input_embds    # [num_total_tokens, hidden_size]
         if infer_state.num_prefill_seqs > 0:
@@ -71,10 +61,21 @@ class LlamaTransformerLayer:
             #     q, k, v, o[:infer_state.num_prefill_tokens, :],
             #     self.model_config, self.engine_config, infer_state
             # )
-        if infer_state.num_decoding_seqs > 0:
-            assert not infer_state.ignore_kvcache
-            with torch.cuda.stream(self.decoding_piggyback_stream):
-                torch.cuda.current_stream().wait_event(store_kvcache_event)
+        
+        with torch.cuda.stream(self.decoding_piggyback_stream):
+            torch.cuda.current_stream().wait_event(kv_computed_event)
+            if not infer_state.ignore_kvcache:
+                store_kvcache(
+                    k, v,
+                    k_cache, v_cache,
+                    block_table,
+                    self.model_config,
+                    self.engine_config,
+                    infer_state,
+                    self.layer_id
+                )
+            if infer_state.num_decoding_seqs > 0:
+                assert not infer_state.ignore_kvcache
                 paged_attention(
                     q[infer_state.num_prefill_tokens:, :, :],
                     k_cache, v_cache, block_table,
@@ -82,9 +83,9 @@ class LlamaTransformerLayer:
                     self.layer_id,
                     o[infer_state.num_prefill_tokens:, :],
                 )
-                event = torch.cuda.Event()
-                event.record()
-            torch.cuda.default_stream().wait_event(event)
+            event = torch.cuda.Event()
+            event.record()
+        torch.cuda.default_stream().wait_event(event)
         
         return o
         
