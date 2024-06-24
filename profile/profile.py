@@ -7,15 +7,19 @@ from transformers import AutoTokenizer
 import swiftllm
 
 if __name__ == '__main__':
-    model_path = "/home/ubuntu/weights/Llama-3-8B-Instruct-Gradient-1048k"
-    data_path = "sample.txt"
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model_path", type=str, default="/home/ubuntu/weights/Llama-3-8B-Instruct-Gradient-1048k")
+    parser.add_argument("--data_path", type=str, default="sample.txt")
+    parser.add_argument("--num_cpu_blocks", type=int, default=8000)
+    parser.add_argument("--offload_attn_to_cpu", "--cpu", action="store_true")
+    args = parser.parse_args()
 
     engine_config = swiftllm.EngineConfig(
-        model_path = model_path,
+        model_path = args.model_path,
         use_dummy = False,
         
         gpu_mem_utilization = 0.99,
-        num_cpu_blocks = 8000,
+        num_cpu_blocks = args.num_cpu_blocks,
         max_seqs_in_block_table = 128,
         max_blocks_per_seq = 2048,
 
@@ -23,27 +27,27 @@ if __name__ == '__main__':
         max_batch_size = 16,
         max_tokens_in_batch = 2048*16,
 
-        offload_attn_to_cpu = False,
+        offload_attn_to_cpu = args.offload_attn_to_cpu
     )
 
     start_time = time.perf_counter()
     model = swiftllm.LlamaModel(engine_config)
     model.load_weights()
     if not engine_config.offload_attn_to_cpu:
-        num_blocks = model.profile_num_blocks()
-        print("Number of blocks:", num_blocks)
+        num_gpu_blocks = model.profile_num_blocks()
+        print("Number of blocks:", num_gpu_blocks)
     else:
-        num_blocks = 0
-    model.init_kvcache_and_swap(num_blocks)
+        num_gpu_blocks = 0
+    model.init_kvcache_and_swap(num_gpu_blocks)
     model_creation_time = time.perf_counter()
     print(f"Model creation time: {model_creation_time - start_time:.2f} seconds")
     
-    with open(data_path) as f:
+    with open(args.data_path) as f:
         prompt = f.read()
     
     prompts = [prompt] * 10
 
-    tokenizer = AutoTokenizer.from_pretrained(model_path)
+    tokenizer = AutoTokenizer.from_pretrained(args.model_path)
     outputs = []
 
     # Prompt phase
@@ -64,7 +68,7 @@ if __name__ == '__main__':
     print("Decoding phase started...")
     seq_lens = [len(x) for x in input_ids]
     last_round_outputs = prompt_phase_outputs
-    for _ in range(100):
+    for _ in range(10):
         for i, _ in enumerate(prompts):
             seq_lens[i] += 1
         last_round_outputs = model.forward(
