@@ -52,13 +52,13 @@ class LlamaModel:
         self.post_layer = None
 
         # KV Cache
-        self.num_blocks = None
+        self.num_gpu_blocks = None
         self.k_cache = self.v_cache = None
         self.k_swap = self.v_swap = None
 
         # Block manager
         self.block_table_device = self.engine_config.offload_attn_to_cpu and "cpu" or "cuda"
-        self.cpu_block_manager = self.gpu_block_manager = None
+        self.cpu_block_manager = self.gpu_block_manager = self.primary_block_manager = None
         
     @torch.inference_mode()
     def load_weights(self):
@@ -132,36 +132,43 @@ class LlamaModel:
         return num_gpu_blocks
     
     @torch.inference_mode()
-    def init_kvcache_and_swap(self, num_blocks: int):
-        self.num_blocks = num_blocks
+    def init_kvcache_and_swap(self, num_gpu_blocks: int):
+        self.num_gpu_blocks = num_gpu_blocks
+
+        if self.engine_config.offload_attn_to_cpu:
+            num_blocks = self.engine_config.num_cpu_blocks
+            cache_device = "cpu"
+        else:
+            num_blocks = self.num_gpu_blocks
+            cache_device = "cuda"
+
+            # Initialize KV swap space
+            kvswap_shape = (
+                self.engine_config.num_cpu_blocks,
+                self.model_config.num_layers,
+                self.model_config.num_kv_heads,
+                self.model_config.head_dim
+            )
+            self.k_swap = torch.zeros(kvswap_shape, dtype=torch.float16, device="cpu")
+            self.v_swap = torch.zeros(kvswap_shape, dtype=torch.float16, device="cpu")
 
         # Initialize KV cache
         kvcache_shape = (
-            self.num_blocks,
+            num_blocks,
             self.model_config.num_layers,
             self.model_config.num_kv_heads,
             self.model_config.head_dim
         )
         # Here we use torch.zeros instead of torch.empty, since that torch.empty
         # has the possibility to contain NaNs, which will cause the model to output NaNs.
-        self.k_cache = torch.zeros(kvcache_shape, dtype=torch.float16, device="cuda")
-        self.v_cache = torch.zeros(kvcache_shape, dtype=torch.float16, device="cuda")
-
-        # Initialize KV swap space
-        kvswap_shape = (
-            self.engine_config.num_cpu_blocks,
-            self.model_config.num_layers,
-            self.model_config.num_kv_heads,
-            self.model_config.head_dim
-        )
-        self.k_swap = torch.zeros(kvswap_shape, dtype=torch.float16, device="cpu")
-        self.v_swap = torch.zeros(kvswap_shape, dtype=torch.float16, device="cpu")
+        self.k_cache = torch.zeros(kvcache_shape, dtype=torch.float16, device=cache_device)
+        self.v_cache = torch.zeros(kvcache_shape, dtype=torch.float16, device=cache_device)
 
         # Initialize block manager
         self.gpu_block_manager = BlockManager(
             "GPU",
             self.block_table_device,
-            self.num_blocks,
+            self.num_gpu_blocks,
             self.engine_config.max_seqs_in_block_table,
             self.engine_config.max_blocks_per_seq,
         )
@@ -172,6 +179,9 @@ class LlamaModel:
             self.engine_config.max_seqs_in_block_table,
             self.engine_config.max_blocks_per_seq,
         )
+
+        self.primary_block_manager = self.engine_config.offload_attn_to_cpu and self.cpu_block_manager or self.gpu_block_manager
+
 
     def _init_to_get_rotary(self):
         rope_scaling_factor = self.model_config.rope_scaling
@@ -199,7 +209,8 @@ class LlamaModel:
         infer_end_event = torch.cuda.Event(enable_timing=True)
         attn_start_events = [torch.cuda.Event(enable_timing=True) for _ in range(self.model_config.num_layers)]
         attn_end_events = [torch.cuda.Event(enable_timing=True) for _ in range(self.model_config.num_layers)]
-        block_table_cuda = self.gpu_block_manager.block_table.cuda() if not infer_state.ignore_kvcache else None
+        
+        block_table = self.primary_block_manager.block_table if not infer_state.ignore_kvcache else None
 
         infer_start_event.record()
 
@@ -212,7 +223,7 @@ class LlamaModel:
                 residual_buf,
                 self.k_cache,
                 self.v_cache,
-                block_table_cuda,
+                block_table,
                 infer_state,
                 attn_start_events[layer.layer_id],
                 attn_end_events[layer.layer_id]
@@ -229,7 +240,7 @@ class LlamaModel:
             for attn_start_event, attn_end_event in zip(attn_start_events, attn_end_events)
         )
 
-        print(f"[Model._forward] Infer time: {infer_total_time:.2f} ms, Attention time: {attention_total_time:.2f} ms")
+        print(f"[Model._forward] Infer time: {infer_total_time:.2f} ms, Attention time: {attention_total_time:.2f} ms, Other time: {infer_total_time - attention_total_time:.2f} ms")
 
         return output_tokens
     
@@ -282,8 +293,7 @@ class LlamaModel:
         ), dim=0)
 
         if not ignore_kvcache:
-            primary_block_manager = self.engine_config.offload_attn_to_cpu and self.cpu_block_manager or self.gpu_block_manager
-            primary_block_manager.allocate_blocks_for_seqs(
+            self.primary_block_manager.allocate_blocks_for_seqs(
                 seq_ids,
                 seq_lengths
             )

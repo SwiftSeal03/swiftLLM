@@ -28,7 +28,7 @@ class LlamaTransformerLayer:
         self.decoding_piggyback_stream = decoding_piggyback_stream
         self.layer_id = layer_id
     
-    def attention_gpu(
+    def attention(
         self,
         input_embds: torch.Tensor,
         q: torch.Tensor,
@@ -83,9 +83,9 @@ class LlamaTransformerLayer:
                     self.layer_id,
                     o[infer_state.num_prefill_tokens:, :],
                 )
-            event = torch.cuda.Event()
-            event.record()
-        torch.cuda.default_stream().wait_event(event)
+            decode_finish_event = torch.cuda.Event()
+            decode_finish_event.record()
+        torch.cuda.default_stream().wait_event(decode_finish_event)
         
         return o
         
@@ -133,19 +133,16 @@ class LlamaTransformerLayer:
         if attn_start_event is not None:
             attn_start_event.record()
 
-        if self.engine_config.offload_attn_to_cpu:
-            raise NotImplementedError("CPU offloading is not supported in this version")
-        else:
-            o = self.attention_gpu(
-                input_embds,
-                q,
-                k,
-                v,
-                k_cache,
-                v_cache,
-                block_table,
-                infer_state
-            )
+        o = self.attention(
+            input_embds,
+            q,
+            k,
+            v,
+            k_cache,
+            v_cache,
+            block_table,
+            infer_state
+        )
             
         if attn_end_event is not None:
             attn_end_event.record()
