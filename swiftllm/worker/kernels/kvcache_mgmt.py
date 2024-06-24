@@ -94,37 +94,53 @@ def store_kvcache(
     assert infer_state.seq_ids.is_contiguous()
     assert infer_state.decoding_seq_lens.is_contiguous()
 
-    if infer_state.num_prefill_seqs > 0:
-        grid = (infer_state.num_prefill_seqs, infer_state.max_prefill_len)
-        _fwd_kvcache_mgmt_prefill_kernel[grid](
-            k_cache, v_cache,
-            k, v,
-            block_table,
-            infer_state.seq_ids, infer_state.prefill_seq_start_locs, infer_state.prefill_seq_lens,
-            cur_layer,
+    if engine_config.offload_attn_to_cpu:
+        k = k.to(k_cache.device)
+        v = v.to(v_cache.device)
+        for i, seq_id in enumerate(infer_state.seq_ids[:infer_state.num_prefill_seqs]):
+            start_loc = infer_state.prefill_seq_start_locs[i]
+            seq_len = infer_state.prefill_seq_lens[i]
+            block_ids = block_table[seq_id, :seq_len]
+            k_cache[block_ids, cur_layer] = k[start_loc:start_loc+seq_len]
+            v_cache[block_ids, cur_layer] = v[start_loc:start_loc+seq_len]
+        
+        for i, seq_id in enumerate(infer_state.seq_ids[infer_state.num_prefill_seqs:]):
+            seq_len = infer_state.decoding_seq_lens[i]
+            block_id = block_table[seq_id, seq_len-1]
+            k_cache[block_id, cur_layer] = k[i]
+            v_cache[block_id, cur_layer] = v[i]
+    else:
+        if infer_state.num_prefill_seqs > 0:
+            grid = (infer_state.num_prefill_seqs, infer_state.max_prefill_len)
+            _fwd_kvcache_mgmt_prefill_kernel[grid](
+                k_cache, v_cache,
+                k, v,
+                block_table,
+                infer_state.seq_ids, infer_state.prefill_seq_start_locs, infer_state.prefill_seq_lens,
+                cur_layer,
 
-            model_config.num_layers, 
-            model_config.num_kv_heads, 
-            model_config.head_dim, 
-            engine_config.max_blocks_per_seq
-        )
+                model_config.num_layers, 
+                model_config.num_kv_heads, 
+                model_config.head_dim, 
+                engine_config.max_blocks_per_seq
+            )
 
-    if infer_state.num_decoding_seqs > 0:
-        grid = (infer_state.num_decoding_seqs,)
-        _fwd_kvcache_mgmt_decoding_kernel[grid](
-            k_cache, v_cache,
-            k[infer_state.num_prefill_tokens:, :, :],
-            v[infer_state.num_prefill_tokens:, :, :],
-            block_table,
-            infer_state.seq_ids[infer_state.num_prefill_seqs:],
-            infer_state.decoding_seq_lens,
-            cur_layer,
+        if infer_state.num_decoding_seqs > 0:
+            grid = (infer_state.num_decoding_seqs,)
+            _fwd_kvcache_mgmt_decoding_kernel[grid](
+                k_cache, v_cache,
+                k[infer_state.num_prefill_tokens:, :, :],
+                v[infer_state.num_prefill_tokens:, :, :],
+                block_table,
+                infer_state.seq_ids[infer_state.num_prefill_seqs:],
+                infer_state.decoding_seq_lens,
+                cur_layer,
 
-            model_config.num_layers, 
-            model_config.num_kv_heads, 
-            model_config.head_dim, 
-            engine_config.max_blocks_per_seq
-        )
+                model_config.num_layers, 
+                model_config.num_kv_heads, 
+                model_config.head_dim, 
+                engine_config.max_blocks_per_seq
+            )
 
         # for my_batch_id in range(infer_state.num_decoding_seqs):
         #     my_k = k[infer_state.num_prefill_tokens+my_batch_id]    # [num_kv_heads, head_dim]

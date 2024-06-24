@@ -166,58 +166,95 @@ def paged_attention(
     assert block_table.is_contiguous()
     assert o.is_contiguous()
 
-    mid_o = torch.empty((
-        infer_state.num_decoding_seqs,
-        model_config.num_q_heads,
-        infer_state.num_seq_blocks,
-        model_config.head_dim
-    ), device=q.device, dtype=torch.float32)
-    mid_o_logexpsum = torch.empty((
-        infer_state.num_decoding_seqs,
-        model_config.num_q_heads,
-        infer_state.num_seq_blocks
-    ), device=q.device, dtype=torch.float32)
+    if engine_config.offload_attn_to_cpu:
+        for i, seq_id in enumerate(infer_state.seq_ids[infer_state.num_prefill_seqs:]):
+            seq_len = infer_state.decoding_seq_lens[seq_id]
+            qi = (q[i]
+                .view(-1, model_config.head_dim) # [num_q_heads, head_dim]
+                .unsqueeze(1) # [num_q_heads, 1, head_dim]
+                .to(k_cache.device, torch.float32)
+            )
+            block_ids = block_table[seq_id, :seq_len]
+            k_blocks = k_cache[block_ids, cur_layer] # [seq_len, num_kv_heads, head_dim]
+            v_blocks = v_cache[block_ids, cur_layer]
+            k = (k_blocks
+                .repeat_interleave(model_config.num_q_heads // model_config.num_kv_heads, 1) # [seq_len, num_q_heads * head_dim]
+                .view(-1, model_config.num_q_heads, model_config.head_dim) # [seq_len, num_q_heads, head_dim]
+                .permute(1, 2, 0) # [num_q_heads, head_dim, seq_len]
+                .to(torch.float32)
+            )
+            v = (v_blocks
+                .repeat_interleave(model_config.num_q_heads // model_config.num_kv_heads, 1) # [seq_len, num_q_heads * head_dim]
+                .view(-1, model_config.num_q_heads, model_config.head_dim) # [seq_len, num_q_heads, head_dim]
+                .permute(1, 0, 2) # [num_q_heads, seq_len, head_dim]
+                .to(torch.float32)
+            )
+           
+            attn_score = (torch.bmm(qi, k) # [num_q_heads, 1, seq_len]
+                .squeeze(1) # [num_q_heads, seq_len]
+                .mul_(infer_state.softmax_scale) # [num_q_heads, seq_len]
+                .softmax(dim=1) # [num_q_heads, seq_len]
+                .unsqueeze(1) # [num_q_heads, 1, seq_len]
+            )
 
-    grid = (infer_state.num_decoding_seqs, model_config.num_q_heads, infer_state.num_seq_blocks)
-    _fwd_paged_attention_phase1[grid](
-        mid_o, mid_o_logexpsum,
-        q, k_cache, v_cache,
-        block_table,
+            o[i] = (torch.bmm(attn_score, v) # [num_q_heads, 1, head_dim]
+                .view(-1) # [num_q_heads * head_dim]
+                .to(q.device, torch.float16)
+            )
+            
+    else:
+        mid_o = torch.empty((
+            infer_state.num_decoding_seqs,
+            model_config.num_q_heads,
+            infer_state.num_seq_blocks,
+            model_config.head_dim
+        ), device=q.device, dtype=torch.float32)
+        mid_o_logexpsum = torch.empty((
+            infer_state.num_decoding_seqs,
+            model_config.num_q_heads,
+            infer_state.num_seq_blocks
+        ), device=q.device, dtype=torch.float32)
 
-        # Here we multiply softmax_scale by log2(e) and use `exp2` instead of
-        # `exp` because of two reasons:
-        # 1. Up to 12 Jun 2024, all NVIDIA GPUs does not have a `exp` instruction
-        #    in PTX. When calculating `exp`, they multiply the input by log2(e)
-        #    and use `exp2` instead.
-        # 2. Some optimizations are disabled while using `exp` in a loop, see
-        #    https://github.com/triton-lang/triton/issues/2961
-        infer_state.softmax_scale * 1.442695040888963,
-        infer_state.decoding_seq_lens,
-        infer_state.seq_ids[infer_state.num_prefill_seqs:],
-        infer_state.num_seq_blocks,
-        cur_layer,
+        grid = (infer_state.num_decoding_seqs, model_config.num_q_heads, infer_state.num_seq_blocks)
+        _fwd_paged_attention_phase1[grid](
+            mid_o, mid_o_logexpsum,
+            q, k_cache, v_cache,
+            block_table,
 
-        model_config.num_layers,
-        model_config.num_q_heads,
-        model_config.num_kv_heads,
-        model_config.num_q_heads // model_config.num_kv_heads,
-        model_config.head_dim,
-        infer_state.seq_block_size,
-        engine_config.max_blocks_per_seq,
-        num_warps = 1,
-        num_stages = 4
-    )
+            # Here we multiply softmax_scale by log2(e) and use `exp2` instead of
+            # `exp` because of two reasons:
+            # 1. Up to 12 Jun 2024, all NVIDIA GPUs does not have a `exp` instruction
+            #    in PTX. When calculating `exp`, they multiply the input by log2(e)
+            #    and use `exp2` instead.
+            # 2. Some optimizations are disabled while using `exp` in a loop, see
+            #    https://github.com/triton-lang/triton/issues/2961
+            infer_state.softmax_scale * 1.442695040888963,
+            infer_state.decoding_seq_lens,
+            infer_state.seq_ids[infer_state.num_prefill_seqs:],
+            infer_state.num_seq_blocks,
+            cur_layer,
 
-    grid = (infer_state.num_decoding_seqs, model_config.num_q_heads)
-    _fwd_paged_attention_phase2[grid](
-        mid_o, mid_o_logexpsum,
-        o,
-        infer_state.decoding_seq_lens,
-        model_config.num_q_heads,
-        model_config.head_dim,
-        infer_state.num_seq_blocks,
-        infer_state.seq_block_size,
-    )
+            model_config.num_layers,
+            model_config.num_q_heads,
+            model_config.num_kv_heads,
+            model_config.num_q_heads // model_config.num_kv_heads,
+            model_config.head_dim,
+            infer_state.seq_block_size,
+            engine_config.max_blocks_per_seq,
+            num_warps = 1,
+            num_stages = 4
+        )
+
+        grid = (infer_state.num_decoding_seqs, model_config.num_q_heads)
+        _fwd_paged_attention_phase2[grid](
+            mid_o, mid_o_logexpsum,
+            o,
+            infer_state.decoding_seq_lens,
+            model_config.num_q_heads,
+            model_config.head_dim,
+            infer_state.num_seq_blocks,
+            infer_state.seq_block_size,
+        )
 
     # from swiftllm.utils import cdiv
     # for my_batch_id in range(infer_state.num_decoding_seqs):
