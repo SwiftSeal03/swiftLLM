@@ -1,3 +1,5 @@
+import time
+
 import torch
 import triton
 import triton.language as tl
@@ -95,8 +97,9 @@ def store_kvcache(
     assert infer_state.decoding_seq_lens.is_contiguous()
 
     if engine_config.offload_attn_to_cpu:
-        k = k.to(k_cache.device)
-        v = v.to(v_cache.device)
+        start = time.perf_counter() * 1000
+        k = k.to(device=k_cache.device, dtype=k_cache.dtype)
+        v = v.to(device=v_cache.device, dtype=v_cache.dtype)
         for i, seq_id in enumerate(infer_state.seq_ids[:infer_state.num_prefill_seqs]):
             start_loc = infer_state.prefill_seq_start_locs[i]
             seq_len = infer_state.prefill_seq_lens[i]
@@ -109,6 +112,9 @@ def store_kvcache(
             block_id = block_table[seq_id, seq_len-1]
             k_cache[block_id, cur_layer] = k[i]
             v_cache[block_id, cur_layer] = v[i]
+        
+        if cur_layer == 0:
+            print(f"Store_kvcache time: {time.perf_counter() * 1000 - start:.2f} ms")
     else:
         if infer_state.num_prefill_seqs > 0:
             grid = (infer_state.num_prefill_seqs, infer_state.max_prefill_len)

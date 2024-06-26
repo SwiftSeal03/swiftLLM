@@ -1,3 +1,5 @@
+import threading, time
+
 import torch
 import triton
 import triton.language as tl
@@ -148,7 +150,58 @@ def _fwd_paged_attention_phase2(
     offs_o = (my_batch_id*num_q_heads+my_q_head_id)*head_dim + tl.arange(0, head_dim)
     tl.store(o + offs_o, (acc / sum_exp).to(tl.float16))
 
+@torch.inference_mode()
+def paged_attention_one_seq(
+    i: int,
+    q: torch.Tensor,                    # [num_q_heads, head_dim]
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    model_config: LlamaModelConfig,
+    infer_state: LlamaInferState,
+    cur_layer: int,
+    o: torch.Tensor     # [num_q_heads, head_dim]
+) -> torch.Tensor:
+    start = time.perf_counter() * 1000
+    seq_id = infer_state.seq_ids[infer_state.num_prefill_seqs + i].item()
+    seq_len = infer_state.decoding_seq_lens[seq_id].item()
+    block_ids = block_table[seq_id, :seq_len]
+    k_blocks = k_cache[block_ids, cur_layer] # [seq_len, num_kv_heads, head_dim]
+    v_blocks = v_cache[block_ids, cur_layer]
+    blk_retrieve_end = time.perf_counter() * 1000
+    k = (k_blocks
+        .permute(1, 2, 0) # [num_kv_heads, head_dim, seq_len]
+        .to(torch.float32)  
+    )
+    v = (v_blocks
+        .permute(1, 0, 2) # [num_kv_heads, seq_len, head_dim]
+        .to(torch.float32)
+    )
+    preprocess_end = time.perf_counter() * 1000
+    
+    attn_score = (torch
+        .bmm(q[i], k) # [num_kv_heads, q_heads_per_kv_head, seq_len]
+        .mul_(infer_state.softmax_scale)
+        .softmax(dim=-1)
+    )
+    attn_score_end = time.perf_counter() * 1000
 
+    o[i] = (torch
+        .bmm(attn_score, v) # [num_kv_heads, q_heads_per_kv_head, seq_len]
+        .view(-1)
+    )
+    # torch._scaled_dot_product_flash_attention_for_cpu(
+    #     q[i].unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0), scale=infer_state.softmax_scale
+    # ).output
+    output_end = time.perf_counter() * 1000
+
+    if i == 0 and cur_layer == 0:
+        print(f"Block retrieval: {blk_retrieve_end - start:.2f} ms")
+        print(f"Preprocess: {preprocess_end - blk_retrieve_end:.2f} ms")
+        print(f"Attn score: {attn_score_end - preprocess_end:.2f} ms")
+        print(f"Compute output: {output_end - attn_score_end:.2f} ms")
+
+@torch.inference_mode()
 def paged_attention(
     q: torch.Tensor,                    # [num_decoding_seqs, num_q_heads, head_dim]
     k_cache: torch.Tensor,
@@ -167,41 +220,18 @@ def paged_attention(
     assert o.is_contiguous()
 
     if engine_config.offload_attn_to_cpu:
-        for i, seq_id in enumerate(infer_state.seq_ids[infer_state.num_prefill_seqs:]):
-            seq_len = infer_state.decoding_seq_lens[seq_id]
-            qi = (q[i]
-                .view(-1, model_config.head_dim) # [num_q_heads, head_dim]
-                .unsqueeze(1) # [num_q_heads, 1, head_dim]
-                .to(k_cache.device, torch.float32)
+        o_cpu = torch.empty_like(o, device='cpu', dtype=torch.float32)
+        q = (q
+            .view(infer_state.num_decoding_seqs, model_config.num_kv_heads, -1, model_config.head_dim)
+            .to(k_cache.device, torch.float32) # [num_decoding_seqs, num_kv_heads, q_heads_per_kv_head, head_dim]
+        )
+        for i in range(infer_state.num_decoding_seqs):
+            paged_attention_one_seq(
+                i, q, k_cache, v_cache, block_table,
+                model_config, infer_state, cur_layer, o_cpu
             )
-            block_ids = block_table[seq_id, :seq_len]
-            k_blocks = k_cache[block_ids, cur_layer] # [seq_len, num_kv_heads, head_dim]
-            v_blocks = v_cache[block_ids, cur_layer]
-            k = (k_blocks
-                .repeat_interleave(model_config.num_q_heads // model_config.num_kv_heads, 1) # [seq_len, num_q_heads * head_dim]
-                .view(-1, model_config.num_q_heads, model_config.head_dim) # [seq_len, num_q_heads, head_dim]
-                .permute(1, 2, 0) # [num_q_heads, head_dim, seq_len]
-                .to(torch.float32)
-            )
-            v = (v_blocks
-                .repeat_interleave(model_config.num_q_heads // model_config.num_kv_heads, 1) # [seq_len, num_q_heads * head_dim]
-                .view(-1, model_config.num_q_heads, model_config.head_dim) # [seq_len, num_q_heads, head_dim]
-                .permute(1, 0, 2) # [num_q_heads, seq_len, head_dim]
-                .to(torch.float32)
-            )
-           
-            attn_score = (torch.bmm(qi, k) # [num_q_heads, 1, seq_len]
-                .squeeze(1) # [num_q_heads, seq_len]
-                .mul_(infer_state.softmax_scale) # [num_q_heads, seq_len]
-                .softmax(dim=1) # [num_q_heads, seq_len]
-                .unsqueeze(1) # [num_q_heads, 1, seq_len]
-            )
+        o.copy_(o_cpu.to(torch.float16))
 
-            o[i] = (torch.bmm(attn_score, v) # [num_q_heads, 1, head_dim]
-                .view(-1) # [num_q_heads * head_dim]
-                .to(q.device, torch.float16)
-            )
-            
     else:
         mid_o = torch.empty((
             infer_state.num_decoding_seqs,

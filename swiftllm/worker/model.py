@@ -138,6 +138,19 @@ class LlamaModel:
         if self.engine_config.offload_attn_to_cpu:
             num_blocks = self.engine_config.num_cpu_blocks
             cache_device = "cpu"
+
+             # Initialize KV cache
+            kvcache_shape = (
+                num_blocks,
+                self.model_config.num_layers,
+                self.model_config.num_kv_heads,
+                self.model_config.head_dim
+            )
+            # Here we use torch.zeros instead of torch.empty, since that torch.empty
+            # has the possibility to contain NaNs, which will cause the model to output NaNs.
+            self.k_cache = torch.zeros(kvcache_shape, dtype=torch.float32, device=cache_device)
+            self.v_cache = torch.zeros(kvcache_shape, dtype=torch.float32, device=cache_device)
+
         else:
             num_blocks = self.num_gpu_blocks
             cache_device = "cuda"
@@ -152,17 +165,17 @@ class LlamaModel:
             self.k_swap = torch.zeros(kvswap_shape, dtype=torch.float16, device="cpu")
             self.v_swap = torch.zeros(kvswap_shape, dtype=torch.float16, device="cpu")
 
-        # Initialize KV cache
-        kvcache_shape = (
-            num_blocks,
-            self.model_config.num_layers,
-            self.model_config.num_kv_heads,
-            self.model_config.head_dim
-        )
-        # Here we use torch.zeros instead of torch.empty, since that torch.empty
-        # has the possibility to contain NaNs, which will cause the model to output NaNs.
-        self.k_cache = torch.zeros(kvcache_shape, dtype=torch.float16, device=cache_device)
-        self.v_cache = torch.zeros(kvcache_shape, dtype=torch.float16, device=cache_device)
+            # Initialize KV cache
+            kvcache_shape = (
+                num_blocks,
+                self.model_config.num_layers,
+                self.model_config.num_kv_heads,
+                self.model_config.head_dim
+            )
+            # Here we use torch.zeros instead of torch.empty, since that torch.empty
+            # has the possibility to contain NaNs, which will cause the model to output NaNs.
+            self.k_cache = torch.zeros(kvcache_shape, dtype=torch.float16, device=cache_device)
+            self.v_cache = torch.zeros(kvcache_shape, dtype=torch.float16, device=cache_device)
 
         # Initialize block manager
         self.gpu_block_manager = BlockManager(
