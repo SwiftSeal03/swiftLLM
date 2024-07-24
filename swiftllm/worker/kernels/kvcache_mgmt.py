@@ -107,11 +107,11 @@ def store_kvcache(
             k_cache[block_ids, cur_layer] = k[start_loc:start_loc+seq_len]
             v_cache[block_ids, cur_layer] = v[start_loc:start_loc+seq_len]
         
-        for i, seq_id in enumerate(infer_state.seq_ids[infer_state.num_prefill_seqs:]):
-            seq_len = infer_state.decoding_seq_lens[i]
-            block_id = block_table[seq_id, seq_len-1]
-            k_cache[block_id, cur_layer] = k[i]
-            v_cache[block_id, cur_layer] = v[i]
+
+        seq_ids = infer_state.seq_ids[infer_state.num_prefill_seqs:]
+        block_ids = block_table[seq_ids, infer_state.decoding_seq_lens-1]
+        k_cache[block_ids, cur_layer] = k[infer_state.num_prefill_tokens:]
+        v_cache[block_ids, cur_layer] = v[infer_state.num_prefill_tokens:]
         
         if cur_layer == 0:
             print(f"Store_kvcache time: {time.perf_counter() * 1000 - start:.2f} ms")

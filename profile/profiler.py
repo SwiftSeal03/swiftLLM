@@ -10,10 +10,12 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_path", type=str, default="/home/ubuntu/weights/Llama-3-8B-Instruct-Gradient-1048k")
     parser.add_argument("--data_path", type=str, default="sample.txt")
-    parser.add_argument("--num_cpu_blocks", type=int, default=45000)
+    parser.add_argument("--num_cpu_blocks", type=int, default=25000)
     parser.add_argument("--offload_attn_to_cpu", "--cpu", action="store_true")
     parser.add_argument("--num_cpu_threads", "-t", type=int, default=8)
     args = parser.parse_args()
+
+    torch.ops.load_library("/home/ubuntu/pacpu/build/libpacpu.so")
 
     engine_config = swiftllm.EngineConfig(
         model_path = args.model_path,
@@ -49,7 +51,7 @@ if __name__ == '__main__':
     with open(args.data_path) as f:
         prompt = f.read()
     
-    prompts = [prompt] * 100
+    prompts = [prompt] * 60
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_path)
     outputs = []
