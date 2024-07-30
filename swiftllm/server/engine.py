@@ -151,7 +151,8 @@ class Engine:
                 self.model.forward,
                 input_ids,
                 seq_ids,
-                decoding_seq_lens_list
+                decoding_seq_lens_list,
+                cpu_num_decoding_seqs=0
             )
 
             # Deal with output tokens

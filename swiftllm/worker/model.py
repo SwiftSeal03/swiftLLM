@@ -217,6 +217,8 @@ class LlamaModel:
         input_ids_list: list[list[int]], # [batch_size, *]
         seq_ids_list: list[int],     # [batch_size]
         decoding_seq_lens_list: list[int], # [num_decoding_seqs]
+        cpu_num_decoding_seqs: int = 0,
+
         ignore_kvcache: bool = False,   # Skip actions related to kv cache, useful when profiling the number of kv blocks
     ) -> list[int]:
         """
@@ -306,6 +308,9 @@ class LlamaModel:
             num_decoding_seqs = batch_size - num_prefill_seqs,
             decoding_seq_lens = decoding_seq_lens,
             max_decoding_len = max_decoding_len,
+
+            cpu_num_decoding_seqs = 0,
+            cpu_decoding_seq_lens = [],
 
             seq_block_size = seq_block_size,
             num_seq_blocks = (max_decoding_len + seq_block_size-1) // seq_block_size,

@@ -257,3 +257,17 @@ def paged_attention(
 
     #     res = torch.bmm(my_attn_score, my_v).squeeze(1)   # [num_q_heads, head_dim]
     #     o[my_batch_id] = res.reshape(-1).to(torch.float16)
+
+
+def cpu_paged_attention(
+    q: torch.Tensor,                    # [num_decoding_seqs, num_q_heads, head_dim]
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    model_config: LlamaModelConfig,
+    engine_config: EngineConfig,
+    infer_state: LlamaInferState,
+    cur_layer: int,
+    o: torch.Tensor     # [num_decoding_seqs, num_q_heads, head_dim]
+):
+   pass

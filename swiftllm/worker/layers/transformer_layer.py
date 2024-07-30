@@ -9,7 +9,7 @@ from swiftllm.worker.infer_state import LlamaInferState
 from swiftllm.worker.kernels.linear import linear
 from swiftllm.worker.kernels.rmsnorm import fused_add_rmsnorm_inplace
 from swiftllm.worker.kernels.rotary_emb import rotary_embedding_inplace
-from swiftllm.worker.kernels.paged_attn import paged_attention
+from swiftllm.worker.kernels.paged_attn import paged_attention, cpu_paged_attention
 from swiftllm.worker.kernels.kvcache_mgmt import store_kvcache
 from swiftllm.worker.kernels.silu_and_mul import silu_and_mul_inplace
 
@@ -103,15 +103,24 @@ class LlamaTransformerLayer:
             with torch.cuda.stream(self.decoding_piggyback_stream):
                 torch.cuda.current_stream().wait_event(store_kvcache_event)
                 paged_attention(
-                    q[infer_state.num_prefill_tokens:, :, :],
+                    q[infer_state.num_prefill_tokens:infer_state.gpu_decode_end, :, :],
                     k_cache, v_cache, block_table,
                     self.model_config, self.engine_config, infer_state,
                     self.layer_id,
-                    o[infer_state.num_prefill_tokens:, :],
+                    o[infer_state.num_prefill_tokens:infer_state.gpu_decode_end, :],
                 )
                 event = torch.cuda.Event()
                 event.record()
             torch.cuda.default_stream().wait_event(event)
+        if infer_state.cpu_num_decoding_seqs > 0:
+            cpu_paged_attention(
+                q[infer_state.gpu_decode_end:, :, :],
+                k_cache, v_cache, block_table,
+                self.model_config, self.engine_config, infer_state,
+                self.layer_id,
+                o[infer_state.gpu_decode_end:, :],
+            )
+            raise NotImplementedError("CPU decoding is not supported")
         
         # Output GEMM
         o = linear(o, self.weight.o_proj)	# [num_total_tokens, hidden_size]
