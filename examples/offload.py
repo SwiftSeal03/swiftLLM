@@ -23,7 +23,7 @@ if __name__ == '__main__':
         
         block_size = 16,
         gpu_mem_utilization = 0.99,
-        num_cpu_blocks = 0,
+        num_cpu_blocks = 1000,
         max_seqs_in_block_table = 256,
         max_blocks_per_seq = 2048,
 
@@ -38,7 +38,8 @@ if __name__ == '__main__':
     # For instructions on how to initialize the model, see comments in swiftllm/worker/model.py
     model = swiftllm.LlamaModel(engine_config)
     model.load_weights()
-    num_blocks = model.profile_num_blocks()
+    # num_blocks = model.profile_num_blocks()
+    num_blocks = 1000
     print("Number of blocks:", num_blocks)
     model.init_kvcache_and_swap(num_blocks)
 
@@ -46,8 +47,10 @@ if __name__ == '__main__':
     print(f"Model creation time: {model_creation_time:.2f} seconds")
     
     prompts = [
-        "one two three four five six seven eight nine ten " * 10
-    ] * 100
+        "The advent of large languange models"
+    ] + [
+        "Compared to GPUs, the efficiency of doing ML workload on CPU is"
+    ]
 
     tokenizer = AutoTokenizer.from_pretrained(model_path)
     outputs = []
@@ -62,6 +65,8 @@ if __name__ == '__main__':
     # print(tokenizer.batch_decode(prompt_phase_outputs, skip_special_tokens=True))
     outputs.append(prompt_phase_outputs)
 
+    model.swap_out_seqs([1])
+
     seq_lens = [len(x) for x in input_ids]
     last_round_outputs = prompt_phase_outputs
     for i in range(11):
@@ -71,14 +76,15 @@ if __name__ == '__main__':
         last_round_outputs = model.forward(
             [[x] for x in last_round_outputs],
             list(range(0, len(prompts))),
-            seq_lens
+            seq_lens,
+            cpu_num_decoding_seqs=1
         )
         # print(tokenizer.batch_decode(last_round_outputs, skip_special_tokens=True))
         outputs.append(last_round_outputs)
         end = time.perf_counter()
         print(f"Decoding time: {end - start:.4f} seconds")
     
-    for i, prompt in enumerate(prompts[:1]):
+    for i, prompt in enumerate(prompts):
         output_tokens = [x[i] for x in outputs]
         output_text = tokenizer.decode(output_tokens, skip_special_tokens=True)
         print(f"{prompt}|{output_text}")

@@ -34,7 +34,10 @@ class LlamaTransformerLayer:
         residual_buf: torch.Tensor, # [num_tokens, hidden_size]
         k_cache: torch.Tensor,
         v_cache: torch.Tensor,
+        k_swap: torch.Tensor,
+        v_swap: torch.Tensor,
         block_table: torch.Tensor,
+        cpu_block_table: torch.Tensor,
         infer_state: LlamaInferState,
     ) -> torch.Tensor:
         # (fused) Add last layer's residual, and perform RMSNorm
@@ -69,7 +72,9 @@ class LlamaTransformerLayer:
             store_kvcache(
                 k, v,
                 k_cache, v_cache,
+                k_swap, v_swap,
                 block_table,
+                cpu_block_table,
                 self.model_config,
                 self.engine_config,
                 infer_state,
@@ -115,12 +120,11 @@ class LlamaTransformerLayer:
         if infer_state.cpu_num_decoding_seqs > 0:
             cpu_paged_attention(
                 q[infer_state.gpu_decode_end:, :, :],
-                k_cache, v_cache, block_table,
+                k_swap, v_swap, cpu_block_table,
                 self.model_config, self.engine_config, infer_state,
                 self.layer_id,
                 o[infer_state.gpu_decode_end:, :],
             )
-            raise NotImplementedError("CPU decoding is not supported")
         
         # Output GEMM
         o = linear(o, self.weight.o_proj)	# [num_total_tokens, hidden_size]

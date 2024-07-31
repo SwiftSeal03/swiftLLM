@@ -160,14 +160,14 @@ class LlamaModel:
 
         # Initialize block manager
         self.gpu_block_manager = BlockManager(
-            "GPU",
+            "cuda",
             self.num_blocks,
             self.engine_config.max_seqs_in_block_table,
             self.engine_config.max_blocks_per_seq,
             self.engine_config.block_size
         )
         self.cpu_block_manager = BlockManager(
-            "CPU",
+            "cpu",
             self.engine_config.num_cpu_blocks,
             self.engine_config.max_seqs_in_block_table,
             self.engine_config.max_blocks_per_seq,
@@ -204,7 +204,10 @@ class LlamaModel:
                 residual_buf,
                 self.k_cache,
                 self.v_cache,
+                self.k_swap,
+                self.v_swap,
                 self.gpu_block_manager.block_table if not infer_state.ignore_kvcache else None,
+                self.cpu_block_manager.block_table if not infer_state.ignore_kvcache else None,
                 infer_state,
             )
         input_embds += residual_buf
@@ -234,11 +237,15 @@ class LlamaModel:
         flattened_input_ids = list(itertools.chain(*input_ids_list))
         seq_lengths_list = [len(seq) for seq in input_ids_list[:num_prefill_seqs]] + decoding_seq_lens_list
 
-        seq_ids = torch.tensor(seq_ids_list, dtype=torch.int32, device="cuda")
-        seq_lengths = torch.tensor(seq_lengths_list, dtype=torch.int32, device="cuda")
-
         batch_size = len(input_ids_list)
         num_tokens = len(flattened_input_ids)
+        gpu_decode_end = batch_size - cpu_num_decoding_seqs
+
+        seq_ids = torch.tensor(seq_ids_list[:gpu_decode_end], dtype=torch.int32, device="cuda")
+        seq_lengths = torch.tensor(seq_lengths_list[:gpu_decode_end], dtype=torch.int32, device="cuda")
+
+        cpu_seq_ids = torch.tensor(seq_ids_list[gpu_decode_end:], dtype=torch.int32, device="cpu")
+        cpu_decoding_seq_lens = torch.tensor(seq_lengths_list[gpu_decode_end:], dtype=torch.int32, device="cpu")
 
         prefill_seq_lens_list = seq_lengths_list[:num_prefill_seqs]
         prefill_seq_lens = torch.tensor(prefill_seq_lens_list, dtype=torch.int32, device="cuda")
@@ -258,13 +265,19 @@ class LlamaModel:
                 )
                 for prefill_seq_len in prefill_seq_lens_list
             ]) if prefill_seq_lens_list else torch.empty(0, device="cuda", dtype=torch.int32),
-            decoding_seq_lens - 1
+            decoding_seq_lens - 1,
+            (cpu_decoding_seq_lens - 1).cuda()
         ), dim=0)
 
         if not ignore_kvcache:
             self.gpu_block_manager.allocate_blocks_for_seqs(
                 seq_ids,
                 seq_lengths
+            )
+
+            self.cpu_block_manager.allocate_blocks_for_seqs(
+                cpu_seq_ids,
+                cpu_decoding_seq_lens
             )
 
         # Select the seq_block_size
@@ -305,12 +318,13 @@ class LlamaModel:
             prefill_seq_lens = prefill_seq_lens,
             max_prefill_len = max_prefill_len,
 
-            num_decoding_seqs = batch_size - num_prefill_seqs,
+            num_decoding_seqs = batch_size - num_prefill_seqs - cpu_num_decoding_seqs,
             decoding_seq_lens = decoding_seq_lens,
             max_decoding_len = max_decoding_len,
 
-            cpu_num_decoding_seqs = 0,
-            cpu_decoding_seq_lens = [],
+            cpu_seq_ids = cpu_seq_ids,
+            cpu_num_decoding_seqs = cpu_num_decoding_seqs,
+            cpu_decoding_seq_lens = cpu_decoding_seq_lens,
 
             seq_block_size = seq_block_size,
             num_seq_blocks = (max_decoding_len + seq_block_size-1) // seq_block_size,
@@ -333,10 +347,12 @@ class LlamaModel:
     ):
         src_block_manager = self.cpu_block_manager if is_swap_in else self.gpu_block_manager
         dst_block_manager = self.gpu_block_manager if is_swap_in else self.cpu_block_manager
-        seq_ids = torch.tensor(seq_ids_list, dtype=torch.int32, device="cuda")
-        seq_lengths = src_block_manager.get_num_allocated_blocks(seq_ids) * self.engine_config.block_size
-        src_block_ids = src_block_manager.gather_allocated_blocks_and_free(seq_ids)
-        dst_block_ids = dst_block_manager.allocate_blocks_for_seqs(seq_ids, seq_lengths)
+        src_seq_ids = torch.tensor(seq_ids_list, dtype=torch.int32, device=src_block_manager.device_name)
+        dst_seq_ids = src_seq_ids.to(dst_block_manager.device_name)
+        src_seq_lengths = src_block_manager.get_num_allocated_blocks(src_seq_ids) * self.engine_config.block_size
+        dst_seq_lengths = src_seq_lengths.to(dst_block_manager.device_name)
+        src_block_ids = src_block_manager.gather_allocated_blocks_and_free(src_seq_ids)
+        dst_block_ids = dst_block_manager.allocate_blocks_for_seqs(dst_seq_ids, dst_seq_lengths)
         swiftllm_c.swap_blocks(
             src_block_ids.tolist(),
             dst_block_ids.tolist(),

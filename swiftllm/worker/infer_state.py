@@ -20,8 +20,9 @@ class LlamaInferState:
     decoding_seq_lens: torch.Tensor # [batch_size]
     max_decoding_len: int
 
+    cpu_seq_ids: torch.Tensor
     cpu_num_decoding_seqs: int
-    cpu_decoding_seq_lens: list[int]
+    cpu_decoding_seq_lens: torch.Tensor
 
     @property
     def gpu_decode_end(self) -> int:

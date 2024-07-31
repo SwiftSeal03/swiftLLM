@@ -40,10 +40,18 @@ def set_block_table_and_num_seq_alloc_blocks(
     """
     block_needed_cumsum = torch.cumsum(block_needed, 0)
     max_blocks_per_seq = block_table.shape[1]
-    grid = (block_needed.shape[0], )
-    _fwd_set_block_table_and_num_seq_alloc_blocks_kernel[grid](
-        block_table, candidate_blocks, seq_ids, num_seq_allocated_blocks, block_needed, block_needed_cumsum, max_blocks_per_seq
-    )
+    if block_table.is_cuda:
+        grid = (block_needed.shape[0], )
+        _fwd_set_block_table_and_num_seq_alloc_blocks_kernel[grid](
+            block_table, candidate_blocks, seq_ids, num_seq_allocated_blocks, block_needed, block_needed_cumsum, max_blocks_per_seq
+        )
+    else:
+        for i, n in enumerate(block_needed):
+            seq_id = seq_ids[i]
+            bt_off = num_seq_allocated_blocks[seq_id]
+            cb_off = block_needed_cumsum[i] - n
+            block_table[seq_id, bt_off: bt_off + n] = candidate_blocks[cb_off: cb_off + n]
+            num_seq_allocated_blocks[seq_id] += n
 
 
 @triton.jit
@@ -75,9 +83,15 @@ def unset_block_table_and_num_seq_alloc_blocks(
     """
     max_blocks_per_seq = block_table.shape[1]
     grid = (seq_ids.shape[0], )
-    _fwd_unset_block_table_and_num_seq_alloc_blocks_kernel[grid](
-        num_seq_allocated_blocks, block_table, seq_ids, is_block_free, max_blocks_per_seq
-    )
+    if block_table.is_cuda:
+        _fwd_unset_block_table_and_num_seq_alloc_blocks_kernel[grid](
+            num_seq_allocated_blocks, block_table, seq_ids, is_block_free, max_blocks_per_seq
+        )
+    else:
+        for seq_id in seq_ids:
+            n = num_seq_allocated_blocks[seq_id]
+            is_block_free[block_table[seq_id, :n]] = True
+            num_seq_allocated_blocks[seq_id] = 0
 
 
 @triton.jit
@@ -117,9 +131,17 @@ def gather_allocated_blocks_and_unset(
 
     max_blocks_per_seq = block_table.shape[1]
     grid = (seq_ids.shape[0], )
-    _fwd_gather_allocated_blocks_and_unset_kernel[grid](
-        num_seq_allocated_blocks, block_table, seq_ids, is_block_free,
-        num_allocated_blocks_cumsum, gathered_block_ids, max_blocks_per_seq
-    )
+    if block_table.is_cuda:
+        _fwd_gather_allocated_blocks_and_unset_kernel[grid](
+            num_seq_allocated_blocks, block_table, seq_ids, is_block_free,
+            num_allocated_blocks_cumsum, gathered_block_ids, max_blocks_per_seq
+        )
+    else:
+        for i, seq_id in enumerate(seq_ids):
+            n = num_seq_allocated_blocks[seq_id]
+            gb_off = num_allocated_blocks_cumsum[i] - n
+            gathered_block_ids[gb_off: gb_off + n] = block_table[seq_id, :n]
+            is_block_free[block_table[seq_id, :n]] = True
+            num_seq_allocated_blocks[seq_id] = 0
 
     return gathered_block_ids

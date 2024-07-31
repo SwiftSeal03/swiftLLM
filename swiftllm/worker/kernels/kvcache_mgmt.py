@@ -83,7 +83,10 @@ def store_kvcache(
     v: torch.Tensor,
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
+    k_swap: torch.Tensor,
+    v_swap: torch.Tensor,
     block_table: torch.Tensor,
+    cpu_block_table: torch.Tensor,
     model_config: LlamaModelConfig,
     engine_config: EngineConfig,
     infer_state: LlamaInferState,
@@ -130,3 +133,10 @@ def store_kvcache(
 
         #     k_cache[my_block_index][cur_layer][:, my_block_offset, :] = my_k
         #     v_cache[my_block_index][cur_layer][:, my_block_offset, :] = my_v
+    
+    if infer_state.cpu_num_decoding_seqs > 0:
+        num_blocks = (infer_state.cpu_decoding_seq_lens - 1) // engine_config.block_size
+        block_offs = (infer_state.cpu_decoding_seq_lens - 1) % engine_config.block_size
+        block_ids = cpu_block_table[infer_state.cpu_seq_ids, num_blocks]
+        k_swap[block_ids, cur_layer, :, block_offs, :] = k[infer_state.gpu_decode_end:, :, :].cpu()
+        v_swap[block_ids, cur_layer, :, block_offs, :] = v[infer_state.gpu_decode_end:, :, :].cpu()

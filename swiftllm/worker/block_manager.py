@@ -25,19 +25,19 @@ class BlockManager:
         self.num_seq_allocated_blocks = torch.zeros(
             (max_seqs_in_block_table,),
             dtype=torch.int32,
-            device="cuda"
+            device=device_name
         )
         # (seq_id, block_index) |-> block_id
         self.block_table = torch.empty(
             (max_seqs_in_block_table, max_blocks_per_seq),
             dtype=torch.int32,
-            device="cuda",
+            device=device_name
         )
         # block_id |-> whether this block is free or not
         self.is_block_free = torch.ones(
             (num_blocks,),
             dtype=torch.bool,
-            device="cuda"
+            device=device_name
         )
     
     def _allocate_blocks(self, num_blocks: int) -> torch.Tensor:
