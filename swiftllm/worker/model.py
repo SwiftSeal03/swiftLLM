@@ -58,6 +58,9 @@ class LlamaModel:
 
         # Block manager
         self.cpu_block_manager = self.gpu_block_manager = None
+
+        if engine_config.library_path:
+            torch.ops.load_library(engine_config.library_path)
         
     @torch.inference_mode()
     def load_weights(self):

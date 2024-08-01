@@ -270,14 +270,29 @@ def cpu_paged_attention(
     cur_layer: int,
     o: torch.Tensor     # [num_decoding_seqs, num_q_heads, head_dim]
 ):
-    seq_ids = infer_state.cpu_seq_ids.tolist()
-    for i, seq_id in enumerate(seq_ids):
-        qi = q[i].cpu().view(model_config.num_kv_heads, -1, model_config.head_dim)   # [num_kv_heads, qh_per_kvh, head_dim]
-        num_blocks = (infer_state.cpu_decoding_seq_lens[i].item() - 1) // engine_config.block_size + 1
-        block_ids = block_table[seq_id][:num_blocks]
-        ki = k_cache[block_ids, cur_layer] # [num_blocks, num_kv_heads, block_size, head_dim]
-        ki = ki.transpose(0, 1).contiguous().view(model_config.num_kv_heads, -1, model_config.head_dim)[:, :infer_state.cpu_decoding_seq_lens[i], :]
-        vi = v_cache[block_ids, cur_layer]
-        vi = vi.transpose(0, 1).contiguous().view(model_config.num_kv_heads, -1, model_config.head_dim)[:, :infer_state.cpu_decoding_seq_lens[i], :]
+    q = q.cpu()
+    o_cpu = torch.zeros_like(o, device='cpu', dtype=torch.float32)
+    torch.ops.pacpu.paged_attention_cpu_ispc(
+        cur_layer,
+        infer_state.softmax_scale,
+        infer_state.cpu_seq_ids.tolist(),
+        infer_state.cpu_decoding_seq_lens.tolist(),
 
-        o[i].copy_(torch.nn.functional.scaled_dot_product_attention(qi, ki, vi, scale=infer_state.softmax_scale).cuda().view(-1))
+        q,
+        k_cache,
+        v_cache,
+        block_table,
+        o_cpu
+    )
+    o.copy_(o_cpu.to(torch.float16), non_blocking=True)
+    # seq_ids = infer_state.cpu_seq_ids.tolist()
+    # for i, seq_id in enumerate(seq_ids):
+    #     qi = q[i].cpu().view(model_config.num_kv_heads, -1, model_config.head_dim)   # [num_kv_heads, qh_per_kvh, head_dim]
+    #     num_blocks = (infer_state.cpu_decoding_seq_lens[i].item() - 1) // engine_config.block_size + 1
+    #     block_ids = block_table[seq_id][:num_blocks]
+    #     ki = k_cache[block_ids, cur_layer] # [num_blocks, num_kv_heads, block_size, head_dim]
+    #     ki = ki.transpose(0, 1).contiguous().view(model_config.num_kv_heads, -1, model_config.head_dim)[:, :infer_state.cpu_decoding_seq_lens[i], :]
+    #     vi = v_cache[block_ids, cur_layer]
+    #     vi = vi.transpose(0, 1).contiguous().view(model_config.num_kv_heads, -1, model_config.head_dim)[:, :infer_state.cpu_decoding_seq_lens[i], :]
+
+    #     o[i].copy_(torch.nn.functional.scaled_dot_product_attention(qi, ki, vi, scale=infer_state.softmax_scale).cuda().view(-1))

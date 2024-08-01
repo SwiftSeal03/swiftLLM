@@ -15,7 +15,14 @@ if __name__ == '__main__':
         type=str,
         default="/home/ubuntu/weights/Llama-3-8B-Instruct-Gradient-1048k"
     )
+    parser.add_argument(
+        "--library-path",
+        help="Path to the shared library",
+        type=str,
+        default="/home/ubuntu/pacpu/build/libpacpu.so"
+    )
     model_path = parser.parse_args().model_path
+    library_path = parser.parse_args().library_path
 
     engine_config = swiftllm.EngineConfig(
         model_path = model_path,
@@ -29,7 +36,9 @@ if __name__ == '__main__':
 
         # The following are not used in the offline example
         max_batch_size = 16,
-        max_tokens_in_batch = 2048*16
+        max_tokens_in_batch = 2048*16,
+
+        library_path=library_path
     )
 
     start_time = time.perf_counter()

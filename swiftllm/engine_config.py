@@ -22,6 +22,9 @@ class EngineConfig:
     max_batch_size: int
     max_tokens_in_batch: int
 
+    # External library path
+    library_path: str = None
+
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
         """
@@ -81,5 +84,11 @@ class EngineConfig:
             type=int,
             default=32768,
             help="Maximum number of tokens in a batch",
+        )
+
+        parser.add_argument(
+            "--library-path",
+            type=str,
+            help="Path to the external library",
         )
         
