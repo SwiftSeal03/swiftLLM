@@ -30,7 +30,7 @@ if __name__ == '__main__':
         
         block_size = 16,
         gpu_mem_utilization = 0.99,
-        num_cpu_blocks = 1000,
+        num_cpu_blocks = 1600,
         max_seqs_in_block_table = 256,
         max_blocks_per_seq = 2048,
 
@@ -47,19 +47,18 @@ if __name__ == '__main__':
     # For instructions on how to initialize the model, see comments in swiftllm/worker/model.py
     model = swiftllm.LlamaModel(engine_config)
     model.load_weights()
-    # num_blocks = model.profile_num_blocks()
-    num_blocks = 1000
+    num_blocks = model.profile_num_blocks()
     print("Number of blocks:", num_blocks)
     model.init_kvcache_and_swap(num_blocks)
 
     model_creation_time = time.perf_counter() - start_time
     print(f"Model creation time: {model_creation_time:.2f} seconds")
     
-    prompts = [
-        "The advent of large languange models"
-    ] + [
-        "Compared to GPUs, the efficiency of doing ML workload on CPU is"
-    ]
+    ngpu_prompts = 75
+    ncpu_prompts = 0
+    nprompts = ncpu_prompts + ngpu_prompts
+    with open("example.txt", "r") as f:
+        prompts = f.readlines() * nprompts
 
     tokenizer = AutoTokenizer.from_pretrained(model_path)
     outputs = []
@@ -74,11 +73,11 @@ if __name__ == '__main__':
     # print(tokenizer.batch_decode(prompt_phase_outputs, skip_special_tokens=True))
     outputs.append(prompt_phase_outputs)
 
-    model.swap_out_seqs([1])
+    model.swap_out_seqs(list(range(nprompts))[-ncpu_prompts:])
 
     seq_lens = [len(x) for x in input_ids]
     last_round_outputs = prompt_phase_outputs
-    for i in range(11):
+    for i in range(10):
         start = time.perf_counter()
         for i, _ in enumerate(prompts):
             seq_lens[i] += 1
@@ -86,7 +85,7 @@ if __name__ == '__main__':
             [[x] for x in last_round_outputs],
             list(range(0, len(prompts))),
             seq_lens,
-            cpu_num_decoding_seqs=1
+            cpu_num_decoding_seqs=ncpu_prompts
         )
         # print(tokenizer.batch_decode(last_round_outputs, skip_special_tokens=True))
         outputs.append(last_round_outputs)
@@ -96,4 +95,5 @@ if __name__ == '__main__':
     for i, prompt in enumerate(prompts):
         output_tokens = [x[i] for x in outputs]
         output_text = tokenizer.decode(output_tokens, skip_special_tokens=True)
-        print(f"{prompt}|{output_text}")
+        if i == 0 or i == nprompts - 1:
+            print(f"{prompt}|{output_text}")
