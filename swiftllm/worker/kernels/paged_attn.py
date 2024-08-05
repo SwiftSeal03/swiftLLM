@@ -271,8 +271,8 @@ def cpu_paged_attention(
     o: torch.Tensor     # [num_decoding_seqs, num_q_heads, head_dim]
 ):
     q = q.cpu()
-    o_cpu = torch.zeros_like(o, device='cpu', dtype=torch.float32)
-    torch.ops.pacpu.paged_attention_cpu_ispc(
+    o_cpu = torch.empty_like(o, device='cpu', dtype=torch.float32)
+    torch.ops.pacpu.paged_attention_cpu_ispc_tasks(
         cur_layer,
         infer_state.softmax_scale,
         infer_state.cpu_seq_ids.tolist(),

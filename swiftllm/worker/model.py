@@ -80,6 +80,7 @@ class LlamaModel:
 
         # Initialize layers
         decoding_piggyback_stream = torch.cuda.Stream()
+        cpu_communication_stream = torch.cuda.Stream()
         self.pre_layer = LlamaPreLayer(self.model_config, self.weight)
         self.transformer_layers = [
             LlamaTransformerLayer(
@@ -87,6 +88,7 @@ class LlamaModel:
                 self.engine_config,
                 self.weight.layers[layer_id],
                 decoding_piggyback_stream,
+                cpu_communication_stream,
                 layer_id
             )
             for layer_id in range(self.model_config.num_layers)

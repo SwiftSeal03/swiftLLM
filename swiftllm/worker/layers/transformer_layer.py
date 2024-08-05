@@ -10,7 +10,7 @@ from swiftllm.worker.kernels.linear import linear
 from swiftllm.worker.kernels.rmsnorm import fused_add_rmsnorm_inplace
 from swiftllm.worker.kernels.rotary_emb import rotary_embedding_inplace
 from swiftllm.worker.kernels.paged_attn import paged_attention, cpu_paged_attention
-from swiftllm.worker.kernels.kvcache_mgmt import store_kvcache
+from swiftllm.worker.kernels.kvcache_mgmt import store_kvcache, cpu_store_kvcache
 from swiftllm.worker.kernels.silu_and_mul import silu_and_mul_inplace
 
 class LlamaTransformerLayer:
@@ -20,12 +20,14 @@ class LlamaTransformerLayer:
         engine_config: EngineConfig,
         weight: LlamaTransformerLayerWeight,
         decoding_piggyback_stream: torch.cuda.Stream,
+        cpu_communication_stream: torch.cuda.Stream,
         layer_id: int
     ):
         self.model_config = model_config
         self.engine_config = engine_config
         self.weight = weight
         self.decoding_piggyback_stream = decoding_piggyback_stream
+        self.cpu_communication_stream = cpu_communication_stream
         self.layer_id = layer_id
     
     def forward(
@@ -68,20 +70,8 @@ class LlamaTransformerLayer:
             infer_state
         )
 
-        if not infer_state.ignore_kvcache:
-            store_kvcache(
-                k, v,
-                k_cache, v_cache,
-                k_swap, v_swap,
-                block_table,
-                cpu_block_table,
-                self.model_config,
-                self.engine_config,
-                infer_state,
-                self.layer_id
-            )
-        store_kvcache_event = torch.cuda.Event()
-        store_kvcache_event.record()
+        linear_end_event = torch.cuda.Event()
+        linear_end_event.record()
 
         # Attention
         o = input_embds    # [num_total_tokens, hidden_size]
@@ -103,10 +93,23 @@ class LlamaTransformerLayer:
             #     q, k, v, o[:infer_state.num_prefill_tokens, :],
             #     self.model_config, self.engine_config, infer_state
             # )
-        if infer_state.num_decoding_seqs > 0:
-            assert not infer_state.ignore_kvcache
+
+        if not infer_state.ignore_kvcache:
             with torch.cuda.stream(self.decoding_piggyback_stream):
-                torch.cuda.current_stream().wait_event(store_kvcache_event)
+                torch.cuda.current_stream().wait_event(linear_end_event)
+                store_kvcache(
+                    k[:infer_state.gpu_decode_end, :, :],
+                    v[:infer_state.gpu_decode_end, :, :],
+                    k_cache, v_cache,
+                    block_table,
+                    self.model_config,
+                    self.engine_config,
+                    infer_state,
+                    self.layer_id
+                )
+
+        if infer_state.num_decoding_seqs > 0:
+            with torch.cuda.stream(self.decoding_piggyback_stream):
                 paged_attention(
                     q[infer_state.num_prefill_tokens:infer_state.gpu_decode_end, :, :],
                     k_cache, v_cache, block_table,
@@ -114,18 +117,31 @@ class LlamaTransformerLayer:
                     self.layer_id,
                     o[infer_state.num_prefill_tokens:infer_state.gpu_decode_end, :],
                 )
-                event = torch.cuda.Event()
-                event.record()
-            torch.cuda.default_stream().wait_event(event)
-        if infer_state.cpu_num_decoding_seqs > 0:
-            cpu_paged_attention(
-                q[infer_state.gpu_decode_end:, :, :],
-                k_swap, v_swap, cpu_block_table,
-                self.model_config, self.engine_config, infer_state,
-                self.layer_id,
-                o[infer_state.gpu_decode_end:, :],
-            )
+                pagpu_end_event = torch.cuda.Event()
+                pagpu_end_event.record()
+            torch.cuda.default_stream().wait_event(pagpu_end_event)
         
+        if infer_state.cpu_num_decoding_seqs > 0:
+            with torch.cuda.stream(self.cpu_communication_stream):
+                torch.cuda.current_stream().wait_event(linear_end_event)
+                cpu_store_kvcache(
+                    k[infer_state.gpu_decode_end:, :, :], 
+                    v[infer_state.gpu_decode_end:, :, :],
+                    k_swap, v_swap, cpu_block_table,
+                    self.engine_config, infer_state, 
+                    self.layer_id
+                )
+                cpu_paged_attention(
+                    q[infer_state.gpu_decode_end:, :, :],
+                    k_swap, v_swap, cpu_block_table,
+                    self.model_config, self.engine_config, infer_state,
+                    self.layer_id,
+                    o[infer_state.gpu_decode_end:, :],
+                )
+                pacpu_end_event = torch.cuda.Event()
+                pacpu_end_event.record()
+            torch.cuda.default_stream().wait_event(pacpu_end_event)
+                
         # Output GEMM
         o = linear(o, self.weight.o_proj)	# [num_total_tokens, hidden_size]
 
