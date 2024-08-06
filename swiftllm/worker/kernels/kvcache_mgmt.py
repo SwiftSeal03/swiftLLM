@@ -94,8 +94,8 @@ def store_kvcache(
     assert k_cache.is_contiguous()
     assert v_cache.is_contiguous()
     assert block_table.is_contiguous()
-    assert infer_state.seq_ids.is_contiguous()
-    assert infer_state.decoding_seq_lens.is_contiguous()
+    assert infer_state.gpu_seq_ids.is_contiguous()
+    assert infer_state.gpu_decoding_seq_lens.is_contiguous()
 
     if infer_state.num_prefill_seqs > 0:
         grid = (infer_state.num_prefill_seqs, cdiv(infer_state.max_prefill_len, engine_config.block_size))
@@ -103,46 +103,21 @@ def store_kvcache(
             k_cache, v_cache,
             k, v,
             block_table,
-            infer_state.seq_ids, infer_state.prefill_seq_start_locs, infer_state.prefill_seq_lens,
+            infer_state.gpu_seq_ids[:infer_state.num_prefill_seqs],
+            infer_state.prefill_seq_start_locs, infer_state.prefill_seq_lens,
             cur_layer,
             model_config.num_layers, model_config.num_kv_heads, engine_config.block_size, model_config.head_dim, engine_config.max_blocks_per_seq
         )
 
-    if infer_state.num_decoding_seqs > 0:
-        grid = (infer_state.num_decoding_seqs,)
+    if infer_state.gpu_num_decoding_seqs > 0:
+        grid = (infer_state.gpu_num_decoding_seqs,)
         _fwd_kvcache_mgmt_decoding_kernel[grid](
             k_cache, v_cache,
             k[infer_state.num_prefill_tokens:, :, :],
             v[infer_state.num_prefill_tokens:, :, :],
             block_table,
-            infer_state.seq_ids[infer_state.num_prefill_seqs:],
-            infer_state.decoding_seq_lens,
+            infer_state.gpu_seq_ids[infer_state.num_prefill_seqs:],
+            infer_state.gpu_decoding_seq_lens,
             cur_layer,
             model_config.num_layers, model_config.num_kv_heads, engine_config.block_size, model_config.head_dim, engine_config.max_blocks_per_seq
         )
-
-        # for my_batch_id in range(infer_state.num_decoding_seqs):
-        #     my_k = k[infer_state.num_prefill_tokens+my_batch_id]    # [num_kv_heads, head_dim]
-        #     my_v = v[infer_state.num_prefill_tokens+my_batch_id]    # [num_kv_heads, head_dim]
-        #     my_new_token_pos = infer_state.decoding_seq_lens[my_batch_id] - 1
-        #     my_block_index = block_table[infer_state.seq_ids[infer_state.num_prefill_seqs+my_batch_id]][my_new_token_pos // engine_config.block_size]
-        #     my_block_offset = my_new_token_pos % engine_config.block_size
-
-        #     k_cache[my_block_index][cur_layer][:, my_block_offset, :] = my_k
-        #     v_cache[my_block_index][cur_layer][:, my_block_offset, :] = my_v
-
-def cpu_store_kvcache(
-    k: torch.Tensor,
-    v: torch.Tensor,
-    k_swap: torch.Tensor,
-    v_swap: torch.Tensor,
-    cpu_block_table: torch.Tensor,
-    engine_config: EngineConfig,
-    infer_state: LlamaInferState,
-    cur_layer: int
-):
-    num_blocks = (infer_state.cpu_decoding_seq_lens - 1) // engine_config.block_size
-    block_offs = (infer_state.cpu_decoding_seq_lens - 1) % engine_config.block_size
-    block_ids = cpu_block_table[infer_state.cpu_seq_ids, num_blocks]
-    k_swap[block_ids, cur_layer, :, block_offs, :] = k.cpu()
-    v_swap[block_ids, cur_layer, :, block_offs, :] = v.cpu()

@@ -168,18 +168,18 @@ def paged_attention(
     assert o.is_contiguous()
 
     mid_o = torch.empty((
-        infer_state.num_decoding_seqs,
+        infer_state.gpu_num_decoding_seqs,
         model_config.num_q_heads,
         infer_state.num_seq_blocks,
         model_config.head_dim
     ), device=q.device, dtype=torch.float32)
     mid_o_logexpsum = torch.empty((
-        infer_state.num_decoding_seqs,
+        infer_state.gpu_num_decoding_seqs,
         model_config.num_q_heads,
         infer_state.num_seq_blocks
     ), device=q.device, dtype=torch.float32)
 
-    grid = (infer_state.num_decoding_seqs, model_config.num_q_heads, infer_state.num_seq_blocks)
+    grid = (infer_state.gpu_num_decoding_seqs, model_config.num_q_heads, infer_state.num_seq_blocks)
     _fwd_paged_attention_phase1[grid](
         mid_o, mid_o_logexpsum,
         q, k_cache, v_cache,
@@ -193,8 +193,8 @@ def paged_attention(
         # 2. Some optimizations are disabled while using `exp` in a loop, see
         #    https://github.com/triton-lang/triton/issues/2961
         infer_state.softmax_scale * 1.442695040888963,
-        infer_state.decoding_seq_lens,
-        infer_state.seq_ids[infer_state.num_prefill_seqs:],
+        infer_state.gpu_decoding_seq_lens,
+        infer_state.gpu_seq_ids[infer_state.num_prefill_seqs:],
         infer_state.num_seq_blocks,
         cur_layer,
 
@@ -210,57 +210,22 @@ def paged_attention(
         num_stages = 4
     )
 
-    grid = (infer_state.num_decoding_seqs, model_config.num_q_heads)
+    grid = (infer_state.gpu_num_decoding_seqs, model_config.num_q_heads)
     _fwd_paged_attention_phase2[grid](
         mid_o, mid_o_logexpsum,
         o,
-        infer_state.decoding_seq_lens,
+        infer_state.gpu_decoding_seq_lens,
         model_config.num_q_heads,
         model_config.head_dim,
         infer_state.num_seq_blocks,
         infer_state.seq_block_size,
     )
 
-    # from swiftllm.utils import cdiv
-    # for my_batch_id in range(infer_state.num_decoding_seqs):
-    #     my_q = q[my_batch_id]   # [num_q_heads, head_dim]
-    #     my_block_table = block_table[infer_state.seq_ids[infer_state.num_prefill_seqs+my_batch_id]]
-    #     my_num_blocks = cdiv(infer_state.decoding_seq_lens[my_batch_id], engine_config.block_size)
-    #     my_k_blocks = []
-    #     my_v_blocks = []
-    #     for block_id in range(my_num_blocks):
-    #         block_index = my_block_table[block_id]
-    #         my_k_blocks.append(k_cache[block_index][cur_layer])
-    #         my_v_blocks.append(v_cache[block_index][cur_layer])
-    #     my_k = torch.cat(my_k_blocks, dim=1)   # [num_kv_heads, *, head_dim]
-    #     my_v = torch.cat(my_v_blocks, dim=1)   # [num_kv_heads, *, head_dim]
-    #     my_k = my_k.repeat_interleave(model_config.num_q_heads // model_config.num_kv_heads, dim=0)   # [num_q_heads, *, head_dim]
-    #     my_v = my_v.repeat_interleave(model_config.num_q_heads // model_config.num_kv_heads, dim=0)   # [num_q_heads, *, head_dim]
-    #     my_q = my_q.reshape(model_config.num_q_heads, 1, model_config.head_dim)
-
-    #     my_q = my_q.to(torch.float32)
-    #     my_k = my_k.to(torch.float32)
-    #     my_v = my_v.to(torch.float32)
-
-    #     my_attn_score = torch.bmm(my_q, my_k.transpose(1, 2)).squeeze()   # [num_q_heads, *]
-    #     my_attn_score = my_attn_score * infer_state.softmax_scale
-    #     # print(my_v[0])
-    #     # print(my_q[0])
-    #     my_attn_score = torch.where(
-    #         torch.arange(my_attn_score.shape[1], device=my_attn_score.device) < infer_state.decoding_seq_lens[my_batch_id],
-    #         my_attn_score,
-    #         torch.full_like(my_attn_score, float('-1e20'))
-    #     )
-    #     # print(my_attn_score)
-    #     my_attn_score = torch.softmax(my_attn_score, dim=1)   # [num_q_heads, *]
-    #     my_attn_score = my_attn_score.unsqueeze(1)   # [num_q_heads, 1, *]
-
-    #     res = torch.bmm(my_attn_score, my_v).squeeze(1)   # [num_q_heads, head_dim]
-    #     o[my_batch_id] = res.reshape(-1).to(torch.float16)
-
-
+# Paged attention for CPU, also stores new KV cache
 def cpu_paged_attention(
-    q: torch.Tensor,                    # [num_decoding_seqs, num_q_heads, head_dim]
+    q: torch.Tensor,                  # [num_decoding_seqs, num_q_heads, head_dim]
+    k: torch.Tensor,                  # [num_decoding_seqs, num_kv_heads, head_dim]
+    v: torch.Tensor,                  # [num_decoding_seqs, num_kv_heads, head_dim]
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
     block_table: torch.Tensor,
@@ -271,6 +236,8 @@ def cpu_paged_attention(
     o: torch.Tensor     # [num_decoding_seqs, num_q_heads, head_dim]
 ):
     q = q.cpu()
+    k = k.cpu()
+    v = v.cpu()
     o_cpu = torch.empty_like(o, device='cpu', dtype=torch.float32)
     torch.ops.pacpu.paged_attention_cpu_ispc_tasks(
         cur_layer,
@@ -279,20 +246,11 @@ def cpu_paged_attention(
         infer_state.cpu_decoding_seq_lens.tolist(),
 
         q,
+        k,
+        v,
         k_cache,
         v_cache,
         block_table,
         o_cpu
     )
     o.copy_(o_cpu.to(torch.float16), non_blocking=True)
-    # seq_ids = infer_state.cpu_seq_ids.tolist()
-    # for i, seq_id in enumerate(seq_ids):
-    #     qi = q[i].cpu().view(model_config.num_kv_heads, -1, model_config.head_dim)   # [num_kv_heads, qh_per_kvh, head_dim]
-    #     num_blocks = (infer_state.cpu_decoding_seq_lens[i].item() - 1) // engine_config.block_size + 1
-    #     block_ids = block_table[seq_id][:num_blocks]
-    #     ki = k_cache[block_ids, cur_layer] # [num_blocks, num_kv_heads, block_size, head_dim]
-    #     ki = ki.transpose(0, 1).contiguous().view(model_config.num_kv_heads, -1, model_config.head_dim)[:, :infer_state.cpu_decoding_seq_lens[i], :]
-    #     vi = v_cache[block_ids, cur_layer]
-    #     vi = vi.transpose(0, 1).contiguous().view(model_config.num_kv_heads, -1, model_config.head_dim)[:, :infer_state.cpu_decoding_seq_lens[i], :]
-
-    #     o[i].copy_(torch.nn.functional.scaled_dot_product_attention(qi, ki, vi, scale=infer_state.softmax_scale).cuda().view(-1))

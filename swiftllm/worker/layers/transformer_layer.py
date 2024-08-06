@@ -1,3 +1,4 @@
+import time
 import torch
 import vllm_flash_attn
 
@@ -10,7 +11,7 @@ from swiftllm.worker.kernels.linear import linear
 from swiftllm.worker.kernels.rmsnorm import fused_add_rmsnorm_inplace
 from swiftllm.worker.kernels.rotary_emb import rotary_embedding_inplace
 from swiftllm.worker.kernels.paged_attn import paged_attention, cpu_paged_attention
-from swiftllm.worker.kernels.kvcache_mgmt import store_kvcache, cpu_store_kvcache
+from swiftllm.worker.kernels.kvcache_mgmt import store_kvcache
 from swiftllm.worker.kernels.silu_and_mul import silu_and_mul_inplace
 
 class LlamaTransformerLayer:
@@ -29,6 +30,10 @@ class LlamaTransformerLayer:
         self.decoding_piggyback_stream = decoding_piggyback_stream
         self.cpu_communication_stream = cpu_communication_stream
         self.layer_id = layer_id
+
+        if engine_config.monitor_performance:
+            self.attn_s_event = torch.cuda.Event(enable_timing=True)
+            self.attn_e_event = torch.cuda.Event(enable_timing=True)
     
     def forward(
         self,
@@ -74,6 +79,9 @@ class LlamaTransformerLayer:
         linear_end_event.record()
 
         # Attention
+        if self.engine_config.monitor_performance:
+            self.attn_s_event.record()
+
         o = input_embds    # [num_total_tokens, hidden_size]
         if infer_state.num_prefill_seqs > 0:
             # Here the performance of vLLM's flash attention is better than us,
@@ -94,12 +102,12 @@ class LlamaTransformerLayer:
             #     self.model_config, self.engine_config, infer_state
             # )
 
-        if not infer_state.ignore_kvcache:
+        if not infer_state.ignore_kvcache and infer_state.gpu_token_end > 0:
             with torch.cuda.stream(self.decoding_piggyback_stream):
                 torch.cuda.current_stream().wait_event(linear_end_event)
                 store_kvcache(
-                    k[:infer_state.gpu_decode_end, :, :],
-                    v[:infer_state.gpu_decode_end, :, :],
+                    k[:infer_state.gpu_token_end, :, :],
+                    v[:infer_state.gpu_token_end, :, :],
                     k_cache, v_cache,
                     block_table,
                     self.model_config,
@@ -108,39 +116,37 @@ class LlamaTransformerLayer:
                     self.layer_id
                 )
 
-        if infer_state.num_decoding_seqs > 0:
+        if infer_state.gpu_num_decoding_seqs > 0:
             with torch.cuda.stream(self.decoding_piggyback_stream):
                 paged_attention(
-                    q[infer_state.num_prefill_tokens:infer_state.gpu_decode_end, :, :],
+                    q[infer_state.num_prefill_tokens:infer_state.gpu_token_end, :, :],
                     k_cache, v_cache, block_table,
                     self.model_config, self.engine_config, infer_state,
                     self.layer_id,
-                    o[infer_state.num_prefill_tokens:infer_state.gpu_decode_end, :],
+                    o[infer_state.num_prefill_tokens:infer_state.gpu_token_end, :],
                 )
                 pagpu_end_event = torch.cuda.Event()
                 pagpu_end_event.record()
             torch.cuda.default_stream().wait_event(pagpu_end_event)
-        
+                
         if infer_state.cpu_num_decoding_seqs > 0:
             with torch.cuda.stream(self.cpu_communication_stream):
                 torch.cuda.current_stream().wait_event(linear_end_event)
-                cpu_store_kvcache(
-                    k[infer_state.gpu_decode_end:, :, :], 
-                    v[infer_state.gpu_decode_end:, :, :],
-                    k_swap, v_swap, cpu_block_table,
-                    self.engine_config, infer_state, 
-                    self.layer_id
-                )
                 cpu_paged_attention(
-                    q[infer_state.gpu_decode_end:, :, :],
+                    q[infer_state.gpu_token_end:, :, :],
+                    k[infer_state.gpu_token_end:, :, :], 
+                    v[infer_state.gpu_token_end:, :, :],
                     k_swap, v_swap, cpu_block_table,
                     self.model_config, self.engine_config, infer_state,
                     self.layer_id,
-                    o[infer_state.gpu_decode_end:, :],
+                    o[infer_state.gpu_token_end:, :],
                 )
                 pacpu_end_event = torch.cuda.Event()
                 pacpu_end_event.record()
             torch.cuda.default_stream().wait_event(pacpu_end_event)
+
+        if self.engine_config.monitor_performance:
+            self.attn_e_event.record()
                 
         # Output GEMM
         o = linear(o, self.weight.o_proj)	# [num_total_tokens, hidden_size]

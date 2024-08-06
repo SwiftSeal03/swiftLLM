@@ -1,5 +1,6 @@
 import itertools
 import math
+from concurrent.futures import ThreadPoolExecutor
 
 import torch
 
@@ -201,6 +202,10 @@ class LlamaModel:
         """
         Run a forward pass of the LlamaModel.
         """
+        if self.engine_config.monitor_performance:
+            forward_s_event = torch.cuda.Event(enable_timing=True)
+            forward_s_event.record()
+
         input_embds = self.pre_layer.forward(input_ids)
         residual_buf = torch.zeros_like(input_embds)
         for layer in self.transformer_layers:
@@ -217,6 +222,15 @@ class LlamaModel:
             )
         input_embds += residual_buf
         output_tokens = self.post_layer.forward(input_embds, infer_state)
+
+        if self.engine_config.monitor_performance:
+            forward_e_event = torch.cuda.Event(enable_timing=True)
+            forward_e_event.record()
+            torch.cuda.synchronize()
+            attn_total_time = sum(layer.attn_s_event.elapsed_time(layer.attn_e_event) for layer in self.transformer_layers)
+            linr_total_time = forward_s_event.elapsed_time(forward_e_event) - attn_total_time
+            print(f"[Model.forward] Linear time: {linr_total_time:.3f} ms, Attention time: {attn_total_time:.3f} ms")
+
         return output_tokens
     
     @torch.inference_mode()
@@ -238,52 +252,24 @@ class LlamaModel:
         This function is intended to be called by the server.
         """
 
-        num_prefill_seqs = len(input_ids_list) - len(decoding_seq_lens_list)
-        flattened_input_ids = list(itertools.chain(*input_ids_list))
-        seq_lengths_list = [len(seq) for seq in input_ids_list[:num_prefill_seqs]] + decoding_seq_lens_list
+        _flattened_input_ids = list(itertools.chain(*input_ids_list))
 
         batch_size = len(input_ids_list)
-        num_tokens = len(flattened_input_ids)
-        gpu_decode_end = batch_size - cpu_num_decoding_seqs
+        num_tokens = len(_flattened_input_ids)
+        num_decoding_seqs = len(decoding_seq_lens_list)
+        num_prefill_seqs = batch_size - num_decoding_seqs
+        gpu_num_decoding_seqs = num_decoding_seqs - cpu_num_decoding_seqs
+        _gpu_seq_end = batch_size - cpu_num_decoding_seqs
 
-        seq_ids = torch.tensor(seq_ids_list[:gpu_decode_end], dtype=torch.int32, device="cuda")
-        seq_lengths = torch.tensor(seq_lengths_list[:gpu_decode_end], dtype=torch.int32, device="cuda")
+        _prefill_seq_lens_list = [len(seq) for seq in input_ids_list[:num_prefill_seqs]]
+        _prefill_start_locs_with_end = [0] + list(itertools.accumulate(_prefill_seq_lens_list))
 
-        cpu_seq_ids = torch.tensor(seq_ids_list[gpu_decode_end:], dtype=torch.int32, device="cpu")
-        cpu_decoding_seq_lens = torch.tensor(seq_lengths_list[gpu_decode_end:], dtype=torch.int32, device="cpu")
-
-        prefill_seq_lens_list = seq_lengths_list[:num_prefill_seqs]
-        prefill_seq_lens = torch.tensor(prefill_seq_lens_list, dtype=torch.int32, device="cuda")
-        prefill_start_locs = torch.cumsum(prefill_seq_lens, dim=0, dtype=torch.int32) - prefill_seq_lens
-        max_prefill_len = max(prefill_seq_lens_list) if prefill_seq_lens_list else 0
-
-        decoding_seq_lens = torch.tensor(decoding_seq_lens_list, dtype=torch.int32, device="cuda")
-        max_decoding_len = max(decoding_seq_lens_list) if decoding_seq_lens_list else 0
-
-        position_indices = torch.cat((
-            torch.concat([
-                torch.arange(
-                    0,
-                    prefill_seq_len,
-                    device="cuda",
-                    dtype=torch.int32
-                )
-                for prefill_seq_len in prefill_seq_lens_list
-            ]) if prefill_seq_lens_list else torch.empty(0, device="cuda", dtype=torch.int32),
-            decoding_seq_lens - 1,
-            (cpu_decoding_seq_lens - 1).cuda()
-        ), dim=0)
-
-        if not ignore_kvcache:
-            self.gpu_block_manager.allocate_blocks_for_seqs(
-                seq_ids,
-                seq_lengths
-            )
-
-            self.cpu_block_manager.allocate_blocks_for_seqs(
-                cpu_seq_ids,
-                cpu_decoding_seq_lens
-            )
+        position_indices = torch.tensor(
+            [i for seq_len in _prefill_seq_lens_list for i in range(seq_len)] +
+            [seq_len - 1 for seq_len in decoding_seq_lens_list],
+            dtype=torch.int32,
+            device="cuda"
+        )
 
         # Select the seq_block_size
         #
@@ -300,39 +286,38 @@ class LlamaModel:
         # In practice, we use `decoding_seq_lens_sum/seq_block_size` to approximate
         # sum(cdiv(decoding_seq_lens, seq_block_size))
 
+        _max_decoding_len = max(decoding_seq_lens_list + [0])
         seq_block_size = 2048
         decoding_seq_lens_sum = sum(decoding_seq_lens_list)
         while self.model_config.num_kv_heads*(decoding_seq_lens_sum/seq_block_size) < 1024 and seq_block_size//2 >= 64 and \
-            max_decoding_len / (seq_block_size//2) <= 128:
+            _max_decoding_len / (seq_block_size//2) <= 128:
             seq_block_size //= 2
+        num_seq_blocks = (_max_decoding_len + seq_block_size - 1) // seq_block_size
 
         infer_state = LlamaInferState(
-            batch_size = batch_size,
-            num_tokens = num_tokens,
-
-            seq_ids = seq_ids,
             softmax_scale = self.model_config.head_dim ** -0.5,
 
+            batch_size = batch_size,
+            num_tokens = num_tokens,
             num_prefill_seqs = num_prefill_seqs,
-            num_prefill_tokens = num_tokens - (batch_size - num_prefill_seqs),
-            prefill_seq_start_locs = prefill_start_locs,
-            prefill_seq_start_locs_with_end = torch.cat([
-                prefill_start_locs,
-                torch.tensor([num_tokens], dtype=torch.int32, device="cuda")
-            ]),
-            prefill_seq_lens = prefill_seq_lens,
-            max_prefill_len = max_prefill_len,
-
-            num_decoding_seqs = batch_size - num_prefill_seqs - cpu_num_decoding_seqs,
-            decoding_seq_lens = decoding_seq_lens,
-            max_decoding_len = max_decoding_len,
-
-            cpu_seq_ids = cpu_seq_ids,
+            gpu_num_decoding_seqs = gpu_num_decoding_seqs,
             cpu_num_decoding_seqs = cpu_num_decoding_seqs,
-            cpu_decoding_seq_lens = cpu_decoding_seq_lens,
+
+            gpu_seq_ids = torch.tensor(seq_ids_list[:_gpu_seq_end], dtype=torch.int32, device="cuda"),
+            cpu_seq_ids = torch.tensor(seq_ids_list[_gpu_seq_end:], dtype=torch.int32, device="cpu"),
+
+            num_prefill_tokens = sum(_prefill_seq_lens_list),
+            max_prefill_len = max(_prefill_seq_lens_list + [0]),
+
+            prefill_seq_lens = torch.tensor(_prefill_seq_lens_list, dtype=torch.int32, device="cuda"),
+            prefill_seq_start_locs = torch.tensor(_prefill_start_locs_with_end[:-1], dtype=torch.int32, device="cuda"),
+            prefill_seq_start_locs_with_end = torch.tensor(_prefill_start_locs_with_end, dtype=torch.int32, device="cuda"),
+
+            gpu_decoding_seq_lens = torch.tensor(decoding_seq_lens_list[:gpu_num_decoding_seqs], dtype=torch.int32, device="cuda"),
+            cpu_decoding_seq_lens = torch.tensor(decoding_seq_lens_list[gpu_num_decoding_seqs:], dtype=torch.int32, device="cpu"),
 
             seq_block_size = seq_block_size,
-            num_seq_blocks = (max_decoding_len + seq_block_size-1) // seq_block_size,
+            num_seq_blocks = num_seq_blocks,
 
             position_cos = self._cos_cached[position_indices],
             position_sin = self._sin_cached[position_indices],
@@ -340,8 +325,19 @@ class LlamaModel:
             ignore_kvcache = ignore_kvcache
         )
 
+        if not ignore_kvcache:
+            self.gpu_block_manager.allocate_blocks_for_seqs(
+                infer_state.gpu_seq_ids,
+                torch.cat([infer_state.prefill_seq_lens, infer_state.gpu_decoding_seq_lens])
+            )
+
+            self.cpu_block_manager.allocate_blocks_for_seqs(
+                infer_state.cpu_seq_ids,
+                infer_state.cpu_decoding_seq_lens
+            )
+
         return self._forward(
-            torch.tensor(flattened_input_ids, dtype=torch.int32, device="cuda"),
+            torch.tensor(_flattened_input_ids, dtype=torch.int32, device="cuda"),
             infer_state
         ).tolist()
 

@@ -25,6 +25,9 @@ class EngineConfig:
     # External library path
     library_path: str = None
 
+    # Monitor performance switch
+    monitor_performance: bool = False
+
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
         """
@@ -90,5 +93,11 @@ class EngineConfig:
             "--library-path",
             type=str,
             help="Path to the external library",
+        )
+
+        parser.add_argument(
+            "--monitor-performance",
+            action="store_true",
+            help="Monitor performance",
         )
         
