@@ -6,7 +6,7 @@ import torch
 
 from swiftllm.engine_config import EngineConfig
 from swiftllm.model_config import LlamaModelConfig
-from swiftllm.worker.model import LlamaModel
+from swiftllm.worker.model import LlamaModel, ModelForwardArgs
 from swiftllm.utils import GB
 
 from .tokenization_engine import TokenizationEngine
@@ -149,10 +149,12 @@ class Engine:
             ]
             output_tokens = await self._run_on_model_async(
                 self.model.forward,
-                input_ids,
-                seq_ids,
-                decoding_seq_lens_list,
-                cpu_num_decoding_seqs=0
+                ModelForwardArgs(
+                    input_ids,
+                    seq_ids,
+                    decoding_seq_lens_list,
+                    cpu_num_decoding_seqs=0
+                )
             )
 
             # Deal with output tokens
