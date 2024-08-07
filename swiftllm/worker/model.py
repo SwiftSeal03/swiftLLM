@@ -89,6 +89,7 @@ class LlamaModel:
         self._init_to_get_rotary()
 
         # Initialize layers
+        prefilling_stream = torch.cuda.Stream()
         decoding_piggyback_stream = torch.cuda.Stream()
         cpu_communication_stream = torch.cuda.Stream()
         self.pre_layer = LlamaPreLayer(self.model_config, self.weight)
@@ -97,6 +98,7 @@ class LlamaModel:
                 self.model_config,
                 self.engine_config,
                 self.weight.layers[layer_id],
+                prefilling_stream,
                 decoding_piggyback_stream,
                 cpu_communication_stream,
                 layer_id
@@ -358,6 +360,67 @@ class LlamaModel:
         return self._forward(
             torch.tensor(flattened_input_ids, dtype=torch.int32, device="cuda"),
             infer_state
+        ).tolist()
+    
+    @torch.inference_mode()
+    def _forward_pipeline(
+        self,
+        input_ids0: torch.Tensor,
+        input_ids1: torch.Tensor,
+        infer_state0: LlamaInferState,
+        infer_state1: LlamaInferState
+    ) -> torch.Tensor:
+        """
+        Run a forward pass of the LlamaModel in a pipelined manner.
+        """
+        input_embds = self.pre_layer.forward(torch.cat([input_ids0, input_ids1]))
+
+        residual_buf0 = torch.zeros_like(input_embds0)
+        residual_buf1 = torch.zeros_like(input_embds1)
+
+        for layer in self.transformer_layers:
+            input_embds0 = layer.forward(
+                input_embds0,
+                residual_buf0,
+                self.k_cache,
+                self.v_cache,
+                self.k_swap,
+                self.v_swap,
+                self.gpu_block_manager.block_table if not infer_state0.ignore_kvcache else None,
+                self.cpu_block_manager.block_table if not infer_state0.ignore_kvcache else None,
+                infer_state0
+            )
+            input_embds1 = layer.forward(
+                input_embds1,
+                residual_buf1,
+                self.k_cache,
+                self.v_cache,
+                self.k_swap,
+                self.v_swap,
+                self.gpu_block_manager.block_table if not infer_state1.ignore_kvcache else None,
+                self.cpu_block_manager.block_table if not infer_state1.ignore_kvcache else None,
+                infer_state1
+            )
+
+        output_tokens = self.post_layer.forward_double(input_embds0, input_embds1, infer_state0, infer_state1)
+
+    @torch.inference_mode()
+    def forward_pipeline(
+        self,
+        args0: ModelForwardArgs,
+        args1: ModelForwardArgs
+    ) -> list[int]:
+        """
+        Forward 2 sub-batches in a pipelined manner.
+        """
+        finput_ids0, infer_state0 = self._prepare_inputs(args0)
+        finput_ids1, infer_state1 = self._prepare_inputs(args1)
+
+        return self._forward_pipeline(
+            torch.tensor(finput_ids0, dtype=torch.int32, device="cuda"),
+            torch.tensor(finput_ids1, dtype=torch.int32, device="cuda"),
+            infer_state0,
+            infer_state1
         ).tolist()
 
     def _swap(
