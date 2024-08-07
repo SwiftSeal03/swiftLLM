@@ -14,10 +14,10 @@ class LlamaPostLayer:
     ):
         self.model_config = model_config
         self.weights = weights
-    
-    def forward(
+
+    def _get_last_input(
         self,
-        input_embds: torch.Tensor,	# [num_total_tokens, hidden_size]
+        input_embds: torch.Tensor,
         infer_state: LlamaInferState
     ) -> torch.Tensor:
         # Slice to get the last token embedding for each request
@@ -29,6 +29,12 @@ class LlamaPostLayer:
         )
         last_input = torch.empty((infer_state.batch_size, self.model_config.hidden_size), device=input_embds.device, dtype=input_embds.dtype)
         last_input[:, :] = input_embds[last_token_indices, :]
+        return last_input
+    
+    def _forward(
+        self,
+        last_input: torch.Tensor
+    ) -> torch.Tensor:
         # Apply RMS-norm
         rmsnorm_inplace(
             last_input,
@@ -38,4 +44,24 @@ class LlamaPostLayer:
         logits = linear(last_input, self.weights.lm_head)    # [batch_size, vocab_size]
         output_tokens = torch.argmax(logits, dim=1)
         return output_tokens
+    
+    def forward(
+        self,
+        input_embds: torch.Tensor,	# [num_total_tokens, hidden_size]
+        infer_state: LlamaInferState
+    ) -> torch.Tensor:
+        last_input = self._get_last_input(input_embds, infer_state)
+        return self._forward(last_input)
+    
+    def forward_double(
+        self,
+        input_embds0: torch.Tensor,
+        input_embds1: torch.Tensor,
+        infer_state0: LlamaInferState,
+        infer_state1: LlamaInferState
+    ):
+        last_inputs0 = self._get_last_input(input_embds0, infer_state0)
+        last_inputs1 = self._get_last_input(input_embds1, infer_state1)
+        last_inputs = torch.cat((last_inputs0, last_inputs1), dim=0)
+        return self._forward(last_inputs)
     
