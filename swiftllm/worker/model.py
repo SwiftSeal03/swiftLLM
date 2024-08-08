@@ -342,9 +342,24 @@ class LlamaModel:
             forward_e_event = torch.cuda.Event(enable_timing=True)
             forward_e_event.record()
             torch.cuda.synchronize()
-            attn_total_time = sum(layer.attn_s_event.elapsed_time(layer.attn_e_event) for layer in self.transformer_layers)
+            prefill_times = [0 for _ in self.transformer_layers]
+            gpudec_times = [0 for _ in self.transformer_layers]
+            cpudec_times = [0 for _ in self.transformer_layers]
+            if infer_state.num_prefill_seqs > 0:
+                prefill_times = [layer.stage_s_events[0].elapsed_time(layer.prefill_e_events[0]) for layer in self.transformer_layers]
+            if infer_state.gpu_num_decoding_seqs > 0:
+                gpudec_times = [layer.stage_s_events[0].elapsed_time(layer.gpudec_e_events[0]) for layer in self.transformer_layers]
+            if infer_state.cpu_num_decoding_seqs > 0:
+                cpudec_times = [layer.stage_s_events[0].elapsed_time(layer.cpudec_e_events[0]) for layer in self.transformer_layers]
+            attn_total_time = sum(max(times) for times in zip(prefill_times, gpudec_times, cpudec_times))
             linr_total_time = forward_s_event.elapsed_time(forward_e_event) - attn_total_time
-            print(f"[Model.forward] Linear time: {linr_total_time:.3f} ms, Attention time: {attn_total_time:.3f} ms")
+
+            prefill_times_avg = sum(prefill_times) / len(self.transformer_layers)
+            gpudec_times_avg = sum(gpudec_times) / len(self.transformer_layers)
+            cpudec_times_avg = sum(cpudec_times) / len(self.transformer_layers)
+            linr_avg_time = linr_total_time / len(self.transformer_layers)
+            print(f"[Model.forward] Linear: {linr_total_time:.3f} ms,   Attention: {attn_total_time:.3f} ms")
+            print(f"                Linear avg: {linr_avg_time:.3f} ms, Prefill attn avg: {prefill_times_avg:.3f} ms, GPUDec attn avg: {gpudec_times_avg:.3f} ms, CPUDec attn avg: {cpudec_times_avg:.3f} ms")
 
         return output_tokens
     
@@ -391,6 +406,10 @@ class LlamaModel:
             self.cpu_block_manager.block_table
         )
 
+        if self.engine_config.monitor_performance:
+            forward_s_event = torch.cuda.Event(enable_timing=True)
+            forward_s_event.record()
+
         # input_embds would serve as a buffer for all attention outputs
         input_embds = self.pre_layer.forward(torch.cat([input_ids0, input_ids1]))
         residual_buf = torch.zeros_like(input_embds)
@@ -402,6 +421,10 @@ class LlamaModel:
             kvargs, infer_state0, infer_state1
         )
 
+        if self.engine_config.monitor_performance:
+            mainbody_s_event = torch.cuda.Event(enable_timing=True)
+            mainbody_s_event.record()
+
         # Main body of the forward pass
         # In every iteration, input_embds0 is updated to newer version of batch 0's attention output and 
         # q1, k1, v1 are updated to batch 1's newer version of q, k, v
@@ -412,6 +435,11 @@ class LlamaModel:
                 kvargs, infer_state0, infer_state1
             )
 
+        if self.engine_config.monitor_performance:
+            mainbody_e_event = torch.cuda.Event(enable_timing=True)
+            mainbody_e_event.record()
+            
+
         f0, f1 = self.transformer_layers[-1].forward_last_stage(
             q1, k1, v1, input_embds0, input_embds1, residual_buf0, residual_buf1,
             kvargs, infer_state0, infer_state1
@@ -421,6 +449,17 @@ class LlamaModel:
         f1 += residual_buf1
 
         output_tokens = self.post_layer.forward_double(f0, f1, infer_state0, infer_state1)
+
+        if self.engine_config.monitor_performance:
+            forward_e_event = torch.cuda.Event(enable_timing=True)
+            forward_e_event.record()
+            torch.cuda.synchronize()
+            pre_proc_time = forward_s_event.elapsed_time(mainbody_s_event)
+            mainbody_time = mainbody_s_event.elapsed_time(mainbody_e_event)
+            post_proc_time = mainbody_e_event.elapsed_time(forward_e_event)
+            avg_stage_time = mainbody_time / (self.model_config.num_layers - 1) / 2
+            print(f"[Model.forward_pipeline] Pre-processing time: {pre_proc_time:.3f} ms, Main body time: {mainbody_time:.3f} ms, Post-processing time: {post_proc_time:.3f} ms, Average stage time: {avg_stage_time:.3f} ms")
+
         return output_tokens
 
     @torch.inference_mode()

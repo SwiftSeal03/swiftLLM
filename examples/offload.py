@@ -56,8 +56,8 @@ if __name__ == '__main__':
     model_creation_time = time.perf_counter() - start_time
     print(f"Model creation time: {model_creation_time:.2f} seconds")
     
-    ngpu_prompts = 4
-    ncpu_prompts = 2
+    ngpu_prompts = 60
+    ncpu_prompts = 40
     nprompts = ncpu_prompts + ngpu_prompts
     with open("example.txt", "r") as f:
         prompts = f.readlines() * nprompts
@@ -98,7 +98,7 @@ if __name__ == '__main__':
         # print(tokenizer.batch_decode(last_round_outputs, skip_special_tokens=True))
         outputs.append(last_round_outputs)
         end = time.perf_counter()
-        print(f"E2E decoding time: {(end - start) * 1000:.4f} ms")
+        print(f"                E2E decoding time: {(end - start) * 1000:.4f} ms")
     
     for i, prompt in enumerate(prompts):
         output_tokens = [x[i] for x in outputs]
