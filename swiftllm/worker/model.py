@@ -13,7 +13,7 @@ from swiftllm.utils import GB
 import swiftllm_c
 
 from .layers.pre_layer import LlamaPreLayer
-from .layers.transformer_layer import LlamaTransformerLayer
+from .layers.transformer_layer import LlamaTransformerLayer, KVCacheArgs
 from .layers.post_layer import LlamaPostLayer
 from .infer_state import LlamaInferState
 
@@ -68,6 +68,7 @@ class LlamaModel:
 
         # Block manager
         self.cpu_block_manager = self.gpu_block_manager = None
+        self.kvargs = None
 
         if engine_config.library_path:
             torch.ops.load_library(engine_config.library_path)
@@ -98,6 +99,7 @@ class LlamaModel:
                 self.model_config,
                 self.engine_config,
                 self.weight.layers[layer_id],
+                self.weight.layers[layer_id + 1] if layer_id + 1 < self.model_config.num_layers else None,
                 prefilling_stream,
                 decoding_piggyback_stream,
                 cpu_communication_stream,
@@ -314,18 +316,23 @@ class LlamaModel:
             forward_s_event = torch.cuda.Event(enable_timing=True)
             forward_s_event.record()
 
+        kvargs = KVCacheArgs(
+            self.k_cache,
+            self.v_cache,
+            self.k_swap,
+            self.v_swap,
+            gpu_block_table = self.gpu_block_manager.block_table if not infer_state.ignore_kvcache else None,
+            cpu_block_table = self.cpu_block_manager.block_table if not infer_state.ignore_kvcache else None
+        )
+
+        # Main body of the forward pass
         input_embds = self.pre_layer.forward(input_ids)
         residual_buf = torch.zeros_like(input_embds)
         for layer in self.transformer_layers:
             input_embds = layer.forward(
                 input_embds,
                 residual_buf,
-                self.k_cache,
-                self.v_cache,
-                self.k_swap,
-                self.v_swap,
-                self.gpu_block_manager.block_table if not infer_state.ignore_kvcache else None,
-                self.cpu_block_manager.block_table if not infer_state.ignore_kvcache else None,
+                kvargs,
                 infer_state,
             )
         input_embds += residual_buf
@@ -373,36 +380,48 @@ class LlamaModel:
         """
         Run a forward pass of the LlamaModel in a pipelined manner.
         """
+        assert infer_state0.ignore_kvcache == False and infer_state1.ignore_kvcache == False
+
+        kvargs = KVCacheArgs(
+            self.k_cache,
+            self.v_cache,
+            self.k_swap,
+            self.v_swap,
+            self.gpu_block_manager.block_table,
+            self.cpu_block_manager.block_table
+        )
+
+        # input_embds would serve as a buffer for all attention outputs
         input_embds = self.pre_layer.forward(torch.cat([input_ids0, input_ids1]))
+        residual_buf = torch.zeros_like(input_embds)
+        input_embds0, input_embds1 = torch.split(input_embds, infer_state0.num_tokens, dim=0)
+        residual_buf0, residual_buf1 = torch.split(residual_buf, infer_state0.num_tokens, dim=0)
 
-        residual_buf0 = torch.zeros_like(input_embds0)
-        residual_buf1 = torch.zeros_like(input_embds1)
+        q1, k1, v1 = self.transformer_layers[0].forward_first_stage(
+            input_embds0, input_embds1, residual_buf0, residual_buf1,
+            kvargs, infer_state0, infer_state1
+        )
 
-        for layer in self.transformer_layers:
-            input_embds0 = layer.forward(
-                input_embds0,
-                residual_buf0,
-                self.k_cache,
-                self.v_cache,
-                self.k_swap,
-                self.v_swap,
-                self.gpu_block_manager.block_table if not infer_state0.ignore_kvcache else None,
-                self.cpu_block_manager.block_table if not infer_state0.ignore_kvcache else None,
-                infer_state0
-            )
-            input_embds1 = layer.forward(
-                input_embds1,
-                residual_buf1,
-                self.k_cache,
-                self.v_cache,
-                self.k_swap,
-                self.v_swap,
-                self.gpu_block_manager.block_table if not infer_state1.ignore_kvcache else None,
-                self.cpu_block_manager.block_table if not infer_state1.ignore_kvcache else None,
-                infer_state1
+        # Main body of the forward pass
+        # In every iteration, input_embds0 is updated to newer version of batch 0's attention output and 
+        # q1, k1, v1 are updated to batch 1's newer version of q, k, v
+        for layer in self.transformer_layers[:-1]:
+            q1, k1, v1 = layer.forward_double(
+                q1, k1, v1, 
+                input_embds0, input_embds1, residual_buf0, residual_buf1,
+                kvargs, infer_state0, infer_state1
             )
 
-        output_tokens = self.post_layer.forward_double(input_embds0, input_embds1, infer_state0, infer_state1)
+        f0, f1 = self.transformer_layers[-1].forward_last_stage(
+            q1, k1, v1, input_embds0, input_embds1, residual_buf0, residual_buf1,
+            kvargs, infer_state0, infer_state1
+        )
+
+        f0 += residual_buf0
+        f1 += residual_buf1
+
+        output_tokens = self.post_layer.forward_double(f0, f1, infer_state0, infer_state1)
+        return output_tokens
 
     @torch.inference_mode()
     def forward_pipeline(

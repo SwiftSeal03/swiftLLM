@@ -25,7 +25,7 @@ class EngineConfig:
     # External library path
     library_path: str = None
 
-    # Monitor performance switch
+    # Switches
     monitor_performance: bool = False
 
     @staticmethod
