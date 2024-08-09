@@ -57,11 +57,10 @@ class LlamaPostLayer:
         self,
         input_embds0: torch.Tensor,
         input_embds1: torch.Tensor,
-        infer_state0: LlamaInferState,
-        infer_state1: LlamaInferState
+        infer_states: list[LlamaInferState]
     ):
-        last_inputs0 = self._get_last_input(input_embds0, infer_state0)
-        last_inputs1 = self._get_last_input(input_embds1, infer_state1)
+        last_inputs0 = self._get_last_input(input_embds0, infer_states[0])
+        last_inputs1 = self._get_last_input(input_embds1, infer_states[1])
         last_inputs = torch.cat((last_inputs0, last_inputs1), dim=0)
         return self._forward(last_inputs)
     

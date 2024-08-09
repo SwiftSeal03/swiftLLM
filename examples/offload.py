@@ -57,7 +57,7 @@ if __name__ == '__main__':
     print(f"Model creation time: {model_creation_time:.2f} seconds")
     
     ngpu_prompts = 60
-    ncpu_prompts = 40
+    ncpu_prompts = 100
     nprompts = ncpu_prompts + ngpu_prompts
     with open("example.txt", "r") as f:
         prompts = f.readlines() * nprompts

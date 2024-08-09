@@ -230,8 +230,7 @@ class LlamaTransformerLayer:
         k1: torch.Tensor,  # [num_tokens, num_kv_heads, head_dim]
         v1: torch.Tensor,  # [num_tokens, num_kv_heads, head_dim]
         kvargs: KVCacheArgs,
-        infer_state0: LlamaInferState,
-        infer_state1: LlamaInferState,
+        infer_states: list[LlamaInferState],
         cur_stage: int
     ) -> tuple[torch.Tensor]:
         """
@@ -247,7 +246,7 @@ class LlamaTransformerLayer:
         self.stage_s_events[cur_stage].record()
 
         f0 = self._postproj(o0, residual_buf0)
-        q0, k0, v0 = self._preproj(f0, residual_buf0, infer_state0, use_next_layer=True)
+        q0, k0, v0 = self._preproj(f0, residual_buf0, infer_states[0], use_next_layer=True)
         del f0
 
         if self.engine_config.monitor_performance:
@@ -255,7 +254,7 @@ class LlamaTransformerLayer:
 
         self._attention(
             o1, q1, k1, v1,
-            kvargs, infer_state1, cur_stage
+            kvargs, infer_states[1], cur_stage
         )
 
         return q0, k0, v0
@@ -270,8 +269,7 @@ class LlamaTransformerLayer:
         residual_buf0: torch.Tensor, # [num_tokens, hidden_size]
         residual_buf1: torch.Tensor, # [num_tokens, hidden_size]
         kvargs: KVCacheArgs,
-        infer_state0: LlamaInferState,
-        infer_state1: LlamaInferState,
+        infer_states: list[LlamaInferState],
     ) -> tuple[torch.Tensor]:
         """
         Do all jobs for 1 transformer layer for 2 batches
@@ -283,11 +281,11 @@ class LlamaTransformerLayer:
         """
         q0, k0, v0 = self._forward_pipeline_stage(
             o0, residual_buf0, o1, q1, k1, v1, 
-            kvargs, infer_state0, infer_state1, cur_stage=0
+            kvargs, infer_states, cur_stage=0
         )
         q1, k1, v1 = self._forward_pipeline_stage(
             o1, residual_buf1, o0, q0, k0, v0,
-            kvargs, infer_state1, infer_state0, cur_stage=1
+            kvargs, infer_states, cur_stage=1
         )
 
         return q1, k1, v1
@@ -299,8 +297,7 @@ class LlamaTransformerLayer:
         residual_buf0: torch.Tensor, # [num_tokens, hidden_size]
         residual_buf1: torch.Tensor, # [num_tokens, hidden_size]
         kvargs: KVCacheArgs,
-        infer_state0: LlamaInferState,
-        infer_state1: LlamaInferState,
+        infer_states: list[LlamaInferState],
     ) -> tuple[torch.Tensor]:
         """
         Do the first stage of the pipeline for 2 batches
@@ -308,13 +305,13 @@ class LlamaTransformerLayer:
         batch0 : input_embeds0 |=> pre-projection -> attention       |=> [o0]
         batch1 : input_embeds1 |=>                  pre-projection   |=> q1, k1, v1
         """
-        q0, k0, v0 = self._preproj(input_embds0, residual_buf0, infer_state0)
-        linear_end_event = torch.cuda.Event()
-        linear_end_event.record()
-        q1, k1, v1 = self._preproj(input_embds1, residual_buf1, infer_state1)
+        q0, k0, v0 = self._preproj(input_embds0, residual_buf0, infer_states[0])
+        # This event of first layer would be recorded again
+        self.stage_s_events[0].record()
+        q1, k1, v1 = self._preproj(input_embds1, residual_buf1, infer_states[1])
         self._attention(
             input_embds0, q0, k0, v0,
-            kvargs, infer_state0, linear_end_event
+            kvargs, infer_states[0], cur_stage=0
         )
         return q1, k1, v1
 
@@ -328,8 +325,7 @@ class LlamaTransformerLayer:
         residual_buf0: torch.Tensor, # [num_tokens, hidden_size]
         residual_buf1: torch.Tensor, # [num_tokens, hidden_size]
         kvargs: KVCacheArgs,
-        infer_state0: LlamaInferState,
-        infer_state1: LlamaInferState
+        infer_states: list[LlamaInferState]
     ) -> tuple[torch.Tensor]:
         """
         Do the last stage of the pipeline for 2 batches
@@ -337,12 +333,12 @@ class LlamaTransformerLayer:
         batch0 : o0   |=> post-projection              |=> [f0]
         batch1 : qkv1 |=> attention -> post-projection |=> [f1]
         """
-        linear_end_event = torch.cuda.Event()
-        linear_end_event.record()
+        self.stage_s_events[0].record()
         f0 = self._postproj(o0, residual_buf0)
+        # Here cur_stage is an offset of layer_id, we use last layer here
         self._attention(
             o1, q1, k1, v1,
-            kvargs, infer_state1, linear_end_event
+            kvargs, infer_states[1], cur_stage=0
         )
         f1 = self._postproj(o1, residual_buf1)
         return f0, f1

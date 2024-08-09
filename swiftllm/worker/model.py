@@ -210,7 +210,7 @@ class LlamaModel:
     def _prepare_inputs(
         self,
         args: ModelForwardArgs
-    ):
+    ) -> tuple[list[int], LlamaInferState]:
         """
         Gets input lists and reformats them into a single tensor.
 
@@ -358,8 +358,8 @@ class LlamaModel:
             gpudec_times_avg = sum(gpudec_times) / len(self.transformer_layers)
             cpudec_times_avg = sum(cpudec_times) / len(self.transformer_layers)
             linr_avg_time = linr_total_time / len(self.transformer_layers)
-            print(f"[Model.forward] Linear: {linr_total_time:.3f} ms,   Attention: {attn_total_time:.3f} ms")
-            print(f"                Linear avg: {linr_avg_time:.3f} ms, Prefill attn avg: {prefill_times_avg:.3f} ms, GPUDec attn avg: {gpudec_times_avg:.3f} ms, CPUDec attn avg: {cpudec_times_avg:.3f} ms")
+            print(f"[Model.forward] Lin   : {linr_total_time:8.3f} ms,   Attn:    {attn_total_time:8.3f} ms")
+            print(f"                Lin av: {linr_avg_time  :8.3f} ms,   Pref av: {prefill_times_avg:8.3f} ms, GDec av: {gpudec_times_avg:8.3f} ms, CDec av: {cpudec_times_avg:8.3f} ms")
 
         return output_tokens
     
@@ -387,15 +387,13 @@ class LlamaModel:
     @torch.inference_mode()
     def _forward_pipeline(
         self,
-        input_ids0: torch.Tensor,
-        input_ids1: torch.Tensor,
-        infer_state0: LlamaInferState,
-        infer_state1: LlamaInferState
+        input_ids: torch.Tensor,
+        infer_states: list[LlamaInferState],
     ) -> torch.Tensor:
         """
         Run a forward pass of the LlamaModel in a pipelined manner.
         """
-        assert infer_state0.ignore_kvcache == False and infer_state1.ignore_kvcache == False
+        assert all(not infer_state.ignore_kvcache for infer_state in infer_states)
 
         kvargs = KVCacheArgs(
             self.k_cache,
@@ -411,14 +409,14 @@ class LlamaModel:
             forward_s_event.record()
 
         # input_embds would serve as a buffer for all attention outputs
-        input_embds = self.pre_layer.forward(torch.cat([input_ids0, input_ids1]))
+        input_embds = self.pre_layer.forward(input_ids)
         residual_buf = torch.zeros_like(input_embds)
-        input_embds0, input_embds1 = torch.split(input_embds, infer_state0.num_tokens, dim=0)
-        residual_buf0, residual_buf1 = torch.split(residual_buf, infer_state0.num_tokens, dim=0)
+        input_embds0, input_embds1 = torch.split(input_embds, infer_states[0].num_tokens, dim=0)
+        residual_buf0, residual_buf1 = torch.split(residual_buf, infer_states[0].num_tokens, dim=0)
 
         q1, k1, v1 = self.transformer_layers[0].forward_first_stage(
             input_embds0, input_embds1, residual_buf0, residual_buf1,
-            kvargs, infer_state0, infer_state1
+            kvargs, infer_states
         )
 
         if self.engine_config.monitor_performance:
@@ -428,11 +426,12 @@ class LlamaModel:
         # Main body of the forward pass
         # In every iteration, input_embds0 is updated to newer version of batch 0's attention output and 
         # q1, k1, v1 are updated to batch 1's newer version of q, k, v
-        for layer in self.transformer_layers[:-1]:
+        stage_layers = self.transformer_layers[:-1]
+        for layer in stage_layers:
             q1, k1, v1 = layer.forward_double(
                 q1, k1, v1, 
                 input_embds0, input_embds1, residual_buf0, residual_buf1,
-                kvargs, infer_state0, infer_state1
+                kvargs, infer_states
             )
 
         if self.engine_config.monitor_performance:
@@ -442,13 +441,13 @@ class LlamaModel:
 
         f0, f1 = self.transformer_layers[-1].forward_last_stage(
             q1, k1, v1, input_embds0, input_embds1, residual_buf0, residual_buf1,
-            kvargs, infer_state0, infer_state1
+            kvargs, infer_states
         )
 
         f0 += residual_buf0
         f1 += residual_buf1
 
-        output_tokens = self.post_layer.forward_double(f0, f1, infer_state0, infer_state1)
+        output_tokens = self.post_layer.forward_double(f0, f1, infer_states)
 
         if self.engine_config.monitor_performance:
             forward_e_event = torch.cuda.Event(enable_timing=True)
@@ -457,8 +456,31 @@ class LlamaModel:
             pre_proc_time = forward_s_event.elapsed_time(mainbody_s_event)
             mainbody_time = mainbody_s_event.elapsed_time(mainbody_e_event)
             post_proc_time = mainbody_e_event.elapsed_time(forward_e_event)
-            avg_stage_time = mainbody_time / (self.model_config.num_layers - 1) / 2
-            print(f"[Model.forward_pipeline] Pre-processing time: {pre_proc_time:.3f} ms, Main body time: {mainbody_time:.3f} ms, Post-processing time: {post_proc_time:.3f} ms, Average stage time: {avg_stage_time:.3f} ms")
+
+            linear_times = [None for _ in infer_states]
+            prefill_times = [[0 for _ in stage_layers] for _ in infer_states]
+            gpudec_times = [[0 for _ in stage_layers] for _ in infer_states]
+            cpudec_times = [[0 for _ in stage_layers] for _ in infer_states]
+
+            for i in range(2):
+                linear_times[i] = [layer.stage_s_events[i].elapsed_time(layer.linear_e_events[i]) for layer in stage_layers]
+                if infer_states[i].num_prefill_seqs > 0:
+                    prefill_times[i] = [layer.stage_s_events[i].elapsed_time(layer.prefill_e_events[i]) for layer in stage_layers]
+                if infer_states[i].gpu_num_decoding_seqs > 0:
+                    gpudec_times[i] = [layer.stage_s_events[i].elapsed_time(layer.gpudec_e_events[i]) for layer in stage_layers]
+                if infer_states[i].cpu_num_decoding_seqs > 0:
+                    cpudec_times[i] = [layer.stage_s_events[i].elapsed_time(layer.cpudec_e_events[i]) for layer in stage_layers]
+            
+            linear_time_avg = sum(sum(times) for times in linear_times) / (len(stage_layers) * 2)
+            prefill_time_avg = sum(sum(times) for times in prefill_times) / (len(stage_layers) * 2)
+            gpudec_time_avg = sum(sum(times) for times in gpudec_times) / (len(stage_layers) * 2)
+            cpudec_time_avg = sum(sum(times) for times in cpudec_times) / (len(stage_layers) * 2)
+            stage_time_avg = mainbody_time / (len(stage_layers) * 2)
+
+
+            print(f"[Model.forward_pipeline] Pre    : {pre_proc_time  :8.3f} ms,   Main   : {mainbody_time  :8.3f} ms,   Post   : {post_proc_time  :8.3f} ms")
+            print(f"                         Stg av : {stage_time_avg :8.3f} ms,   Lin av : {linear_time_avg:8.3f} ms,   Pref av: {prefill_time_avg:8.3f} ms")
+            print(f"                         GDec av: {gpudec_time_avg:8.3f} ms,   CDec av: {cpudec_time_avg:8.3f} ms")
 
         return output_tokens
 
@@ -475,10 +497,8 @@ class LlamaModel:
         finput_ids1, infer_state1 = self._prepare_inputs(args1)
 
         return self._forward_pipeline(
-            torch.tensor(finput_ids0, dtype=torch.int32, device="cuda"),
-            torch.tensor(finput_ids1, dtype=torch.int32, device="cuda"),
-            infer_state0,
-            infer_state1
+            torch.tensor(finput_ids0 + finput_ids1, dtype=torch.int32, device="cuda"),
+            [infer_state0, infer_state1]
         ).tolist()
 
     def _swap(
