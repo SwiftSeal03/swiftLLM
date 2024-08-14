@@ -25,6 +25,16 @@ class ModelForwardArgs:
     cpu_num_decoding_seqs: int = 0
     ignore_kvcache: bool = False
 
+@dataclasses.dataclass
+class ModelPerfResult:
+    avg_gpu_linr_time: float
+    avg_gpu_attn_time: float
+    avg_cpu_attn_time: float
+    margin_layer_time: float # Time for pre-layer and post-layer
+    margin_stage_time: float = 0 # Time for first and last pipeline stage
+
+    total_time: float = 0 # Unused when measuring
+
 class LlamaModel:
     """
     LlamaModel - A Llama model that can be used for inference.
@@ -72,6 +82,10 @@ class LlamaModel:
 
         if engine_config.library_path:
             torch.ops.load_library(engine_config.library_path)
+
+        # List of performance results, unused if monitor_performance is False
+        self.perf_results = []
+        self.show_perf_results = False
         
     @torch.inference_mode()
     def load_weights(self):
@@ -327,6 +341,11 @@ class LlamaModel:
 
         # Main body of the forward pass
         input_embds = self.pre_layer.forward(input_ids)
+
+        if self.engine_config.monitor_performance:
+            mainbody_s_event = torch.cuda.Event(enable_timing=True)
+            mainbody_s_event.record()
+        
         residual_buf = torch.zeros_like(input_embds)
         for layer in self.transformer_layers:
             input_embds = layer.forward(
@@ -336,6 +355,11 @@ class LlamaModel:
                 infer_state,
             )
         input_embds += residual_buf
+
+        if self.engine_config.monitor_performance:
+            mainbody_e_event = torch.cuda.Event(enable_timing=True)
+            mainbody_e_event.record()
+
         output_tokens = self.post_layer.forward(input_embds, infer_state)
 
         if self.engine_config.monitor_performance:
@@ -351,15 +375,16 @@ class LlamaModel:
                 gpudec_times = [layer.stage_s_events[0].elapsed_time(layer.gpudec_e_events[0]) for layer in self.transformer_layers]
             if infer_state.cpu_num_decoding_seqs > 0:
                 cpudec_times = [layer.stage_s_events[0].elapsed_time(layer.cpudec_e_events[0]) for layer in self.transformer_layers]
-            attn_total_time = sum(max(times) for times in zip(prefill_times, gpudec_times, cpudec_times))
-            linr_total_time = forward_s_event.elapsed_time(forward_e_event) - attn_total_time
 
-            prefill_times_avg = sum(prefill_times) / len(self.transformer_layers)
-            gpudec_times_avg = sum(gpudec_times) / len(self.transformer_layers)
-            cpudec_times_avg = sum(cpudec_times) / len(self.transformer_layers)
-            linr_avg_time = linr_total_time / len(self.transformer_layers)
-            print(f"[Model.forward] Lin   : {linr_total_time:8.3f} ms,   Attn:    {attn_total_time:8.3f} ms")
-            print(f"                Lin av: {linr_avg_time  :8.3f} ms,   Pref av: {prefill_times_avg:8.3f} ms, GDec av: {gpudec_times_avg:8.3f} ms, CDec av: {cpudec_times_avg:8.3f} ms")
+            attn_total_time = sum(max(times) for times in zip(prefill_times, gpudec_times, cpudec_times))
+            linr_total_time = mainbody_s_event.elapsed_time(mainbody_e_event) - attn_total_time
+
+            self.perf_results.append(ModelPerfResult(
+                avg_gpu_linr_time = linr_total_time / len(self.transformer_layers),
+                avg_gpu_attn_time = sum(max(times) for times in zip(prefill_times, gpudec_times)) / len(self.transformer_layers),
+                avg_cpu_attn_time = sum(cpudec_times) / len(self.transformer_layers),
+                margin_layer_time = forward_s_event.elapsed_time(mainbody_s_event) + mainbody_e_event.elapsed_time(forward_e_event),
+            ))
 
         return output_tokens
     
@@ -414,7 +439,14 @@ class LlamaModel:
         input_embds0, input_embds1 = torch.split(input_embds, infer_states[0].num_tokens, dim=0)
         residual_buf0, residual_buf1 = torch.split(residual_buf, infer_states[0].num_tokens, dim=0)
 
-        q1, k1, v1 = self.transformer_layers[0].forward_first_stage(
+        if self.engine_config.monitor_performance:
+            pipeline_s_event = torch.cuda.Event(enable_timing=True)
+            pipeline_s_event.record()
+
+        first_layer = self.transformer_layers[0]
+        last_layer = self.transformer_layers[-1]
+        
+        q1, k1, v1 = first_layer.forward_first_stage(
             input_embds0, input_embds1, residual_buf0, residual_buf1,
             kvargs, infer_states
         )
@@ -422,6 +454,11 @@ class LlamaModel:
         if self.engine_config.monitor_performance:
             mainbody_s_event = torch.cuda.Event(enable_timing=True)
             mainbody_s_event.record()
+            # back up the events
+            last_layer.stage_s_events[1] = first_layer.stage_s_events[0]
+            last_layer.cpudec_e_events[1] = first_layer.cpudec_e_events[0]
+            first_layer.stage_s_events[0] = torch.cuda.Event(enable_timing=True)
+            first_layer.cpudec_e_events[0] = torch.cuda.Event(enable_timing=True)
 
         # Main body of the forward pass
         # In every iteration, input_embds0 is updated to newer version of batch 0's attention output and 
@@ -439,10 +476,14 @@ class LlamaModel:
             mainbody_e_event.record()
             
 
-        f0, f1 = self.transformer_layers[-1].forward_last_stage(
+        f0, f1 = last_layer.forward_last_stage(
             q1, k1, v1, input_embds0, input_embds1, residual_buf0, residual_buf1,
             kvargs, infer_states
         )
+
+        if self.engine_config.monitor_performance:
+            pipeline_e_event = torch.cuda.Event(enable_timing=True)
+            pipeline_e_event.record()
 
         f0 += residual_buf0
         f1 += residual_buf1
@@ -453,9 +494,10 @@ class LlamaModel:
             forward_e_event = torch.cuda.Event(enable_timing=True)
             forward_e_event.record()
             torch.cuda.synchronize()
-            pre_proc_time = forward_s_event.elapsed_time(mainbody_s_event)
-            mainbody_time = mainbody_s_event.elapsed_time(mainbody_e_event)
-            post_proc_time = mainbody_e_event.elapsed_time(forward_e_event)
+            pre_layer_time = forward_s_event.elapsed_time(pipeline_s_event)
+            first_stage_time = pipeline_s_event.elapsed_time(mainbody_s_event)
+            last_stage_time = mainbody_e_event.elapsed_time(pipeline_e_event)
+            post_layer_time = pipeline_e_event.elapsed_time(forward_e_event)
 
             linear_times = [None for _ in infer_states]
             prefill_times = [[0 for _ in stage_layers] for _ in infer_states]
@@ -471,30 +513,27 @@ class LlamaModel:
                 if infer_states[i].cpu_num_decoding_seqs > 0:
                     cpudec_times[i] = [layer.stage_s_events[i].elapsed_time(layer.cpudec_e_events[i]) for layer in stage_layers]
             
-            linear_time_avg = sum(sum(times) for times in linear_times) / (len(stage_layers) * 2)
-            prefill_time_avg = sum(sum(times) for times in prefill_times) / (len(stage_layers) * 2)
-            gpudec_time_avg = sum(sum(times) for times in gpudec_times) / (len(stage_layers) * 2)
-            cpudec_time_avg = sum(sum(times) for times in cpudec_times) / (len(stage_layers) * 2)
-            stage_time_avg = mainbody_time / (len(stage_layers) * 2)
-
-
-            print(f"[Model.forward_pipeline] Pre    : {pre_proc_time  :8.3f} ms,   Main   : {mainbody_time  :8.3f} ms,   Post   : {post_proc_time  :8.3f} ms")
-            print(f"                         Stg av : {stage_time_avg :8.3f} ms,   Lin av : {linear_time_avg:8.3f} ms,   Pref av: {prefill_time_avg:8.3f} ms")
-            print(f"                         GDec av: {gpudec_time_avg:8.3f} ms,   CDec av: {cpudec_time_avg:8.3f} ms")
+            self.perf_results.append(ModelPerfResult(
+                avg_gpu_linr_time = sum(time for i in range(2) for time in linear_times[i]) / len(stage_layers) / 2,
+                avg_gpu_attn_time = 0, # attention goes in parallel with linear here, so omitted
+                avg_cpu_attn_time = sum(times for i in range(2) for times in cpudec_times[i]) / len(stage_layers) / 2,
+                margin_layer_time = pre_layer_time + post_layer_time,
+                margin_stage_time = first_stage_time + last_stage_time
+            ))
 
         return output_tokens
 
     @torch.inference_mode()
     def forward_pipeline(
         self,
-        args0: ModelForwardArgs,
-        args1: ModelForwardArgs
+        argss: list[ModelForwardArgs]
     ) -> list[int]:
         """
         Forward 2 sub-batches in a pipelined manner.
         """
-        finput_ids0, infer_state0 = self._prepare_inputs(args0)
-        finput_ids1, infer_state1 = self._prepare_inputs(args1)
+        assert len(argss) == 2
+        finput_ids0, infer_state0 = self._prepare_inputs(argss[0])
+        finput_ids1, infer_state1 = self._prepare_inputs(argss[1])
 
         return self._forward_pipeline(
             torch.tensor(finput_ids0 + finput_ids1, dtype=torch.int32, device="cuda"),
@@ -548,6 +587,59 @@ class LlamaModel:
         """
         Free the resources of the specified sequences.
         """
-        seq_ids = torch.tensor(seq_ids_list, dtype=torch.int32, device="cuda")
-        self.gpu_block_manager.free_blocks_for_seqs(seq_ids)
-        self.cpu_block_manager.free_blocks_for_seqs(seq_ids)
+        gpu_seq_ids = torch.tensor(seq_ids_list, dtype=torch.int32, device="cuda")
+        cpu_seq_ids = gpu_seq_ids.to("cpu")
+        self.gpu_block_manager.free_blocks_for_seqs(gpu_seq_ids)
+        self.cpu_block_manager.free_blocks_for_seqs(cpu_seq_ids)
+
+    @torch.inference_mode()
+    def get_perf_results(
+        self,
+        is_pipeline: bool = False
+    ) -> ModelPerfResult:
+        """
+        Show the performance results, which is calculated form the average of the list
+        
+        Then clear the results.
+        """
+
+        if not self.engine_config.monitor_performance:
+            print("Performance monitoring is not enabled.")
+            return
+
+        if not self.perf_results:
+            print("No performance results to show.")
+            return
+
+        avg_gpu_linr_time = sum(result.avg_gpu_linr_time for result in self.perf_results) / len(self.perf_results)
+        avg_gpu_attn_time = sum(result.avg_gpu_attn_time for result in self.perf_results) / len(self.perf_results)
+        avg_cpu_attn_time = sum(result.avg_cpu_attn_time for result in self.perf_results) / len(self.perf_results)
+        margin_layer_time = sum(result.margin_layer_time for result in self.perf_results) / len(self.perf_results)
+        margin_stage_time = sum(result.margin_stage_time for result in self.perf_results) / len(self.perf_results)
+
+        if is_pipeline:
+            total_time = max(avg_gpu_linr_time, avg_gpu_attn_time, avg_cpu_attn_time) * (len(self.transformer_layers) - 1) * 2 
+            total_time += margin_layer_time + margin_stage_time
+        else:
+            total_time = (avg_gpu_linr_time + max(avg_gpu_attn_time, avg_cpu_attn_time)) * len(self.transformer_layers)
+            total_time += margin_layer_time + margin_stage_time
+
+        if self.show_perf_results:    
+            print(f"  Average GPU linear time:    {avg_gpu_linr_time:8.3f} ms")
+            print(f"  Average GPU attention time: {avg_gpu_attn_time:8.3f} ms")
+            print(f"  Average CPU attention time: {avg_cpu_attn_time:8.3f} ms")
+            print(f"  Margin layer time:          {margin_layer_time:8.3f} ms")
+            print(f"  Margin stage time:          {margin_stage_time:8.3f} ms")
+            print(f"  Total time:                 {total_time:8.3f} ms")
+
+        self.perf_results.clear()
+
+        return ModelPerfResult(
+            avg_gpu_linr_time,
+            avg_gpu_attn_time,
+            avg_cpu_attn_time,
+            margin_layer_time,
+            margin_stage_time,
+            total_time
+        )
+        

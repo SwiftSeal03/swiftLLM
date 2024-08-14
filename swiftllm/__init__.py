@@ -6,4 +6,4 @@ from swiftllm.server.engine import Engine
 from swiftllm.server.structs import RawRequest
 
 # The Model for offline inference
-from swiftllm.worker.model import LlamaModel, ModelForwardArgs
+from swiftllm.worker.model import LlamaModel, ModelForwardArgs, ModelPerfResult

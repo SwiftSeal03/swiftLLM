@@ -239,7 +239,7 @@ def cpu_paged_attention(
     k = k.cpu()
     v = v.cpu()
     o_cpu = torch.empty_like(o, device='cpu', dtype=torch.float32)
-    torch.ops.pacpu.paged_attention_cpu_ispc_tasks(
+    torch.ops.pacpu.paged_attention_cpu(
         cur_layer,
         infer_state.softmax_scale,
         infer_state.cpu_seq_ids.tolist(),

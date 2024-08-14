@@ -100,19 +100,15 @@ if __name__ == '__main__':
             seq_lens[j] += 1
         last_round_outputs0 = last_round_outputs[:nprompts // 2]
         last_round_outputs1 = last_round_outputs[nprompts // 2:]
-        args0 = swiftllm.ModelForwardArgs(
-          [input_ids[0]] + [[x] for x in last_round_outputs0],
-          [nprompts + i * 2] + list(range(0, nprompts // 2)),
-          seq_lens[:nprompts // 2],
-          cpu_num_decoding_seqs=ncpu_prompts // 2
-        )
-        args1 = swiftllm.ModelForwardArgs(
-          [input_ids[0]] + [[x] for x in last_round_outputs1],
-          [nprompts + i * 2 + 1] + list(range(nprompts // 2, nprompts)),
-          seq_lens[nprompts // 2:],
-          cpu_num_decoding_seqs=ncpu_prompts // 2
-        )
-        last_round_outputs = model.forward_pipeline(args0, args1)
+        argss = [None] * 2
+        for j in range(2):
+            argss[j] = swiftllm.ModelForwardArgs(
+                [input_ids[0]] + [[x] for x in last_round_outputs0],
+                [nprompts + i * 2 + j] + list(range(0, nprompts // 2) if j == 0 else range(nprompts // 2, nprompts)),
+                seq_lens[:nprompts // 2] if j == 0 else seq_lens[nprompts // 2:],
+                cpu_num_decoding_seqs=ncpu_prompts // 2
+            )
+        last_round_outputs = model.forward_pipeline(argss)
         last_round_outputs = last_round_outputs[1:nprompts // 2 + 1] + last_round_outputs[nprompts // 2 + 2:]
         # print(tokenizer.batch_decode(last_round_outputs, skip_special_tokens=True))
         outputs.append(last_round_outputs)

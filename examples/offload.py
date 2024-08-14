@@ -50,22 +50,25 @@ if __name__ == '__main__':
     model = swiftllm.LlamaModel(engine_config)
     model.load_weights()
     num_blocks = 1700
+    model.show_perf_results = True
     print("Number of blocks:", num_blocks)
     model.init_kvcache_and_swap(num_blocks)
 
     model_creation_time = time.perf_counter() - start_time
     print(f"Model creation time: {model_creation_time:.2f} seconds")
     
-    ngpu_prompts = 60
-    ncpu_prompts = 100
+    ngpu_prompts = 0
+    ncpu_prompts = 64
+    prompt_len = 126
     nprompts = ncpu_prompts + ngpu_prompts
     with open("example.txt", "r") as f:
-        prompts = f.readlines() * nprompts
+        prompt = ' '.join(f.readlines())
     tokenizer = AutoTokenizer.from_pretrained(model_path)
     outputs = []
 
     # Prompt phase
-    input_ids = tokenizer(prompts)['input_ids']
+    input_ids = tokenizer(prompt)['input_ids']
+    input_ids = [input_ids[:prompt_len]] * nprompts
     cpu_prompt_outputs = model.forward(swiftllm.ModelForwardArgs(
         input_ids[ngpu_prompts:],
         list(range(ngpu_prompts, nprompts)),
@@ -88,20 +91,21 @@ if __name__ == '__main__':
         for j in range(nprompts):
             seq_lens[j] += 1
         last_round_outputs = model.forward(swiftllm.ModelForwardArgs(
-            [input_ids[0]] + 
+            # [input_ids[0]] + 
             [[x] for x in last_round_outputs],
-            [nprompts + i] + 
-            list(range(0, len(prompts))),
+            # [nprompts + i] + 
+            list(range(0, nprompts)),
             seq_lens,
             cpu_num_decoding_seqs=ncpu_prompts
-        ))[1:]
+        ))#[1:]
         # print(tokenizer.batch_decode(last_round_outputs, skip_special_tokens=True))
         outputs.append(last_round_outputs)
         end = time.perf_counter()
-        print(f"                E2E decoding time: {(end - start) * 1000:.4f} ms")
+        print(f"E2E decoding time: {(end - start) * 1000:.4f} ms")
+        model.get_perf_results()
     
-    for i, prompt in enumerate(prompts):
+    for i in range(nprompts):
         output_tokens = [x[i] for x in outputs]
         output_text = tokenizer.decode(output_tokens, skip_special_tokens=True)
         if i == 0 or i == nprompts - 1:
-            print(f"{prompt}|{output_text}")
+            print(f"{output_text}")

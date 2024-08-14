@@ -46,12 +46,10 @@ class LlamaTransformerLayer:
         self.layer_id = layer_id
         
         self.stage_s_events = [torch.cuda.Event(enable_timing=True) for _ in range(2)]    
+        self.linear_e_events = [torch.cuda.Event(enable_timing=True) for _ in range(2)]
         self.prefill_e_events = [torch.cuda.Event(enable_timing=True) for _ in range(2)]
         self.gpudec_e_events = [torch.cuda.Event(enable_timing=True) for _ in range(2)]
         self.cpudec_e_events = [torch.cuda.Event(enable_timing=True) for _ in range(2)]
-
-        if engine_config.monitor_performance:
-            self.linear_e_events = [torch.cuda.Event(enable_timing=True) for _ in range(2)]
 
 
     def _preproj(
