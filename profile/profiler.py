@@ -9,7 +9,7 @@ import swiftllm.worker
 model_path = "/home/ubuntu/weights/Llama-3-8B-Instruct-Gradient-1048k"
 library_path = "/home/ubuntu/pacpu/build/libpacpu.so"
 
-tokenizer, model = None, None
+tokenizer, model, profiler = None, None, None
 
 nwarmup = 2
 nrepeat = 3
@@ -67,94 +67,26 @@ def get_tokens():
   
   base_tokens = tokenizer(prompt)['input_ids'] * 4
 
-
-def run_test_case(
-  prefill_lens: list[int] = [],
-  gpu_decode_lens: list[int] = [],
-  cpu_decode_lens: list[int] = [],
-  use_pipeline: bool = False
-) -> swiftllm.ModelPerfResult:
-  """
-  Run a artificial test case and return the performance results.
-  """
-  # print(f"Running test case with prefill_lens={prefill_lens}, gpu_decode_lens={gpu_decode_lens}, cpu_decode_lens={cpu_decode_lens}")
-
-  npref = len(prefill_lens)
-  ngdec = len(gpu_decode_lens)
-  ncdec = len(cpu_decode_lens)
-
-  argss = []
-  all_prefill_ids = []
-  all_decode_ids = []
-
-  # Seq 0 is the base tokens
-  offs = 1
-  for _ in range(2 if use_pipeline else 1):
-    prefill_ids = list(range(offs, offs + npref))
-    gpu_decode_ids = list(range(offs + npref, offs + npref + ngdec))
-    cpu_decode_ids = list(range(offs + npref + ngdec, offs + npref + ngdec + ncdec))
-    offs += npref + ngdec + ncdec
-
-    all_prefill_ids.extend(prefill_ids)
-    all_decode_ids.extend(gpu_decode_ids + cpu_decode_ids)
-
-    if ncdec > 0:
-      fake_prefill.prefill(cpu_decode_ids, cpu_decode_lens)
-      model.swap_out_seqs(cpu_decode_ids)
-    if ngdec > 0:
-      fake_prefill.prefill(gpu_decode_ids, gpu_decode_lens)
-
-    input_ids = [
-      base_tokens[:seq_len] for seq_len in prefill_lens
-    ] + [
-      [base_tokens[seq_len - 1]] for seq_len in gpu_decode_lens
-    ] + [
-      [base_tokens[seq_len - 1]] for seq_len in cpu_decode_lens
-    ]
-
-    argss.append(swiftllm.ModelForwardArgs(
-      input_ids,
-      prefill_ids + gpu_decode_ids + cpu_decode_ids,
-      gpu_decode_lens + cpu_decode_lens,
-      len(cpu_decode_ids)
-    ))
-
-  for i in range(-nwarmup, nrepeat):
-    if i == 0:
-        start = time.perf_counter()
-    model.engine_config.monitor_performance = i >= 0
-    if not use_pipeline:
-      model.forward(argss[0])
-    else:
-      model.forward_pipeline(argss)
-    # Note that faked prefilling already allocates memory for the "new" token to be fed
-    # into the model, so model.forward won't allocate memory for them and we only need
-    # to free the resources for the prefill tokens.
-    if all_prefill_ids:
-      model.free_seqs_resources(all_prefill_ids)
-
-  elapsed = time.perf_counter() - start
-  # print(f"Time taken: {elapsed * 1000/nrepeat:.2f} ms")
-
-  assert len(model.perf_results) == nrepeat
-  res = model.get_perf_results(use_pipeline)
-  model.free_seqs_resources(all_decode_ids)
-  return res
-
 def init():
   init_model()
   get_tokens()
-  fake_prefill.init(model, base_tokens)
+  global profiler
+  profiler = swiftllm.ModelProfiler(
+    model, 
+    base_tokens,
+    nwarmup, 
+    nrepeat
+  )
 
 if __name__ == "__main__":
   init()
-  res = run_test_case(
-    prefill_lens=[192, 192],
-    gpu_decode_lens=[384] * 40,
-    cpu_decode_lens=[384] * 40
+  res = profiler.run_test_case(
+    prefill_lens=[192],
+    gpu_decode_lens=[384] * 20,
+    cpu_decode_lens=[384] * 20
   )
   pprint(res)
-  res = run_test_case(
+  res = profiler.run_test_case(
     prefill_lens=[192],
     gpu_decode_lens=[384] * 20,
     cpu_decode_lens=[384] * 20,
