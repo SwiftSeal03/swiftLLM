@@ -82,6 +82,8 @@ class LlamaModel:
 
         if engine_config.library_path:
             torch.ops.load_library(engine_config.library_path)
+        
+        self.executor = None # ThreadPoolExecutor(max_workers=1)
 
         # List of performance results, unused if monitor_performance is False
         self.perf_results = []
@@ -117,6 +119,7 @@ class LlamaModel:
                 prefilling_stream,
                 decoding_piggyback_stream,
                 cpu_communication_stream,
+                self.executor,
                 layer_id
             )
             for layer_id in range(self.model_config.num_layers)

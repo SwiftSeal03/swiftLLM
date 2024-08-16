@@ -28,7 +28,7 @@ def init_model():
     
     block_size = 16,
     gpu_mem_utilization = 0.995,
-    num_cpu_blocks = 1700,
+    num_cpu_blocks = 4000,
     max_seqs_in_block_table = 512,
     max_blocks_per_seq = 2048,
 
@@ -45,7 +45,7 @@ def init_model():
   # For instructions on how to initialize the model, see comments in swiftllm/worker/model.py
   model = swiftllm.LlamaModel(engine_config)
   model.load_weights()
-  num_blocks = 1700
+  num_blocks = 1750
   print("Number of blocks:", num_blocks)
   model.init_kvcache_and_swap(num_blocks)
 
@@ -80,12 +80,6 @@ def init():
 
 if __name__ == "__main__":
   init()
-  res = profiler.run_test_case(
-    prefill_lens=[192],
-    gpu_decode_lens=[384] * 20,
-    cpu_decode_lens=[384] * 20
-  )
-  pprint(res)
   res = profiler.run_test_case(
     prefill_lens=[192],
     gpu_decode_lens=[384] * 20,

@@ -220,37 +220,3 @@ def paged_attention(
         infer_state.num_seq_blocks,
         infer_state.seq_block_size,
     )
-
-# Paged attention for CPU, also stores new KV cache
-def cpu_paged_attention(
-    q: torch.Tensor,                  # [num_decoding_seqs, num_q_heads, head_dim]
-    k: torch.Tensor,                  # [num_decoding_seqs, num_kv_heads, head_dim]
-    v: torch.Tensor,                  # [num_decoding_seqs, num_kv_heads, head_dim]
-    k_cache: torch.Tensor,
-    v_cache: torch.Tensor,
-    block_table: torch.Tensor,
-    model_config: LlamaModelConfig,
-    engine_config: EngineConfig,
-    infer_state: LlamaInferState,
-    cur_layer: int,
-    o: torch.Tensor     # [num_decoding_seqs, num_q_heads, head_dim]
-):
-    q = q.cpu()
-    k = k.cpu()
-    v = v.cpu()
-    o_cpu = torch.empty_like(o, device='cpu', dtype=torch.float32)
-    torch.ops.pacpu.paged_attention_cpu(
-        cur_layer,
-        infer_state.softmax_scale,
-        infer_state.cpu_seq_ids.tolist(),
-        infer_state.cpu_decoding_seq_lens.tolist(),
-
-        q,
-        k,
-        v,
-        k_cache,
-        v_cache,
-        block_table,
-        o_cpu
-    )
-    o.copy_(o_cpu.to(torch.float16), non_blocking=True)

@@ -2,6 +2,7 @@ import time
 import dataclasses
 import torch
 import vllm_flash_attn
+from concurrent.futures import ThreadPoolExecutor
 
 from swiftllm.model_config import LlamaModelConfig
 from swiftllm.engine_config import EngineConfig
@@ -34,6 +35,7 @@ class LlamaTransformerLayer:
         prefilling_stream: torch.cuda.Stream,
         decoding_piggyback_stream: torch.cuda.Stream,
         cpu_communication_stream: torch.cuda.Stream,
+        executor: ThreadPoolExecutor,
         layer_id: int
     ):
         self.model_config = model_config
@@ -43,6 +45,7 @@ class LlamaTransformerLayer:
         self.prefilling_stream = prefilling_stream
         self.decoding_piggyback_stream = decoding_piggyback_stream
         self.cpu_communication_stream = cpu_communication_stream
+        self.executor = executor
         self.layer_id = layer_id
         
         self.stage_s_events = [torch.cuda.Event(enable_timing=True) for _ in range(2)]    
@@ -109,6 +112,21 @@ class LlamaTransformerLayer:
 
         cur_layer_id = self.layer_id + cur_stage
 
+        # CPU decoding is done in a separate thread, so that we can overlap it with GPU kernel launches
+        # if infer_state.cpu_num_decoding_seqs > 0:
+        #     with torch.cuda.stream(self.cpu_communication_stream):
+        #         torch.cuda.current_stream().wait_event(self.stage_s_events[cur_stage])
+        #         fut = self.executor.submit(
+        #             cpu_paged_attention,
+        #             q[infer_state.gpu_token_end:, :, :],
+        #             k[infer_state.gpu_token_end:, :, :], 
+        #             v[infer_state.gpu_token_end:, :, :],
+        #             k_swap, v_swap, cpu_block_table,
+        #             self.model_config, self.engine_config, infer_state,
+        #             cur_layer_id,
+        #             o[infer_state.gpu_token_end:, :]
+        #         )
+
         if infer_state.num_prefill_seqs > 0:
             with torch.cuda.stream(self.prefilling_stream):
                 torch.cuda.current_stream().wait_event(self.stage_s_events[cur_stage])
@@ -163,15 +181,26 @@ class LlamaTransformerLayer:
         if infer_state.cpu_num_decoding_seqs > 0:
             with torch.cuda.stream(self.cpu_communication_stream):
                 torch.cuda.current_stream().wait_event(self.stage_s_events[cur_stage])
-                cpu_paged_attention(
-                    q[infer_state.gpu_token_end:, :, :],
-                    k[infer_state.gpu_token_end:, :, :], 
-                    v[infer_state.gpu_token_end:, :, :],
-                    k_swap, v_swap, cpu_block_table,
-                    self.model_config, self.engine_config, infer_state,
+                q_cpu = q[infer_state.gpu_token_end:, :, :].cpu()
+                k_cpu = k[infer_state.gpu_token_end:, :, :].cpu()
+                v_cpu = v[infer_state.gpu_token_end:, :, :].cpu()
+                oc = o[infer_state.gpu_token_end:, :]
+                o_cpu = torch.empty_like(oc, device='cpu', dtype=torch.float32)
+                torch.ops.pacpu.paged_attention_cpu(
                     cur_layer_id,
-                    o[infer_state.gpu_token_end:, :],
+                    infer_state.softmax_scale,
+                    infer_state.cpu_seq_ids.tolist(),
+                    infer_state.cpu_decoding_seq_lens.tolist(),
+
+                    q_cpu,
+                    k_cpu,
+                    v_cpu,
+                    k_swap,
+                    v_swap,
+                    cpu_block_table,
+                    o_cpu
                 )
+                oc.copy_(o_cpu.to(torch.float16), non_blocking=True)
                 self.cpudec_e_events[cur_stage].record()
             torch.cuda.default_stream().wait_event(self.cpudec_e_events[cur_stage])
 
