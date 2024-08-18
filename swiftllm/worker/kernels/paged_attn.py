@@ -165,35 +165,46 @@ def paged_attention(
     q: torch.Tensor,                    # [num_decoding_seqs, num_q_heads, head_dim]
     k: torch.Tensor,                    # [num_decoding_seqs, num_kv_heads, head_dim]
     v: torch.Tensor,                    # [num_decoding_seqs, num_kv_heads, head_dim]
+    o: torch.Tensor,     # [num_decoding_seqs, num_q_heads, head_dim]
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
     block_table: torch.Tensor,
-    model_config: LlamaModelConfig,
-    engine_config: EngineConfig,
-    infer_state: LlamaInferState,
+    seq_ids: torch.Tensor,
+    seq_lens: torch.Tensor,
     cur_layer: int,
-    o: torch.Tensor     # [num_decoding_seqs, num_q_heads, head_dim]
+    seq_block_size: int,
+    num_seq_blocks: int,
+    softmax_scale: float
 ):
     assert q.is_contiguous()
     assert k_cache.is_contiguous()
     assert v_cache.is_contiguous()
     assert block_table.is_contiguous()
-    assert infer_state.seq_block_size % engine_config.block_size == 0
     assert o.is_contiguous()
 
+    num_q_heads = q.shape[1]
+    head_dim = q.shape[2]
+    num_layers = k_cache.shape[1]
+    num_kv_heads = k_cache.shape[2]
+    block_size = k_cache.shape[3]
+    block_table_width = block_table.shape[1]
+    assert seq_block_size % block_size == 0
+
+    num_decoding_seqs = seq_ids.shape[0]
+
     mid_o = torch.empty((
-        infer_state.gpu_num_decoding_seqs,
-        model_config.num_q_heads,
-        infer_state.num_seq_blocks,
-        model_config.head_dim
+        num_decoding_seqs,
+        num_q_heads,
+        num_seq_blocks,
+        head_dim
     ), device=q.device, dtype=torch.float32)
     mid_o_logexpsum = torch.empty((
-        infer_state.gpu_num_decoding_seqs,
-        model_config.num_q_heads,
-        infer_state.num_seq_blocks
+        num_decoding_seqs,
+        num_q_heads,
+        num_seq_blocks
     ), device=q.device, dtype=torch.float32)
 
-    grid = (infer_state.gpu_num_decoding_seqs, model_config.num_q_heads, infer_state.num_seq_blocks)
+    grid = (num_decoding_seqs, num_q_heads, num_seq_blocks)
     _fwd_paged_attention_phase1[grid](
         mid_o, mid_o_logexpsum,
         q, k, v, k_cache, v_cache,
@@ -206,31 +217,31 @@ def paged_attention(
         #    and use `exp2` instead.
         # 2. Some optimizations are disabled while using `exp` in a loop, see
         #    https://github.com/triton-lang/triton/issues/2961
-        infer_state.softmax_scale * 1.442695040888963,
-        infer_state.gpu_decoding_seq_lens,
-        infer_state.gpu_seq_ids[infer_state.num_prefill_seqs:],
-        infer_state.num_seq_blocks,
+        softmax_scale * 1.442695040888963,
+        seq_lens,
+        seq_ids,
+        num_seq_blocks,
         cur_layer,
 
-        model_config.num_layers,
-        model_config.num_q_heads,
-        model_config.num_kv_heads,
-        model_config.num_q_heads // model_config.num_kv_heads,
-        engine_config.block_size,
-        model_config.head_dim,
-        infer_state.seq_block_size,
-        engine_config.max_blocks_per_seq,
+        num_layers,
+        num_q_heads,
+        num_kv_heads,
+        num_q_heads // num_kv_heads,
+        block_size,
+        head_dim,
+        seq_block_size,
+        block_table_width,
         num_warps = 1,
         num_stages = 4
     )
 
-    grid = (infer_state.gpu_num_decoding_seqs, model_config.num_q_heads)
+    grid = (num_decoding_seqs, num_q_heads)
     _fwd_paged_attention_phase2[grid](
         mid_o, mid_o_logexpsum,
         o,
-        infer_state.gpu_decoding_seq_lens,
-        model_config.num_q_heads,
-        model_config.head_dim,
-        infer_state.num_seq_blocks,
-        infer_state.seq_block_size,
+        seq_lens,
+        num_q_heads,
+        head_dim,
+        num_seq_blocks,
+        seq_block_size
     )

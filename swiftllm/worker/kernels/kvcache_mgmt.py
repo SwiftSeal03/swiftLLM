@@ -54,27 +54,34 @@ def store_kvcache(
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
     block_table: torch.Tensor,
-    model_config: LlamaModelConfig,
-    engine_config: EngineConfig,
-    infer_state: LlamaInferState,
-    cur_layer: int
+    seq_ids: torch.Tensor,
+    prefill_seq_start_locs: torch.Tensor,
+    prefill_seq_lens: torch.Tensor,
+    cur_layer: int,
+    max_prefill_len: int
 ):
     assert k.is_contiguous()
     assert v.is_contiguous()
     assert k_cache.is_contiguous()
     assert v_cache.is_contiguous()
     assert block_table.is_contiguous()
-    assert infer_state.gpu_seq_ids.is_contiguous()
-    assert infer_state.gpu_decoding_seq_lens.is_contiguous()
+    assert seq_ids.is_contiguous()
 
-    if infer_state.num_prefill_seqs > 0:
-        grid = (infer_state.num_prefill_seqs, cdiv(infer_state.max_prefill_len, engine_config.block_size))
-        _fwd_kvcache_mgmt_prefill_kernel[grid](
-            k_cache, v_cache,
-            k, v,
-            block_table,
-            infer_state.gpu_seq_ids[:infer_state.num_prefill_seqs],
-            infer_state.prefill_seq_start_locs, infer_state.prefill_seq_lens,
-            cur_layer,
-            model_config.num_layers, model_config.num_kv_heads, engine_config.block_size, model_config.head_dim, engine_config.max_blocks_per_seq
-        )
+    num_layers = k_cache.shape[1]
+    num_kv_heads = k_cache.shape[2]
+    block_size = k_cache.shape[3]
+    head_dim = k_cache.shape[4]
+    block_table_width = block_table.shape[1]
+    num_prefill_seqs = seq_ids.shape[0]
+
+    grid = (num_prefill_seqs, cdiv(max_prefill_len, block_size))
+    _fwd_kvcache_mgmt_prefill_kernel[grid](
+        k_cache, v_cache,
+        k, v,
+        block_table,
+        seq_ids,
+        prefill_seq_start_locs, 
+        prefill_seq_lens,
+        cur_layer,
+        num_layers, num_kv_heads, block_size, head_dim, block_table_width
+    )

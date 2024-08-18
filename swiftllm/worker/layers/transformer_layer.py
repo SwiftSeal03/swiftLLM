@@ -144,14 +144,15 @@ class LlamaTransformerLayer:
             with torch.cuda.stream(self.decoding_piggyback_stream):
                 torch.cuda.current_stream().wait_event(self.stage_s_events[cur_stage])
                 store_kvcache(
-                    k[:infer_state.gpu_token_end, :, :],
-                    v[:infer_state.gpu_token_end, :, :],
+                    k[:infer_state.num_prefill_tokens, :, :],
+                    v[:infer_state.num_prefill_tokens, :, :],
                     k_cache, v_cache,
                     gpu_block_table,
-                    self.model_config,
-                    self.engine_config,
-                    infer_state,
-                    cur_layer_id
+                    infer_state.gpu_seq_ids[:infer_state.num_prefill_seqs],
+                    infer_state.prefill_seq_start_locs,
+                    infer_state.prefill_seq_lens,
+                    cur_layer_id,
+                    infer_state.max_prefill_len
                 )
             # Default stream doesn't need to wait for store_kvcache because:
             #   1. If there is no GPU decoding, the data won't be used until next iteration.
@@ -164,10 +165,14 @@ class LlamaTransformerLayer:
                     q[infer_state.num_prefill_tokens:infer_state.gpu_token_end, :, :],
                     k[infer_state.num_prefill_tokens:infer_state.gpu_token_end, :, :],
                     v[infer_state.num_prefill_tokens:infer_state.gpu_token_end, :, :],
-                    k_cache, v_cache, gpu_block_table,
-                    self.model_config, self.engine_config, infer_state,
-                    cur_layer_id,
                     o[infer_state.num_prefill_tokens:infer_state.gpu_token_end, :],
+                    k_cache, v_cache, gpu_block_table,
+                    infer_state.gpu_seq_ids[infer_state.num_prefill_seqs:],
+                    infer_state.gpu_decoding_seq_lens,
+                    cur_layer_id,
+                    infer_state.seq_block_size,
+                    infer_state.num_seq_blocks,
+                    infer_state.softmax_scale
                 )
                 self.gpudec_e_events[cur_stage].record()
             torch.cuda.default_stream().wait_event(self.gpudec_e_events[cur_stage])
