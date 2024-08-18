@@ -29,6 +29,7 @@ class ModelForwardArgs:
 class ModelPerfResult:
     avg_gpu_linr_time: float
     avg_gpu_attn_time: float
+    avg_cpu_work_time: float
     avg_cpu_attn_time: float
     margin_layer_time: float # Time for pre-layer and post-layer
     margin_stage_time: float = 0 # Time for first and last pipeline stage
@@ -83,7 +84,7 @@ class LlamaModel:
         if engine_config.library_path:
             torch.ops.load_library(engine_config.library_path)
         
-        self.executor = None # ThreadPoolExecutor(max_workers=1)
+        self.executor = ThreadPoolExecutor(max_workers=1)
 
         # List of performance results, unused if monitor_performance is False
         self.perf_results = []
@@ -371,13 +372,15 @@ class LlamaModel:
             torch.cuda.synchronize()
             prefill_times = [0 for _ in self.transformer_layers]
             gpudec_times = [0 for _ in self.transformer_layers]
+            cpuwrk_times = [0 for _ in self.transformer_layers]
             cpudec_times = [0 for _ in self.transformer_layers]
             if infer_state.num_prefill_seqs > 0:
                 prefill_times = [layer.stage_s_events[0].elapsed_time(layer.prefill_e_events[0]) for layer in self.transformer_layers]
             if infer_state.gpu_num_decoding_seqs > 0:
                 gpudec_times = [layer.stage_s_events[0].elapsed_time(layer.gpudec_e_events[0]) for layer in self.transformer_layers]
             if infer_state.cpu_num_decoding_seqs > 0:
-                cpudec_times = [layer.stage_s_events[0].elapsed_time(layer.cpudec_e_events[0]) for layer in self.transformer_layers]
+                cpuwrk_times = [layer.stage_s_events[0].elapsed_time(layer.cpudec_e_events[0]) for layer in self.transformer_layers]
+                cpudec_times = [layer.cpudec_s_events[0].elapsed_time(layer.cpudec_e_events[0]) for layer in self.transformer_layers]
 
             attn_total_time = sum(max(times) for times in zip(prefill_times, gpudec_times, cpudec_times))
             linr_total_time = mainbody_s_event.elapsed_time(mainbody_e_event) - attn_total_time
@@ -385,6 +388,7 @@ class LlamaModel:
             self.perf_results.append(ModelPerfResult(
                 avg_gpu_linr_time = linr_total_time / len(self.transformer_layers),
                 avg_gpu_attn_time = sum(max(times) for times in zip(prefill_times, gpudec_times)) / len(self.transformer_layers),
+                avg_cpu_work_time = sum(cpuwrk_times) / len(self.transformer_layers),
                 avg_cpu_attn_time = sum(cpudec_times) / len(self.transformer_layers),
                 margin_layer_time = forward_s_event.elapsed_time(mainbody_s_event) + mainbody_e_event.elapsed_time(forward_e_event),
             ))
@@ -505,6 +509,7 @@ class LlamaModel:
             linear_times = [None for _ in infer_states]
             prefill_times = [[0 for _ in stage_layers] for _ in infer_states]
             gpudec_times = [[0 for _ in stage_layers] for _ in infer_states]
+            cpuwrk_times = [[0 for _ in stage_layers] for _ in infer_states]
             cpudec_times = [[0 for _ in stage_layers] for _ in infer_states]
 
             for i in range(2):
@@ -514,11 +519,13 @@ class LlamaModel:
                 if infer_states[i].gpu_num_decoding_seqs > 0:
                     gpudec_times[i] = [layer.stage_s_events[i].elapsed_time(layer.gpudec_e_events[i]) for layer in stage_layers]
                 if infer_states[i].cpu_num_decoding_seqs > 0:
-                    cpudec_times[i] = [layer.stage_s_events[i].elapsed_time(layer.cpudec_e_events[i]) for layer in stage_layers]
+                    cpuwrk_times[i] = [layer.stage_s_events[i].elapsed_time(layer.cpudec_e_events[i]) for layer in stage_layers]
+                    cpudec_times[i] = [layer.cpudec_s_events[i].elapsed_time(layer.cpudec_e_events[i]) for layer in stage_layers]
             
             self.perf_results.append(ModelPerfResult(
                 avg_gpu_linr_time = sum(time for i in range(2) for time in linear_times[i]) / len(stage_layers) / 2,
                 avg_gpu_attn_time = 0, # attention goes in parallel with linear here, so omitted
+                avg_cpu_work_time = sum(times for i in range(2) for times in cpuwrk_times[i]) / len(stage_layers) / 2,
                 avg_cpu_attn_time = sum(times for i in range(2) for times in cpudec_times[i]) / len(stage_layers) / 2,
                 margin_layer_time = pre_layer_time + post_layer_time,
                 margin_stage_time = first_stage_time + last_stage_time
@@ -616,20 +623,22 @@ class LlamaModel:
 
         avg_gpu_linr_time = sum(result.avg_gpu_linr_time for result in self.perf_results) / len(self.perf_results)
         avg_gpu_attn_time = sum(result.avg_gpu_attn_time for result in self.perf_results) / len(self.perf_results)
+        avg_cpu_work_time = sum(result.avg_cpu_work_time for result in self.perf_results) / len(self.perf_results)
         avg_cpu_attn_time = sum(result.avg_cpu_attn_time for result in self.perf_results) / len(self.perf_results)
         margin_layer_time = sum(result.margin_layer_time for result in self.perf_results) / len(self.perf_results)
         margin_stage_time = sum(result.margin_stage_time for result in self.perf_results) / len(self.perf_results)
 
         if is_pipeline:
-            total_time = max(avg_gpu_linr_time, avg_gpu_attn_time, avg_cpu_attn_time) * (len(self.transformer_layers) - 1) * 2 
+            total_time = max(avg_gpu_linr_time, avg_gpu_attn_time, avg_cpu_work_time) * (len(self.transformer_layers) - 1) * 2 
             total_time += margin_layer_time + margin_stage_time
         else:
-            total_time = (avg_gpu_linr_time + max(avg_gpu_attn_time, avg_cpu_attn_time)) * len(self.transformer_layers)
+            total_time = (avg_gpu_linr_time + max(avg_gpu_attn_time, avg_cpu_work_time)) * len(self.transformer_layers)
             total_time += margin_layer_time + margin_stage_time
 
         if self.show_perf_results:    
             print(f"  Average GPU linear time:    {avg_gpu_linr_time:8.3f} ms")
             print(f"  Average GPU attention time: {avg_gpu_attn_time:8.3f} ms")
+            print(f"  Average CPU working time:   {avg_cpu_work_time:8.3f} ms")
             print(f"  Average CPU attention time: {avg_cpu_attn_time:8.3f} ms")
             print(f"  Margin layer time:          {margin_layer_time:8.3f} ms")
             print(f"  Margin stage time:          {margin_stage_time:8.3f} ms")
@@ -640,6 +649,7 @@ class LlamaModel:
         return ModelPerfResult(
             avg_gpu_linr_time,
             avg_gpu_attn_time,
+            avg_cpu_work_time,
             avg_cpu_attn_time,
             margin_layer_time,
             margin_stage_time,

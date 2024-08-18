@@ -1,3 +1,4 @@
+import os
 from setuptools import setup
 from torch.utils import cpp_extension
 
@@ -8,11 +9,12 @@ ext_modules = [
         "swiftllm_c",
         [
             "src/entrypoints.cpp",
-			"src/block_swapping.cpp"
+			"src/block_swapping.cpp",
+            "src/small_kernels.cu",
         ],
         extra_compile_args={
             'cxx': ['-O3'],
-            'nvcc': ['-O3', '--use_fast_math']
+            'nvcc': ['-O3']
         }
     ),
 ]

@@ -1,6 +1,7 @@
 import torch
 import triton
 import triton.language as tl
+import swiftllm_c
 
 @triton.jit
 def _fwd_silu_and_mul(
@@ -32,3 +33,14 @@ def silu_and_mul_inplace(
     block_size = 256
     assert ffn_inter_dim % block_size == 0
     _fwd_silu_and_mul[(num_tokens, ffn_inter_dim//block_size)](x, ffn_inter_dim, block_size)
+
+if __name__ == "__main__":
+    x = torch.randn(10, 512, dtype=torch.float16, device="cuda")
+    y = x.clone()
+    silu_and_mul_inplace(x)
+    swiftllm_c.silu_and_mul_inplace(y)
+
+    print(x)
+    print(y)
+    
+    assert torch.allclose(x, y, atol=1e-5)

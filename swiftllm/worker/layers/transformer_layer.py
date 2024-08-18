@@ -2,6 +2,7 @@ import time
 import dataclasses
 import torch
 import vllm_flash_attn
+from swiftllm_c import fused_add_rmsnorm_inplace, silu_and_mul_inplace, rotary_embedding_inplace
 from concurrent.futures import ThreadPoolExecutor
 
 from swiftllm.model_config import LlamaModelConfig
@@ -10,11 +11,11 @@ from swiftllm.worker.weight import LlamaTransformerLayerWeight
 from swiftllm.worker.infer_state import LlamaInferState
 
 from swiftllm.worker.kernels.linear import linear
-from swiftllm.worker.kernels.rmsnorm import fused_add_rmsnorm_inplace
-from swiftllm.worker.kernels.rotary_emb import rotary_embedding_inplace
-from swiftllm.worker.kernels.paged_attn import paged_attention, cpu_paged_attention
+# from swiftllm.worker.kernels.rotary_emb import rotary_embedding_inplace
+from swiftllm.worker.kernels.paged_attn import paged_attention
 from swiftllm.worker.kernels.kvcache_mgmt import store_kvcache
-from swiftllm.worker.kernels.silu_and_mul import silu_and_mul_inplace
+# from swiftllm.worker.kernels.silu_and_mul import silu_and_mul_inplace
+# from swiftllm.worker.kernels.rmsnorm import fused_add_rmsnorm_inplace
 
 @dataclasses.dataclass
 class KVCacheArgs:
@@ -53,6 +54,7 @@ class LlamaTransformerLayer:
         self.prefill_e_events = [torch.cuda.Event(enable_timing=True) for _ in range(2)]
         self.gpudec_e_events = [torch.cuda.Event(enable_timing=True) for _ in range(2)]
         self.cpudec_e_events = [torch.cuda.Event(enable_timing=True) for _ in range(2)]
+        self.cpudec_s_events = [torch.cuda.Event(enable_timing=True) for _ in range(2)]
 
 
     def _preproj(
@@ -65,6 +67,7 @@ class LlamaTransformerLayer:
         # We may need to use the next layer in piplined setting
         weight = self.weight if not use_next_layer else self.next_layer_weight
 
+        start = time.perf_counter()
         fused_add_rmsnorm_inplace(
             input_embds,
             residual_buf,
@@ -84,8 +87,11 @@ class LlamaTransformerLayer:
         rotary_embedding_inplace(
             q,
             k,
-            infer_state
+            infer_state.position_sin,
+            infer_state.position_cos
         )
+        end = time.perf_counter()
+        print(f"Preproj launch time: {(end - start)*1000:.3f} ms")
 
         return q, k, v
     
@@ -112,21 +118,7 @@ class LlamaTransformerLayer:
 
         cur_layer_id = self.layer_id + cur_stage
 
-        # CPU decoding is done in a separate thread, so that we can overlap it with GPU kernel launches
-        # if infer_state.cpu_num_decoding_seqs > 0:
-        #     with torch.cuda.stream(self.cpu_communication_stream):
-        #         torch.cuda.current_stream().wait_event(self.stage_s_events[cur_stage])
-        #         fut = self.executor.submit(
-        #             cpu_paged_attention,
-        #             q[infer_state.gpu_token_end:, :, :],
-        #             k[infer_state.gpu_token_end:, :, :], 
-        #             v[infer_state.gpu_token_end:, :, :],
-        #             k_swap, v_swap, cpu_block_table,
-        #             self.model_config, self.engine_config, infer_state,
-        #             cur_layer_id,
-        #             o[infer_state.gpu_token_end:, :]
-        #         )
-
+        start = time.perf_counter()
         if infer_state.num_prefill_seqs > 0:
             with torch.cuda.stream(self.prefilling_stream):
                 torch.cuda.current_stream().wait_event(self.stage_s_events[cur_stage])
@@ -170,6 +162,8 @@ class LlamaTransformerLayer:
             with torch.cuda.stream(self.decoding_piggyback_stream):
                 paged_attention(
                     q[infer_state.num_prefill_tokens:infer_state.gpu_token_end, :, :],
+                    k[infer_state.num_prefill_tokens:infer_state.gpu_token_end, :, :],
+                    v[infer_state.num_prefill_tokens:infer_state.gpu_token_end, :, :],
                     k_cache, v_cache, gpu_block_table,
                     self.model_config, self.engine_config, infer_state,
                     cur_layer_id,
@@ -177,10 +171,14 @@ class LlamaTransformerLayer:
                 )
                 self.gpudec_e_events[cur_stage].record()
             torch.cuda.default_stream().wait_event(self.gpudec_e_events[cur_stage])
+
+        elapsed = time.perf_counter() - start
+        print(f"Attention launch time: {elapsed*1000:.3f} ms")
                 
         if infer_state.cpu_num_decoding_seqs > 0:
             with torch.cuda.stream(self.cpu_communication_stream):
                 torch.cuda.current_stream().wait_event(self.stage_s_events[cur_stage])
+                self.cpudec_s_events[cur_stage].record()
                 q_cpu = q[infer_state.gpu_token_end:, :, :].cpu()
                 k_cpu = k[infer_state.gpu_token_end:, :, :].cpu()
                 v_cpu = v[infer_state.gpu_token_end:, :, :].cpu()
@@ -204,14 +202,13 @@ class LlamaTransformerLayer:
                 self.cpudec_e_events[cur_stage].record()
             torch.cuda.default_stream().wait_event(self.cpudec_e_events[cur_stage])
 
-        return o
-
     def _postproj(
         self,
         o: torch.Tensor,
         residual_buf: torch.Tensor
     ) -> torch.Tensor:
         # Output GEMM
+        start = time.perf_counter()
         o = linear(o, self.weight.o_proj)	# [num_total_tokens, hidden_size]
 
         # residual & FFN norm
@@ -222,6 +219,8 @@ class LlamaTransformerLayer:
         del o
         silu_and_mul_inplace(up_gate_proj)
         ffn_out = linear(up_gate_proj[:, :self.model_config.ffn_inter_dim], self.weight.down_proj)
+        end = time.perf_counter()
+        print(f"Postproj launch time: {(end - start)*1000:.3f} ms\n")
         return ffn_out
     
     def forward(

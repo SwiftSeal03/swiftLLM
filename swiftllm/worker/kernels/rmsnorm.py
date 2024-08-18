@@ -1,6 +1,7 @@
 import torch
 import triton
 import triton.language as tl
+import swiftllm_c
 
 @triton.jit
 def _fwd_rmsnorm(
@@ -87,3 +88,17 @@ def fused_add_rmsnorm_inplace(
 		eps,
 		input_and_output.shape[1]
 	)
+
+if __name__ == "__main__":
+	x = torch.randn(10, 128, dtype=torch.float16, device="cuda")
+	y = x.clone()
+	r = torch.randn(10, 128, dtype=torch.float16, device="cuda")
+	s = r.clone()
+	w = torch.randn(1024, dtype=torch.float16, device="cuda")
+	eps = 1e-6
+
+	fused_add_rmsnorm_inplace(x, r, w, eps)
+	swiftllm_c.fused_add_rmsnorm_inplace(y, s, w, eps)
+
+	assert torch.allclose(x, y, atol=1e-5), "Mismatch x, y"
+	assert torch.allclose(r, s, atol=1e-5), "Mismatch r, s"

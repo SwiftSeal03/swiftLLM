@@ -56,7 +56,7 @@ if __name__ == '__main__':
     model_creation_time = time.perf_counter() - start_time
     print(f"Model creation time: {model_creation_time:.2f} seconds")
     
-    ngpu_prompts = 60
+    ngpu_prompts = 30
     ncpu_prompts = 40
     nprompts = ncpu_prompts + ngpu_prompts
     with open("example.txt", "r") as f:
@@ -103,8 +103,10 @@ if __name__ == '__main__':
         argss = [None] * 2
         for j in range(2):
             argss[j] = swiftllm.ModelForwardArgs(
-                [input_ids[0]] + [[x] for x in last_round_outputs0],
-                [nprompts + i * 2 + j] + list(range(0, nprompts // 2) if j == 0 else range(nprompts // 2, nprompts)),
+                [input_ids[0]] + 
+                [[x] for x in last_round_outputs0],
+                [nprompts + i * 2 + j] + 
+                list(range(0, nprompts // 2) if j == 0 else range(nprompts // 2, nprompts)),
                 seq_lens[:nprompts // 2] if j == 0 else seq_lens[nprompts // 2:],
                 cpu_num_decoding_seqs=ncpu_prompts // 2
             )

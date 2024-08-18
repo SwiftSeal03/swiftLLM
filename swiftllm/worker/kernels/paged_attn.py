@@ -1,3 +1,4 @@
+import time
 import torch
 import triton
 import triton.language as tl
@@ -11,6 +12,8 @@ def _fwd_paged_attention_phase1(
     mid_o: torch.Tensor,	# [num_decoding_seqs, num_q_heads, num_seq_blocks, head_dim], contiguous. num_seq_blocks = ceil(max_seq_len / seq_block_size)
     mid_o_logexpsum: torch.Tensor,	# [num_decoding_seqs, num_q_heads, num_seq_blocks], contiguous
     q: torch.Tensor,    	# [num_decoding_seqs, num_q_heads, head_dim], contiguous
+    k: torch.Tensor,		# [num_decoding_seqs, num_kv_heads, head_dim], contiguous
+    v: torch.Tensor,		# [num_decoding_seqs, num_kv_heads, head_dim], contiguous
     k_cache: torch.Tensor,	# [num_blocks, num_layers, num_kv_heads, block_size, head_dim], contiguous
     v_cache: torch.Tensor,	# [num_blocks, num_layers, num_kv_heads, block_size, head_dim], contiguous
     block_table: torch.Tensor,  # [*, max_blocks_per_seq], contiguous
@@ -65,6 +68,15 @@ def _fwd_paged_attention_phase1(
             my_seq_len - my_start_token_idx,
             block_size
         )
+        # First store the new KV cache
+        my_block_id = (my_seq_len-1) // block_size
+        my_block_offset = (my_seq_len-1) % block_size
+        my_block_index = tl.load(block_table + my_seq_id*max_blocks_per_seq + my_block_id).to(tl.int64)
+        offs_kv = my_batch_id*num_kv_heads*head_dim + (tl.arange(0, num_kv_heads)*head_dim)[:, None] + tl.arange(0, head_dim)[None, :]
+        offs_kvcache = (my_block_index*num_layers+cur_layer)*num_kv_heads*block_size*head_dim + (tl.arange(0, num_kv_heads)*block_size*head_dim)[:, None] + my_block_offset*head_dim + tl.arange(0, head_dim)[None, :]
+        tl.store(k_cache + offs_kvcache, tl.load(k + offs_kv))
+        tl.store(v_cache + offs_kvcache, tl.load(v + offs_kv))
+
         for block_i in range(0, my_num_blocks):
             block_idx = start_block_idx + block_i
             block_index = tl.load(block_table + my_seq_id*max_blocks_per_seq + block_idx).to(tl.int64)
@@ -151,6 +163,8 @@ def _fwd_paged_attention_phase2(
 
 def paged_attention(
     q: torch.Tensor,                    # [num_decoding_seqs, num_q_heads, head_dim]
+    k: torch.Tensor,                    # [num_decoding_seqs, num_kv_heads, head_dim]
+    v: torch.Tensor,                    # [num_decoding_seqs, num_kv_heads, head_dim]
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
     block_table: torch.Tensor,
@@ -182,7 +196,7 @@ def paged_attention(
     grid = (infer_state.gpu_num_decoding_seqs, model_config.num_q_heads, infer_state.num_seq_blocks)
     _fwd_paged_attention_phase1[grid](
         mid_o, mid_o_logexpsum,
-        q, k_cache, v_cache,
+        q, k, v, k_cache, v_cache,
         block_table,
 
         # Here we multiply softmax_scale by log2(e) and use `exp2` instead of

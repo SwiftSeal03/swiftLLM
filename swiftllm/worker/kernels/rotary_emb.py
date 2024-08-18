@@ -1,6 +1,7 @@
 import torch
 import triton
 import triton.language as tl
+import swiftllm_c
 
 from swiftllm.worker.infer_state import LlamaInferState
 
@@ -44,7 +45,8 @@ def _fwd_rotary_embedding(
 def rotary_embedding_inplace(
 	q: torch.Tensor,	# [num_tokens, num_q_heads, head_dim]
 	k: torch.Tensor,	# [num_tokens, num_k_heads, head_dim]
-	infer_state: LlamaInferState
+	sin_table: torch.Tensor,	# [num_tokens, head_dim//2]
+	cos_table: torch.Tensor	  # [num_tokens, head_dim//2]
 ):
 	num_tokens = q.shape[0]
 	num_q_heads = q.shape[1]
@@ -53,7 +55,22 @@ def rotary_embedding_inplace(
 	grid = (num_tokens, num_kv_heads)
 	_fwd_rotary_embedding[grid](
 		q, k,
-		infer_state.position_cos, infer_state.position_sin,
+		cos_table, sin_table,
 		num_q_heads, num_kv_heads, num_q_heads//num_kv_heads, head_dim
 	)
 	
+if __name__ == '__main__':
+	q0 = torch.randn(4, 32, 128, dtype=torch.float16, device='cuda')
+	q1 = q0.clone()
+	k0 = torch.randn(4, 32, 128, dtype=torch.float16, device='cuda')
+	k1 = k0.clone()
+	sin_table = torch.randn(4, 64, dtype=torch.float16, device='cuda')
+	cos_table = torch.randn(4, 64, dtype=torch.float16, device='cuda')
+
+	rotary_embedding_inplace(q0, k0, sin_table, cos_table)
+	swiftllm_c.rotary_embedding_inplace(q1, k1, sin_table, cos_table)
+	print(q0[0,0])
+	print(q1[0,0])
+
+	assert torch.allclose(q0, q1, atol=1e-6), "q0 != q1"
+	assert torch.allclose(k0, k1, atol=1e-6), "k0 != k1"
