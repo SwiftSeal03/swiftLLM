@@ -40,7 +40,7 @@ if __name__ == '__main__':
 
         library_path=library_path,
 
-        monitor_performance=True    
+        monitor_performance=True,
     )
 
     start_time = time.perf_counter()

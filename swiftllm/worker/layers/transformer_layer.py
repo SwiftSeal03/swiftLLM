@@ -23,8 +23,8 @@ class KVCacheArgs:
     v_cache: torch.Tensor
     k_swap: torch.Tensor
     v_swap: torch.Tensor
-    gpu_block_table: torch.Tensor
-    cpu_block_table: torch.Tensor
+    gpu_block_table: torch.Tensor | None
+    cpu_block_table: torch.Tensor | None
 
 class LlamaTransformerLayer:
     def __init__(
@@ -36,7 +36,6 @@ class LlamaTransformerLayer:
         prefilling_stream: torch.cuda.Stream,
         decoding_piggyback_stream: torch.cuda.Stream,
         cpu_communication_stream: torch.cuda.Stream,
-        executor: ThreadPoolExecutor,
         layer_id: int
     ):
         self.model_config = model_config
@@ -46,7 +45,6 @@ class LlamaTransformerLayer:
         self.prefilling_stream = prefilling_stream
         self.decoding_piggyback_stream = decoding_piggyback_stream
         self.cpu_communication_stream = cpu_communication_stream
-        self.executor = executor
         self.layer_id = layer_id
         
         self.stage_s_events = [torch.cuda.Event(enable_timing=True) for _ in range(2)]    
@@ -67,7 +65,6 @@ class LlamaTransformerLayer:
         # We may need to use the next layer in piplined setting
         weight = self.weight if not use_next_layer else self.next_layer_weight
 
-        start = time.perf_counter()
         fused_add_rmsnorm_inplace(
             input_embds,
             residual_buf,
@@ -91,7 +88,6 @@ class LlamaTransformerLayer:
             infer_state.position_cos
         )
         end = time.perf_counter()
-        print(f"Preproj launch time: {(end - start)*1000:.3f} ms")
 
         return q, k, v
     
@@ -140,9 +136,9 @@ class LlamaTransformerLayer:
 
         # Actually we can further separate KV-cache storing for prefilling and decoding,
         # but since the kernel is fast enough, we put all to decoding stream for simplicity
-        if not infer_state.ignore_kvcache and infer_state.gpu_token_end > 0:
-            with torch.cuda.stream(self.decoding_piggyback_stream):
-                torch.cuda.current_stream().wait_event(self.stage_s_events[cur_stage])
+        with torch.cuda.stream(self.decoding_piggyback_stream):
+            torch.cuda.current_stream().wait_event(self.stage_s_events[cur_stage])
+            if infer_state.num_prefill_seqs > 0 and not self.engine_config.ignore_kvcache:
                 store_kvcache(
                     k[:infer_state.num_prefill_tokens, :, :],
                     v[:infer_state.num_prefill_tokens, :, :],
@@ -154,13 +150,8 @@ class LlamaTransformerLayer:
                     cur_layer_id,
                     infer_state.max_prefill_len
                 )
-            # Default stream doesn't need to wait for store_kvcache because:
-            #   1. If there is no GPU decoding, the data won't be used until next iteration.
-            #   2. If there is GPU decoding, the stream will be waited later.
 
-        # GPU decoding stream doesn't need to wait for linear-end-event because it must be waited by store_kvcache
-        if infer_state.gpu_num_decoding_seqs > 0:
-            with torch.cuda.stream(self.decoding_piggyback_stream):
+            if infer_state.gpu_num_decoding_seqs > 0:
                 paged_attention(
                     q[infer_state.num_prefill_tokens:infer_state.gpu_token_end, :, :],
                     k[infer_state.num_prefill_tokens:infer_state.gpu_token_end, :, :],
@@ -174,8 +165,8 @@ class LlamaTransformerLayer:
                     infer_state.num_seq_blocks,
                     infer_state.softmax_scale
                 )
-                self.gpudec_e_events[cur_stage].record()
-            torch.cuda.default_stream().wait_event(self.gpudec_e_events[cur_stage])
+            self.gpudec_e_events[cur_stage].record()
+        torch.cuda.default_stream().wait_event(self.gpudec_e_events[cur_stage])
 
         elapsed = time.perf_counter() - start
         print(f"Attention launch time: {elapsed*1000:.3f} ms")
@@ -213,7 +204,6 @@ class LlamaTransformerLayer:
         residual_buf: torch.Tensor
     ) -> torch.Tensor:
         # Output GEMM
-        start = time.perf_counter()
         o = linear(o, self.weight.o_proj)	# [num_total_tokens, hidden_size]
 
         # residual & FFN norm
@@ -224,8 +214,6 @@ class LlamaTransformerLayer:
         del o
         silu_and_mul_inplace(up_gate_proj)
         ffn_out = linear(up_gate_proj[:, :self.model_config.ffn_inter_dim], self.weight.down_proj)
-        end = time.perf_counter()
-        print(f"Postproj launch time: {(end - start)*1000:.3f} ms\n")
         return ffn_out
     
     def forward(

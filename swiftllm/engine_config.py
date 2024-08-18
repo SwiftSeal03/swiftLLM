@@ -26,7 +26,8 @@ class EngineConfig:
     library_path: str = None
 
     # Switches
-    monitor_performance: bool = False
+    ignore_kvcache: bool = False      # Should be turned off when profiling blocks
+    monitor_performance: bool = False # Can be altered while running
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):

@@ -23,7 +23,6 @@ class ModelForwardArgs:
     seq_ids_list: list[int]
     decoding_seq_lens_list: list[int]
     cpu_num_decoding_seqs: int = 0
-    ignore_kvcache: bool = False
 
 @dataclasses.dataclass
 class ModelPerfResult:
@@ -84,8 +83,6 @@ class LlamaModel:
         if engine_config.library_path:
             torch.ops.load_library(engine_config.library_path)
         
-        self.executor = ThreadPoolExecutor(max_workers=1)
-
         # List of performance results, unused if monitor_performance is False
         self.perf_results = []
         self.show_perf_results = False
@@ -120,7 +117,6 @@ class LlamaModel:
                 prefilling_stream,
                 decoding_piggyback_stream,
                 cpu_communication_stream,
-                self.executor,
                 layer_id
             )
             for layer_id in range(self.model_config.num_layers)
@@ -150,7 +146,9 @@ class LlamaModel:
         ]
         seq_ids = list(range(batch_size))
         self.k_cache = self.v_cache = None # pylint: disable=attribute-defined-outside-init
-        _ = self.forward(input_ids, seq_ids, [], ignore_kvcache=True)
+        self.engine_config.ignore_kvcache = True
+        _ = self.forward(ModelForwardArgs(input_ids, seq_ids, []))
+        self.engine_config.ignore_kvcache = False
         torch.cuda.synchronize()
 
         # peak_memory = torch.cuda.max_memory_allocated()
@@ -303,11 +301,9 @@ class LlamaModel:
 
             position_cos = self._cos_cached[position_indices],
             position_sin = self._sin_cached[position_indices],
-
-            ignore_kvcache = args.ignore_kvcache
         )
 
-        if not args.ignore_kvcache:
+        if not self.engine_config.ignore_kvcache:
             self.gpu_block_manager.allocate_blocks_for_seqs(
                 infer_state.gpu_seq_ids,
                 torch.cat([infer_state.prefill_seq_lens, infer_state.gpu_decoding_seq_lens])
@@ -339,8 +335,8 @@ class LlamaModel:
             self.v_cache,
             self.k_swap,
             self.v_swap,
-            gpu_block_table = self.gpu_block_manager.block_table if not infer_state.ignore_kvcache else None,
-            cpu_block_table = self.cpu_block_manager.block_table if not infer_state.ignore_kvcache else None
+            self.gpu_block_manager.block_table if not self.engine_config.ignore_kvcache else None,
+            self.cpu_block_manager.block_table if not self.engine_config.ignore_kvcache else None
         )
 
         # Main body of the forward pass
@@ -425,15 +421,13 @@ class LlamaModel:
         """
         Run a forward pass of the LlamaModel in a pipelined manner.
         """
-        assert all(not infer_state.ignore_kvcache for infer_state in infer_states)
-
         kvargs = KVCacheArgs(
             self.k_cache,
             self.v_cache,
             self.k_swap,
             self.v_swap,
-            self.gpu_block_manager.block_table,
-            self.cpu_block_manager.block_table
+            self.gpu_block_manager.block_table if not self.engine_config.ignore_kvcache else None,
+            self.cpu_block_manager.block_table if not self.engine_config.ignore_kvcache else None
         )
 
         if self.engine_config.monitor_performance:
