@@ -44,7 +44,7 @@ class Engine:
         self.model.load_weights()
 
         print("[Engine] Profiling kv blocks...")
-        num_gpu_blocks = self.model.profile_num_blocks()
+        num_gpu_blocks = 1700 # self.model.profile_num_blocks()
         num_cpu_blocks = self.engine_config.num_cpu_blocks
         block_size_bytes = self.engine_config.block_size*self.model_config.get_kvslot_size()
         print(f"[Engine] Number of GPU blocks: {num_gpu_blocks} ({num_gpu_blocks*block_size_bytes/GB:.2f} GB)")

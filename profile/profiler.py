@@ -28,15 +28,16 @@ def init_model():
     
     block_size = 16,
     gpu_mem_utilization = 0.995,
-    num_cpu_blocks = 4000,
+    num_cpu_blocks = 4500,
     max_seqs_in_block_table = 512,
-    max_blocks_per_seq = 2048,
+    max_blocks_per_seq = 256,
 
     # The following are not used in the offline example
-    max_batch_size = 16,
+    max_batch_size = 256,
     max_tokens_in_batch = 2048*16,
 
-    library_path=library_path
+    library_path=library_path,
+    profile_result_path="/home/ubuntu/swiftLLM/profile_results/",
   )
 
   start_time = time.perf_counter()
@@ -80,6 +81,7 @@ def init():
 
 if __name__ == "__main__":
   init()
+  model.show_perf_results = True
   res = profiler.run_test_case(
     prefill_lens=[192],
     gpu_decode_lens=[384] * 20,

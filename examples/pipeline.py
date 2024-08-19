@@ -21,8 +21,15 @@ if __name__ == '__main__':
         type=str,
         default="/home/ubuntu/pacpu/build/libpacpu.so"
     )
+    parser.add_argument(
+        "--profile-result-path",
+        help="Path to folder of profiling results",
+        type=str,
+        default="/home/ubuntu/swiftLLM/profile_results/"
+    )
     model_path = parser.parse_args().model_path
     library_path = parser.parse_args().library_path
+    profile_result_path = parser.parse_args().profile_result_path
 
     engine_config = swiftllm.EngineConfig(
         model_path = model_path,
@@ -31,14 +38,15 @@ if __name__ == '__main__':
         block_size = 16,
         gpu_mem_utilization = 0.995,
         num_cpu_blocks = 4000,
-        max_seqs_in_block_table = 256,
-        max_blocks_per_seq = 2048,
+        max_seqs_in_block_table = 384,
+        max_blocks_per_seq = 512,
 
         # The following are not used in the offline example
         max_batch_size = 16,
         max_tokens_in_batch = 2048*16,
 
         library_path=library_path,
+        profile_result_path=profile_result_path,
 
         monitor_performance=True,
     )
@@ -55,8 +63,8 @@ if __name__ == '__main__':
 
     model_creation_time = time.perf_counter() - start_time
     print(f"Model creation time: {model_creation_time:.2f} seconds")
-    
-    ngpu_prompts = 30
+
+    ngpu_prompts = 40
     ncpu_prompts = 40
     nprompts = ncpu_prompts + ngpu_prompts
     with open("example.txt", "r") as f:

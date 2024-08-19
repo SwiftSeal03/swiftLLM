@@ -54,12 +54,15 @@ async def main():
         
         block_size = 16,
         gpu_mem_utilization = 0.99,
-        num_cpu_blocks = 1024,
-        max_seqs_in_block_table = 128,
-        max_blocks_per_seq = 3072,
+        num_cpu_blocks = 4096,
+        max_seqs_in_block_table = 384,
+        max_blocks_per_seq = 256,
 
-        max_batch_size = 4,
-        max_tokens_in_batch = 1024
+        max_batch_size = 256,
+        max_tokens_in_batch = 2048*16,
+
+        library_path="/home/ubuntu/pacpu/build/libpacpu.so",
+        profile_result_path="/home/ubuntu/swiftLLM/profile_results/",
     )
 
     prompt_and_output_lens = [

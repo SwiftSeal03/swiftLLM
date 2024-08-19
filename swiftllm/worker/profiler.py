@@ -1,5 +1,8 @@
-import time
+import time, os, json
 import torch
+from tqdm import tqdm
+import numpy as np
+import matplotlib.pyplot as plt
 
 from .model import LlamaModel, ModelForwardArgs, ModelPerfResult
 
@@ -10,7 +13,7 @@ class ModelProfiler:
   def __init__(
     self, 
     model: LlamaModel, 
-    base_tokens: list[int],
+    base_tokens: list[int] | None = None,
     nwarmup: int = 2,
     nrepeat: int = 3
   ):
@@ -19,15 +22,25 @@ class ModelProfiler:
     self.nrepeat = nrepeat
     self.nwarmup = nwarmup
 
-    print("[fake_prefill] Initializing base KV entries")
+    if not self.base_tokens:
+      # Use dummy tokens
+      self.base_tokens = [10] * model.engine_config.max_seq_len
+    
+    os.makedirs(model.engine_config.profile_result_path, exist_ok=True)
+
+    print("[ModelProfiler] Initializing base KV entries")
     self.model.forward(ModelForwardArgs(
       [self.base_tokens],
       [0],
       []
     ))
+  
+  def __del__(self):
+    self.model.engine_config.monitor_performance = False
+    self.model.free_seqs_resources([0])
 
   @torch.inference_mode()
-  def fake_prefill(
+  def _gpu_fake_prefill(
     self,
     seq_ids: list[int],
     seq_lens: list[int]
@@ -63,7 +76,20 @@ class ModelProfiler:
       self.model.k_cache[block_ids] = base_k[:nblock]
       self.model.v_cache[block_ids] = base_v[:nblock]
 
-  def run_test_case(
+  @torch.inference_mode()
+  def _cpu_fake_prefill(
+    self,
+    seq_ids: list[int],
+    seq_lens: list[int]
+  ):
+    # We should segregate it into parts in order not to exceed the maximum number of blocks
+    # Note that this is just heuristic based
+    step = 10
+    for i in range(0, len(seq_ids), step):
+      self._gpu_fake_prefill(seq_ids[i:i+step], seq_lens[i:i+step])
+      self.model.swap_out_seqs(seq_ids[i:i+step])
+
+  def _run_test_case(
     self,
     prefill_lens: list[int] = [],
     gpu_decode_lens: list[int] = [],
@@ -95,10 +121,9 @@ class ModelProfiler:
       all_decode_ids.extend(gpu_decode_ids + cpu_decode_ids)
 
       if ncdec > 0:
-        self.fake_prefill(cpu_decode_ids, cpu_decode_lens)
-        self.model.swap_out_seqs(cpu_decode_ids)
+        self._cpu_fake_prefill(cpu_decode_ids, cpu_decode_lens)
       if ngdec > 0:
-        self.fake_prefill(gpu_decode_ids, gpu_decode_lens)
+        self._gpu_fake_prefill(gpu_decode_ids, gpu_decode_lens)
 
       input_ids = [
         self.base_tokens[:seq_len] for seq_len in prefill_lens
@@ -136,3 +161,99 @@ class ModelProfiler:
     res = self.model.get_perf_results(use_pipeline)
     self.model.free_seqs_resources(all_decode_ids)
     return res
+  
+  def profile_linear(
+      self, 
+      S_list: list[int]
+  ) -> list[float]:
+    """
+    Profile model's linear part performance.
+    """
+    print(f"Profiling linear part ...")
+    result_path = self.model.engine_config.profile_result_path + "linear.json"
+
+    if os.path.exists(result_path):
+      with open(result_path, "r") as f:
+        res = json.load(f)
+        if res["S_list"] == S_list:
+          return res["T_list"]
+
+    T_list = []
+    for S in tqdm(S_list):
+      T_list.append(self._run_test_case(
+        prefill_lens=[S]
+      ).avg_gpu_linr_time)
+
+    plt.figure(figsize=(16, 12))
+    plt.plot(S_list, T_list)
+    plt.xlim(0)
+    plt.ylim(0)
+    plt.xlabel("S")
+    plt.ylabel("T_l(ms)")
+    plt.savefig(self.model.engine_config.profile_result_path + "linear.png")
+    plt.close()
+
+    with open(result_path, "w") as f:
+      json.dump({
+        "S_list": S_list,
+        "T_list": T_list
+      }, f, indent=2)
+
+    return T_list
+  
+  def profile_cpu_attn(
+    self,
+    S_list: list[int],
+    N_list: list[int]
+  ) -> list[list[float]]:
+    """
+    Profile model's CPU attention part performance.
+    """
+    print(f"Profiling CPU attention part ...")
+    result_path = self.model.engine_config.profile_result_path + "cpu_attn.json"
+
+    if os.path.exists(result_path):
+      with open(result_path, "r") as f:
+        res = json.load(f)
+        if res["S_list"] == S_list and res["N_list"] == N_list:
+          return res["T_list"]
+
+    T_list = []
+    for S in tqdm(S_list):
+      T_list.append([])
+      for N in N_list:
+        T_list[-1].append(self._run_test_case(
+          # Divide N into S segments as even as possible
+          cpu_decode_lens=[N // S] * (S - N % S) + [N // S + 1] * (N % S),
+        ).avg_cpu_attn_time)
+
+    T_array = np.array(T_list)
+
+    plt.figure(figsize=(16, 12))
+    ax = plt.axes(projection='3d')
+    ax.plot_surface(
+      np.outer(S_list, np.ones(len(N_list))),
+      np.outer(np.ones(len(S_list)), N_list),
+      T_array,
+      label = "CPU"
+    )
+
+    ax.set_xlim(0)
+    ax.set_ylim(0)
+    # ax.set_xticks(S_list)
+    # ax.set_yticks([0] + N_list)
+    # ax.set_zticks([0.2 * i for i in range(0, 16)])
+    ax.set_xlabel("S_c")
+    ax.set_ylabel("N_c")
+    ax.set_zlabel("T(ms)")
+    plt.savefig(self.model.engine_config.profile_result_path + "cpu_attn.png")
+    plt.close()
+
+    with open(result_path, "w") as f:
+      json.dump({
+        "S_list": S_list,
+        "N_list": N_list,
+        "T_list": T_list
+      }, f, indent=2)
+
+    return T_list

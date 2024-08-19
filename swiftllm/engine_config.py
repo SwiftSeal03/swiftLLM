@@ -24,10 +24,15 @@ class EngineConfig:
 
     # External library path
     library_path: str = None
+    profile_result_path: str = None
 
     # Switches
     ignore_kvcache: bool = False      # Should be turned off when profiling blocks
     monitor_performance: bool = False # Can be altered while running
+
+    @property
+    def max_seq_len(self) -> int:
+        return self.block_size * self.max_blocks_per_seq
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):

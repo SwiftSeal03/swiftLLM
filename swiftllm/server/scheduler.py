@@ -1,6 +1,7 @@
 from collections import deque
 
-from swiftllm.model_config import LlamaModelConfig
+from swiftllm.worker.model import LlamaModel
+from swiftllm.worker.profiler import ModelProfiler
 from swiftllm.engine_config import EngineConfig
 from swiftllm.utils import cdiv
 from swiftllm.server.structs import Request
@@ -36,10 +37,17 @@ class Scheduler:
     as well as swapping in/out
     """
 
-    def __init__(self, model_config: LlamaModelConfig, engine_config: EngineConfig, num_gpu_blocks: int):
-        self.model_config = model_config
+    def __init__(self, model: LlamaModel, engine_config: EngineConfig, num_gpu_blocks: int):
         self.engine_config = engine_config
         self.num_gpu_blocks = num_gpu_blocks
+
+        profiler = ModelProfiler(model)
+        self.linr_S_list = list(range(32, 512, 32)) + list(range(512, engine_config.max_seq_len + 512, 512))
+        self.linr_T_list = profiler.profile_linear(self.linr_S_list)
+        self.cdec_S_list = list(range(8, 64, 8)) + list(range(64, engine_config.max_batch_size + 64, 64))
+        self.cdec_N_list = list(range(512, 4096, 512)) + list(range(4096, 16384 + 4096, 4096))
+        self.cdec_T_list = profiler.profile_cpu_attn(self.cdec_S_list, self.cdec_N_list)
+        del profiler
 
         # Request in the following three deques are sorted by their arrival time
         self.waiting_q = deque()
@@ -143,3 +151,4 @@ class Scheduler:
             for req in self.running_q
             if not req.is_finished()
         ]
+
