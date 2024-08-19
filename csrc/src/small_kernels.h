@@ -21,3 +21,16 @@ void rotary_embedding_inplace(
   torch::Tensor sin_table,
   torch::Tensor cos_table
 );
+
+void store_kvcache(
+  torch::Tensor k,
+  torch::Tensor v,
+  torch::Tensor k_cache,
+  torch::Tensor v_cache,
+  torch::Tensor block_table,
+  torch::Tensor seq_ids,
+  torch::Tensor seq_start_locs,
+  torch::Tensor seq_lens,
+  const int64_t cur_layer,
+  const int64_t max_prefill_len
+);

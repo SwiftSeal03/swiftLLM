@@ -2,8 +2,7 @@ import time
 import dataclasses
 import torch
 import vllm_flash_attn
-from swiftllm_c import fused_add_rmsnorm_inplace, silu_and_mul_inplace, rotary_embedding_inplace
-from concurrent.futures import ThreadPoolExecutor
+from swiftllm_c import fused_add_rmsnorm_inplace, silu_and_mul_inplace, rotary_embedding_inplace, store_kvcache
 
 from swiftllm.model_config import LlamaModelConfig
 from swiftllm.engine_config import EngineConfig
@@ -13,7 +12,7 @@ from swiftllm.worker.infer_state import LlamaInferState
 from swiftllm.worker.kernels.linear import linear
 # from swiftllm.worker.kernels.rotary_emb import rotary_embedding_inplace
 from swiftllm.worker.kernels.paged_attn import paged_attention
-from swiftllm.worker.kernels.kvcache_mgmt import store_kvcache
+# from swiftllm.worker.kernels.kvcache_mgmt import store_kvcache
 # from swiftllm.worker.kernels.silu_and_mul import silu_and_mul_inplace
 # from swiftllm.worker.kernels.rmsnorm import fused_add_rmsnorm_inplace
 
@@ -65,6 +64,7 @@ class LlamaTransformerLayer:
         # We may need to use the next layer in piplined setting
         weight = self.weight if not use_next_layer else self.next_layer_weight
 
+        start = time.perf_counter()*1e6
         fused_add_rmsnorm_inplace(
             input_embds,
             residual_buf,
@@ -72,6 +72,7 @@ class LlamaTransformerLayer:
             self.model_config.rms_norm_eps
         )
 
+        mid0 = time.perf_counter()*1e6
         # Calculate QKV
         q = linear(input_embds, weight.q_proj)		# [num_total_tokens, hidden_size]
         k = linear(input_embds, weight.k_proj)		# [num_total_tokens, num_kv_heads*head_dim]
@@ -80,6 +81,7 @@ class LlamaTransformerLayer:
         k = k.view(-1, self.model_config.num_kv_heads, self.model_config.head_dim)	# [num_total_tokens, num_kv_heads, head_dim]
         v = v.view(-1, self.model_config.num_kv_heads, self.model_config.head_dim)	# [num_total_tokens, num_kv_heads, head_dim]
 
+        mid1 = time.perf_counter()*1e6
         # Rotary emb
         rotary_embedding_inplace(
             q,
@@ -87,7 +89,8 @@ class LlamaTransformerLayer:
             infer_state.position_sin,
             infer_state.position_cos
         )
-        end = time.perf_counter()
+        end = time.perf_counter()*1e6
+        # print(f"RMSNorm: {mid0 - start:.2f}, QKV GEMM: {mid1 - mid0:.2f}, Rotary emb: {end - mid1:.2f}")
 
         return q, k, v
     
@@ -114,7 +117,7 @@ class LlamaTransformerLayer:
 
         cur_layer_id = self.layer_id + cur_stage
 
-        start = time.perf_counter()
+        start = time.perf_counter()*1e6
         if infer_state.num_prefill_seqs > 0:
             with torch.cuda.stream(self.prefilling_stream):
                 torch.cuda.current_stream().wait_event(self.stage_s_events[cur_stage])
@@ -133,6 +136,7 @@ class LlamaTransformerLayer:
                 ).reshape(-1, self.model_config.hidden_size)
                 self.prefill_e_events[cur_stage].record()
             torch.cuda.default_stream().wait_event(self.prefill_e_events[cur_stage])
+        mid0 = time.perf_counter()*1e6
 
         # Actually we can further separate KV-cache storing for prefilling and decoding,
         # but since the kernel is fast enough, we put all to decoding stream for simplicity
@@ -150,6 +154,7 @@ class LlamaTransformerLayer:
                     cur_layer_id,
                     infer_state.max_prefill_len
                 )
+            mid1 = time.perf_counter()*1e6
 
             if infer_state.gpu_num_decoding_seqs > 0:
                 paged_attention(
@@ -168,8 +173,8 @@ class LlamaTransformerLayer:
             self.gpudec_e_events[cur_stage].record()
         torch.cuda.default_stream().wait_event(self.gpudec_e_events[cur_stage])
 
-        elapsed = time.perf_counter() - start
-        print(f"Attention launch time: {elapsed*1000:.3f} ms")
+        end = time.perf_counter()*1e6
+        # print(f"Prefill launch: {mid0 - start:.2f}, KV-cache store: {mid1 - mid0:.2f}, GPU decoding: {end - mid1:.2f}")
                 
         if infer_state.cpu_num_decoding_seqs > 0:
             with torch.cuda.stream(self.cpu_communication_stream):
@@ -204,16 +209,23 @@ class LlamaTransformerLayer:
         residual_buf: torch.Tensor
     ) -> torch.Tensor:
         # Output GEMM
+        start = time.perf_counter()*1e6
         o = linear(o, self.weight.o_proj)	# [num_total_tokens, hidden_size]
 
+        mid0 = time.perf_counter()*1e6
         # residual & FFN norm
         fused_add_rmsnorm_inplace(o, residual_buf, self.weight.ffn_norm, self.model_config.rms_norm_eps)
 
+        mid1 = time.perf_counter()*1e6
         # FFN
         up_gate_proj = linear(o, self.weight.up_gate_proj)
         del o
+        mid2 = time.perf_counter()*1e6
         silu_and_mul_inplace(up_gate_proj)
+        mid3 = time.perf_counter()*1e6
         ffn_out = linear(up_gate_proj[:, :self.model_config.ffn_inter_dim], self.weight.down_proj)
+        end = time.perf_counter()*1e6
+        # print(f"Output GEMM: {mid0 - start:.2f}, RMSNorm: {mid1 - mid0:.2f}, FFN GEMM: {mid2 - mid1:.2f}, SiLU: {mid3 - mid2:.2f}, Down-proj GEMM: {end - mid3:.2f}")
         return ffn_out
     
     def forward(

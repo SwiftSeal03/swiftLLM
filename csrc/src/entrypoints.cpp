@@ -9,4 +9,5 @@ PYBIND11_MODULE(swiftllm_c, m) {
   m.def("fused_add_rmsnorm_inplace", &fused_add_rmsnorm_inplace);
   m.def("silu_and_mul_inplace", &silu_and_mul_inplace);
   m.def("rotary_embedding_inplace", &rotary_embedding_inplace);
+  m.def("store_kvcache", &store_kvcache);
 }

@@ -189,3 +189,105 @@ void rotary_embedding_inplace(
 		throw std::invalid_argument("Unsupported num_q_heads and num_k_heads");
 	}
 }
+
+template<int NUM_KV_HEADS>
+__global__ void prefill_store_kvcache_Kernel(
+	const half* __restrict__ k, // [num_tokens, num_heads, head_dim]
+	const half* __restrict__ v, // [num_tokens, num_heads, head_dim]
+	half* __restrict__ k_cache, // [... , num_layers, num_kv_heads, block_size, head_dim]
+	half* __restrict__ v_cache, // [... , num_layers, num_kv_heads, block_size, head_dim]
+	const int32_t* __restrict__ block_table,
+	const int32_t* __restrict__ seq_ids,
+	const int32_t* __restrict__ seq_start_locs,
+	const int32_t* __restrict__ seq_lens,
+	const int64_t cur_layer,
+	const int64_t block_size,
+	const int64_t block_table_width,
+	const int64_t num_layers,
+	const int64_t head_dim
+) {
+	const int64_t batch_pos = blockIdx.x;
+	const int64_t block_pos = blockIdx.y;
+	const int64_t seq_len = seq_lens[batch_pos];
+	if (block_size * block_pos >= seq_len) {
+		return;
+	}
+
+	const int32_t seq_id = seq_ids[batch_pos];
+	const int32_t seq_start_loc = seq_start_locs[batch_pos];
+	const int32_t block_idx = block_table[seq_id * block_table_width + block_pos];
+	const int32_t max_i = min(block_size, seq_len - block_size * block_pos); 
+
+	for (int i = 0; i < max_i; i++) {
+		int64_t src_off = 
+			(seq_start_loc + block_pos * block_size + i) * NUM_KV_HEADS * head_dim + threadIdx.x;
+		int64_t dst_off = 
+			((block_idx * num_layers + cur_layer) * NUM_KV_HEADS * block_size + i) * head_dim + threadIdx.x;
+		#pragma unroll
+		for (int j = 0; j < NUM_KV_HEADS; j++) {
+			k_cache[dst_off] = k[src_off];
+			v_cache[dst_off] = v[src_off];
+			src_off += head_dim;
+			dst_off += block_size * head_dim;
+		}
+	}
+}
+
+#define PREFILL_STORE_KVCACHE_KERNEL(kvh) \
+	prefill_store_kvcache_Kernel<kvh><<<grid, block_dim_x>>>( \
+		k_p, v_p, k_cache_p, v_cache_p, \
+		block_table_p, seq_ids_p, seq_start_locs_p, seq_lens_p, \
+		cur_layer, block_size, block_table_width, num_layers, head_dim \
+	);
+
+void store_kvcache(
+  torch::Tensor k,
+  torch::Tensor v,
+  torch::Tensor k_cache,
+  torch::Tensor v_cache,
+  torch::Tensor block_table,
+  torch::Tensor seq_ids,
+  torch::Tensor seq_start_locs,
+  torch::Tensor seq_lens,
+  const int64_t cur_layer,
+  const int64_t max_prefill_len
+) {
+	const int64_t num_layers = k_cache.size(1);
+	const int64_t num_kv_heads = k_cache.size(2);
+	const int64_t block_size = k_cache.size(3);
+	const int64_t head_dim = k_cache.size(4);
+	const int64_t block_table_width = block_table.size(1);
+	const int64_t num_seqs = seq_ids.size(0);
+
+	const dim3 grid(num_seqs, (max_prefill_len - 1) / block_size + 1);
+	const int64_t block_dim_x = head_dim;
+
+	half* k_p = (half*)k.data_ptr();
+	half* v_p = (half*)v.data_ptr();
+	half* k_cache_p = (half*)k_cache.data_ptr();
+	half* v_cache_p = (half*)v_cache.data_ptr();
+	const int32_t* block_table_p = (int32_t*)block_table.data_ptr();
+	const int32_t* seq_ids_p = (int32_t*)seq_ids.data_ptr();
+	const int32_t* seq_start_locs_p = (int32_t*)seq_start_locs.data_ptr();
+	const int32_t* seq_lens_p = (int32_t*)seq_lens.data_ptr();
+
+	if (head_dim != 128) {
+		throw std::invalid_argument("head_dim must be 128");
+	}
+
+	if (num_kv_heads == 8) { // llama-3-8B
+		PREFILL_STORE_KVCACHE_KERNEL(8);
+	}
+	else if (num_kv_heads == 32) { // llama-2-7B
+		PREFILL_STORE_KVCACHE_KERNEL(32);
+	}
+	else if (num_kv_heads == 40) { // llama-2-13B
+		PREFILL_STORE_KVCACHE_KERNEL(40);
+	}
+	else if (num_kv_heads == 64) { // llama-2/3-70B
+		PREFILL_STORE_KVCACHE_KERNEL(64);
+	}
+	else {
+		throw std::invalid_argument("Unsupported num_kv_heads");
+	}
+}

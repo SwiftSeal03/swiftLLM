@@ -168,3 +168,4 @@ cython_debug/
 #.idea/
 
 tmp/
+profile_results/
