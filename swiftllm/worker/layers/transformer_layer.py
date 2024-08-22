@@ -271,6 +271,9 @@ class LlamaTransformerLayer:
             batch 1 : qkv1 |=>      attention[i + attn_layer_id_offs]    |=> [o1]
 
         buffer of o1 is given as input
+
+        Note that batch-0 here may actually be batch-1 in the forward pass, should reverse the list
+        in the second stage
         """
         
         # Here we put the linear_end_event at the beginning because batch 1 don't need to wait for batch 0's linear
@@ -310,13 +313,14 @@ class LlamaTransformerLayer:
             batch 0 : o0   |=>  post-projection[i] -> pre-projection[i+1]  |        attention[i+1]                     |=> [o0']
             batch 1 : qkv1 |=>       attention[i]                          | post-projection[i] -> pre-projection[i+1] |=> qkv1'
         """
+        rev_infer_states = infer_states[::-1]
         q0, k0, v0 = self._forward_pipeline_stage(
             o0, residual_buf0, o1, q1, k1, v1, 
             kvargs, infer_states, cur_stage=0
         )
         q1, k1, v1 = self._forward_pipeline_stage(
             o1, residual_buf1, o0, q0, k0, v0,
-            kvargs, infer_states, cur_stage=1
+            kvargs, rev_infer_states, cur_stage=1
         )
 
         return q1, k1, v1
