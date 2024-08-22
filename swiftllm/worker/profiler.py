@@ -84,10 +84,22 @@ class ModelProfiler:
   ):
     # We should segregate it into parts in order not to exceed the maximum number of blocks
     # Note that this is just heuristic based
-    step = 10
-    for i in range(0, len(seq_ids), step):
-      self._gpu_fake_prefill(seq_ids[i:i+step], seq_lens[i:i+step])
-      self.model.swap_out_seqs(seq_ids[i:i+step])
+    num_gpu_free_blocks = self.model.gpu_block_manager.num_free_blocks
+    i = 0
+    # Since seq_lens may exceed GPU KV cache size, we need to divide it into parts
+    while i < len(seq_ids):
+      j = i
+      block_needed = 0
+      while j < len(seq_ids):
+        seq_len = seq_lens[i]
+        nblocks = (seq_len - 1) // self.model.engine_config.block_size + 1
+        if block_needed + nblocks > num_gpu_free_blocks:
+          break
+        block_needed += nblocks
+        j += 1
+      self._gpu_fake_prefill(seq_ids[i:j], seq_lens[i:j])
+      self.model.swap_out_seqs(seq_ids[i:j])
+      i = j
 
   def _run_test_case(
     self,
@@ -160,6 +172,7 @@ class ModelProfiler:
     assert len(self.model.perf_results) == self.nrepeat
     res = self.model.get_perf_results(use_pipeline)
     self.model.free_seqs_resources(all_decode_ids)
+    self.model.monitor_performance = False
     return res
   
   def profile_linear(
