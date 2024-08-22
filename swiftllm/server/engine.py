@@ -1,6 +1,9 @@
+import time
 import asyncio
 import functools
 from typing import AsyncGenerator
+import dataclasses
+from pprint import pprint
 
 import torch
 
@@ -11,7 +14,7 @@ from swiftllm.utils import GB
 
 from .tokenization_engine import TokenizationEngine
 from .structs import Request, RawRequest, StepOutput
-from .scheduler import Scheduler
+from .scheduler import Scheduler, SubBatch
 
 class Engine:
     def __init__(self, engine_config: EngineConfig):
@@ -54,7 +57,7 @@ class Engine:
         self.model.init_kvcache_and_swap(num_gpu_blocks)
 
         print("[Engine] Initializing scheduler...")
-        self.scheduler = Scheduler(self.model, self.engine_config, num_gpu_blocks)
+        self.scheduler = Scheduler(self.model)
 
         print("[Engine] Initializing tokenization engine...")
         self.tokenization_engine = TokenizationEngine.remote(self.engine_config)
@@ -116,13 +119,17 @@ class Engine:
         """
         Event loop for forwarding the model
         """
+        # Loop invariant (at beginning):
+        # 1. All GPU requests arrives earlier than CPU requests
         while True:
             # Get the next batch from the scheduler
-            cur_batch, cur_swap_in, cur_swap_out = self.scheduler.get_next_batch()
-            if not cur_batch and not cur_swap_in and not cur_swap_out:
+            batch = [None] * 2
+            batch[0], batch[1], cur_swap_out, cur_swap_in = self.scheduler.get_next_batch()
+            if all(not (batch[i] and batch[i].x) for i in range(2)) and not cur_swap_in and not cur_swap_out:
                 # No new batch, sleep for a bit
                 await asyncio.sleep(0.005)
                 continue
+            start = time.perf_counter()
 
             # Perform swap in/out
             if cur_swap_out:
@@ -137,29 +144,27 @@ class Engine:
                 )
             
             # Forward the model
-            input_ids = [
-                req.prompt_token_ids if req.is_prefill_stage() else [req.output_token_ids[-1]]
-                for req in cur_batch
+            argss = [
+                batch[i].get_model_forward_args() if batch[i] else None
+                for i in range(2)
             ]
-            seq_ids = [req.request_id for req in cur_batch]
-            decoding_seq_lens_list = [
-                req.prompt_len + req.get_cur_output_len()
-                for req in cur_batch
-                if not req.is_prefill_stage()
-            ]
-            output_tokens = await self._run_on_model_async(
-                self.model.forward,
-                ModelForwardArgs(
-                    input_ids,
-                    seq_ids,
-                    decoding_seq_lens_list,
-                    cpu_num_decoding_seqs=0
-                )
-            )
+            if not batch[1]:
+                # Sequential mode
+                reqs = batch[0].get_all_reqs()
+                print(f"Using sequential mode (batch_size = {len(reqs)})")
+                output_tokens = await self._run_on_model_async(self.model.forward, argss[0])
+            else:
+                # Pipelined mode
+                start = time.perf_counter() * 1000
+                reqs = batch[0].get_all_reqs() + batch[1].get_all_reqs()
+                print(f"Using pipelined mode (batch_size = {len(reqs)})")
+                output_tokens = await self._run_on_model_async(self.model.forward_pipeline, argss)
+                end = time.perf_counter() * 1000
 
             # Deal with output tokens
             finished_req_ids = []
-            for req, output_token in zip(cur_batch, output_tokens):
+            for req, output_token in zip(reqs, output_tokens):
+                req.cur_output_len += 1
                 req.output_token_ids.append(output_token)
                 req.output_q.put_nowait(StepOutput(output_token, req))
                 if req.is_finished():
@@ -170,8 +175,15 @@ class Engine:
                 finished_req_ids
             )
             
-            # Inform the scheduler
-            self.scheduler.on_batch_finish(cur_batch)
+            # Inform the scheduler, swap out newly prefilled requests if necessary
+            cur_swap_out = self.scheduler.on_batch_finish(reqs)
+            if cur_swap_out:
+                await self._run_on_model_async(
+                    self.model.swap_out_seqs,
+                    [req.request_id for req in cur_swap_out]
+                )
+
+            end = time.perf_counter()
     
     async def start_all_event_loops(self):
         """

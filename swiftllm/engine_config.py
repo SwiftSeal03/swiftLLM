@@ -29,6 +29,7 @@ class EngineConfig:
     # Switches
     ignore_kvcache: bool = False      # Should be turned off when profiling blocks
     monitor_performance: bool = False # Can be altered while running
+    always_use_gpu: bool = False      # Can be altered while running
 
     @property
     def max_seq_len(self) -> int:
@@ -60,25 +61,25 @@ class EngineConfig:
         parser.add_argument(
             "--gpu-mem-utilization",
             type=float,
-            default=0.97,
+            default=0.99,
             help="Fraction of GPU memory to be used",
         )
         parser.add_argument(
             "--num-cpu-blocks",
             type=int,
-            default=2048,
+            default=10000,
             help="Number of CPU blocks",
         )
         parser.add_argument(
             "--max-seqs-in-block-table",
             type=int,
-            default=4096,
+            default=768,
             help="Maximum number of sequences in the block table",
         )
         parser.add_argument(
             "--max-blocks-per-seq",
             type=int,
-            default=32768,
+            default=512,
             help="Maximum number of blocks per sequence",
         )
 
@@ -91,7 +92,7 @@ class EngineConfig:
         parser.add_argument(
             "--max-tokens-in-batch",
             type=int,
-            default=32768,
+            default=3072,
             help="Maximum number of tokens in a batch",
         )
 
