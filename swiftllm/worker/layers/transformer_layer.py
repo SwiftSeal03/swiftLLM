@@ -25,6 +25,30 @@ class KVCacheArgs:
     gpu_block_table: torch.Tensor | None
     cpu_block_table: torch.Tensor | None
 
+class TransformerEvents:
+    def __init__(self):
+        self.stage_s = torch.cuda.Event(enable_timing=True)
+        self.linear_e = torch.cuda.Event(enable_timing=True)
+        self.prefill_e = torch.cuda.Event(enable_timing=True)
+        self.gpudec_e = torch.cuda.Event(enable_timing=True)
+        self.cpudec_e = torch.cuda.Event(enable_timing=True)
+        self.cpudec_s = torch.cuda.Event(enable_timing=True)
+
+    def get_prefill_time(self) -> float:
+        return self.stage_s.elapsed_time(self.prefill_e)
+
+    def get_gpudec_time(self) -> float:
+        return self.stage_s.elapsed_time(self.gpudec_e)
+    
+    def get_linear_time(self) -> float:
+        return self.stage_s.elapsed_time(self.linear_e)
+    
+    def get_cpuwrk_time(self) -> float:
+        return self.stage_s.elapsed_time(self.cpudec_e)
+    
+    def get_cpudec_time(self) -> float:
+        return self.cpudec_s.elapsed_time(self.cpudec_e)
+
 class LlamaTransformerLayer:
     def __init__(
         self,
@@ -46,13 +70,7 @@ class LlamaTransformerLayer:
         self.cpu_communication_stream = cpu_communication_stream
         self.layer_id = layer_id
         
-        self.stage_s_events = [torch.cuda.Event(enable_timing=True) for _ in range(2)]    
-        self.linear_e_events = [torch.cuda.Event(enable_timing=True) for _ in range(2)]
-        self.prefill_e_events = [torch.cuda.Event(enable_timing=True) for _ in range(2)]
-        self.gpudec_e_events = [torch.cuda.Event(enable_timing=True) for _ in range(2)]
-        self.cpudec_e_events = [torch.cuda.Event(enable_timing=True) for _ in range(2)]
-        self.cpudec_s_events = [torch.cuda.Event(enable_timing=True) for _ in range(2)]
-
+        self.events = [TransformerEvents() for _ in range(2)]
 
     def _preproj(
         self,
@@ -120,7 +138,7 @@ class LlamaTransformerLayer:
         start = time.perf_counter()*1e6
         if infer_state.num_prefill_seqs > 0:
             with torch.cuda.stream(self.prefilling_stream):
-                torch.cuda.current_stream().wait_event(self.stage_s_events[cur_stage])
+                torch.cuda.current_stream().wait_event(self.events[cur_stage].stage_s)
                 # Here the performance of vLLM's flash attention is better than us,
                 # so use vllm_flash_attn
                 o[:infer_state.num_prefill_tokens, :] = vllm_flash_attn.flash_attn_varlen_func(
@@ -134,14 +152,14 @@ class LlamaTransformerLayer:
                     softmax_scale=infer_state.softmax_scale,
                     causal=True
                 ).reshape(-1, self.model_config.hidden_size)
-                self.prefill_e_events[cur_stage].record()
-            torch.cuda.default_stream().wait_event(self.prefill_e_events[cur_stage])
+                self.events[cur_stage].prefill_e.record()
+            torch.cuda.default_stream().wait_event(self.events[cur_stage].prefill_e)
         mid0 = time.perf_counter()*1e6
 
         # Actually we can further separate KV-cache storing for prefilling and decoding,
         # but since the kernel is fast enough, we put all to decoding stream for simplicity
         with torch.cuda.stream(self.decoding_piggyback_stream):
-            torch.cuda.current_stream().wait_event(self.stage_s_events[cur_stage])
+            torch.cuda.current_stream().wait_event(self.events[cur_stage].stage_s)
             if infer_state.num_prefill_seqs > 0 and not self.engine_config.ignore_kvcache:
                 store_kvcache(
                     k[:infer_state.num_prefill_tokens, :, :],
@@ -170,16 +188,16 @@ class LlamaTransformerLayer:
                     infer_state.num_seq_blocks,
                     infer_state.softmax_scale
                 )
-            self.gpudec_e_events[cur_stage].record()
-        torch.cuda.default_stream().wait_event(self.gpudec_e_events[cur_stage])
+            self.events[cur_stage].gpudec_e.record()
+        torch.cuda.default_stream().wait_event(self.events[cur_stage].gpudec_e)
 
         end = time.perf_counter()*1e6
         # print(f"Prefill launch: {mid0 - start:.2f}, KV-cache store: {mid1 - mid0:.2f}, GPU decoding: {end - mid1:.2f}")
                 
         if infer_state.cpu_num_decoding_seqs > 0:
             with torch.cuda.stream(self.cpu_communication_stream):
-                torch.cuda.current_stream().wait_event(self.stage_s_events[cur_stage])
-                self.cpudec_s_events[cur_stage].record()
+                torch.cuda.current_stream().wait_event(self.events[cur_stage].stage_s)
+                self.events[cur_stage].cpudec_s.record()
                 q_cpu = q[infer_state.gpu_token_end:, :, :].cpu()
                 k_cpu = k[infer_state.gpu_token_end:, :, :].cpu()
                 v_cpu = v[infer_state.gpu_token_end:, :, :].cpu()
@@ -200,8 +218,8 @@ class LlamaTransformerLayer:
                     o_cpu
                 )
                 oc.copy_(o_cpu.to(torch.float16), non_blocking=True)
-                self.cpudec_e_events[cur_stage].record()
-            torch.cuda.default_stream().wait_event(self.cpudec_e_events[cur_stage])
+                self.events[cur_stage].cpudec_e.record()
+            torch.cuda.default_stream().wait_event(self.events[cur_stage].cpudec_e)
 
     def _postproj(
         self,
@@ -242,7 +260,7 @@ class LlamaTransformerLayer:
         #        residual_buf will be input_embds + residual_buf (which will be
         #        used as the residual after the attention block)
         q, k, v = self._preproj(input_embds, residual_buf, infer_state)
-        self.stage_s_events[0].record()
+        self.events[0].stage_s.record()
         self._attention(
             input_embds, q, k, v, 
             kvargs, infer_state
@@ -277,14 +295,13 @@ class LlamaTransformerLayer:
         """
         
         # Here we put the linear_end_event at the beginning because batch 1 don't need to wait for batch 0's linear
-        self.stage_s_events[cur_stage].record()
+        self.events[cur_stage].stage_s.record()
 
         f0 = self._postproj(o0, residual_buf0)
         q0, k0, v0 = self._preproj(f0, residual_buf0, infer_states[0], use_next_layer=True)
         del f0
 
-        if self.engine_config.monitor_performance:
-            self.linear_e_events[cur_stage].record()
+        self.events[cur_stage].linear_e.record()
 
         self._attention(
             o1, q1, k1, v1,
@@ -340,13 +357,14 @@ class LlamaTransformerLayer:
         batch0 : input_embeds0 |=> pre-projection -> attention       |=> [o0]
         batch1 : input_embeds1 |=>                  pre-projection   |=> q1, k1, v1
         """
-        q0, k0, v0 = self._preproj(input_embds0, residual_buf0, infer_states[0])
+        q0, k0, v0 = self._preproj(input_embds0, residual_buf0, infer_states[0], use_next_layer=True)
         # This event of first layer would be recorded again
-        self.stage_s_events[0].record()
-        q1, k1, v1 = self._preproj(input_embds1, residual_buf1, infer_states[1])
+        self.events[1].stage_s.record()
+        q1, k1, v1 = self._preproj(input_embds1, residual_buf1, infer_states[1], use_next_layer=True)
+        self.events[1].linear_e.record()
         self._attention(
             input_embds0, q0, k0, v0,
-            kvargs, infer_states[0], cur_stage=0
+            kvargs, infer_states[0], cur_stage=1
         )
         return q1, k1, v1
 
@@ -368,8 +386,9 @@ class LlamaTransformerLayer:
         batch0 : o0   |=> post-projection              |=> [f0]
         batch1 : qkv1 |=> attention -> post-projection |=> [f1]
         """
-        self.stage_s_events[0].record()
+        self.events[0].stage_s.record()
         f0 = self._postproj(o0, residual_buf0)
+        self.events[0].linear_e.record()
         # Here cur_stage is an offset of layer_id, we use last layer here
         self._attention(
             o1, q1, k1, v1,
