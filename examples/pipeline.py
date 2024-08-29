@@ -43,6 +43,7 @@ if __name__ == '__main__':
 
         # The following are not used in the offline example
         max_batch_size = 16,
+        max_prefill_tokens = 2048*16,
         max_tokens_in_batch = 2048*16,
 
         library_path=library_path,

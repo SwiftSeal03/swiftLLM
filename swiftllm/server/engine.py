@@ -2,7 +2,6 @@ import time
 import asyncio
 import functools
 from typing import AsyncGenerator
-import dataclasses
 from pprint import pprint
 
 import torch
@@ -137,11 +136,13 @@ class Engine:
                     self.model.swap_out_seqs,
                     [req.request_id for req in cur_swap_out]
                 )
+            swp_out_finish = time.perf_counter()
             if cur_swap_in:
                 await self._run_on_model_async(
                     self.model.swap_in_seqs,
                     [req.request_id for req in cur_swap_in]
                 )
+            swp_in_finish = time.perf_counter()
             
             # Forward the model
             argss = [
@@ -155,11 +156,9 @@ class Engine:
                 output_tokens = await self._run_on_model_async(self.model.forward, argss[0])
             else:
                 # Pipelined mode
-                start = time.perf_counter() * 1000
                 reqs = batch[0].get_all_reqs() + batch[1].get_all_reqs()
                 print(f"Using pipelined mode (batch_size = {len(reqs)})")
                 output_tokens = await self._run_on_model_async(self.model.forward_pipeline, argss)
-                end = time.perf_counter() * 1000
 
             # Deal with output tokens
             finished_req_ids = []
@@ -175,6 +174,7 @@ class Engine:
                 finished_req_ids
             )
             
+            iter_end = time.perf_counter()
             # Inform the scheduler, swap out newly prefilled requests if necessary
             cur_swap_out = self.scheduler.on_batch_finish(reqs)
             if cur_swap_out:
@@ -184,6 +184,7 @@ class Engine:
                 )
 
             end = time.perf_counter()
+            # print(f"Time: {end-start:.3f}s, Swap out: {swp_out_finish-start:.3f}s, Swap in: {swp_in_finish-swp_out_finish:.3f}s, Forward: {iter_end-swp_in_finish:.3f}s, Swap out (new): {end-iter_end:.3f}s")
     
     async def start_all_event_loops(self):
         """

@@ -20,6 +20,7 @@ class EngineConfig:
 
     # Scheduling-related parameters
     max_batch_size: int
+    max_prefill_tokens: int
     max_tokens_in_batch: int
 
     # External library path

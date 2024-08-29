@@ -10,6 +10,7 @@ class ModelProfiler:
   """
   A profiler for the Llama model.
   """
+  @torch.inference_mode()
   def __init__(
     self, 
     model: LlamaModel, 
@@ -35,6 +36,7 @@ class ModelProfiler:
       []
     ))
   
+  @torch.inference_mode()
   def __del__(self):
     self.model.engine_config.monitor_performance = False
     self.model.free_seqs_resources([0])

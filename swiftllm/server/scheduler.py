@@ -75,24 +75,29 @@ class RequestIdManager:
         self.available_ids.extend(req_ids)
 
 class ScheduleBudget:
-    def __init__(self, max_batch_size: int, max_tokens_in_batch: int):
+    def __init__(self, max_batch_size: int, max_prefill_tokens: int, max_tokens_in_batch: int):
         self.remaining_batch_size = max_batch_size
+        self.remaining_prefill_tokens = max_prefill_tokens
         self.remaining_tokens_in_batch = max_tokens_in_batch
     
     @property
     def overspent(self) -> bool:
         return self.remaining_batch_size < 0 or self.remaining_tokens_in_batch < 0
 
-    def check_and_substract(self, num_tokens) -> bool:
-        if self.remaining_batch_size >= 1 and self.remaining_tokens_in_batch >= num_tokens:
+    def check_and_substract(self, num_tokens, is_prefill = False) -> bool:
+        if self.remaining_batch_size >= 1 and \
+            self.remaining_tokens_in_batch >= num_tokens and \
+            self.remaining_prefill_tokens >= (num_tokens if is_prefill else 0):
             self.remaining_batch_size -= 1
             self.remaining_tokens_in_batch -= num_tokens
+            self.remaining_prefill_tokens -= num_tokens if is_prefill else 0
             return True
         return False
 
-    def add(self, num_tokens) -> bool:
+    def add(self, num_tokens, is_prefill = False) -> bool:
         self.remaining_batch_size += 1
         self.remaining_tokens_in_batch += num_tokens
+        self.remaining_prefill_tokens += num_tokens if is_prefill else 0
 
 class Scheduler:
     """
@@ -120,7 +125,7 @@ class Scheduler:
         self.cdec_S_arr = np.array(cdec_S_list)
         self.cdec_N_arr = np.array(cdec_N_list)
         self.cdec_T_arr = np.array(cdec_T_list)
-        self.kernel_launch_time = 0.8
+        self.kernel_launch_time = 1.0
 
         # Request in the following three deques are sorted by their arrival time
         self.waiting_q: deque[Request] = deque()
@@ -160,7 +165,7 @@ class Scheduler:
         Get the CPU decoding time for iteration width S and number of tokens N,
         using bilinear interpolation
         """
-        assert S <= self.cdec_S_arr[-1], f"Iteration width {S} exceeds the maximum {self.cdec_S_arr[-1]}"
+        assert S <= self.cdec_S_arr[-1], f"CPU batch size {S} exceeds the maximum {self.cdec_S_arr[-1]}"
         assert N <= self.cdec_N_arr[-1], f"Number of tokens {N} exceeds the maximum {self.cdec_N_arr[-1]}"
         if S == 0:
             return 0.0
@@ -176,8 +181,10 @@ class Scheduler:
     
     def _get_cpu_remaining_capacity(self, s: int, x_c: int, n_c: int):
         """
-        Get the remaining CPU capacity for a batch with iteration width s, number of CPU decoding requests x_c,
-        and total number of tokens n_c
+        Get the remaining CPU capacity for a batch with 
+        - (opposite batch's) iteration width s
+        - number of CPU decoding requests x_c,
+        - total number of tokens n_c
         """
         return self._get_linr_T(s) - self._get_cdec_T(x_c, n_c) - self.kernel_launch_time
 
@@ -217,13 +224,13 @@ class Scheduler:
             if not budget.check_and_substract(1):
                 break
             # We insert the req to the batch that maximizes the min R value, i.e. (T_l - T_c)
-            old_Rs = []
-            new_Rs = [] 
+            slf_Rs = [] # slf_Rs[i] is the R value of batch-i if we insert the req to batch-i
+            opp_Rs = [] # opp_Rs[i] is the R value of batch-i if we insert the req to batch-(1-i)
             for i in range(2):
-                old_Rs.append(self._get_cpu_remaining_capacity(batches[i].s, batches[i].x_c, batches[i].n_c))
-                new_Rs.append(self._get_cpu_remaining_capacity(batches[i].s + 1, batches[i].x_c + 1, batches[i].n_c + req.seq_len))
-            min_R0 = min(new_Rs[0], old_Rs[1])
-            min_R1 = min(new_Rs[1], old_Rs[0])
+                opp_Rs.append(self._get_cpu_remaining_capacity(batches[1-i].s + 1, batches[i].x_c, batches[i].n_c))
+                slf_Rs.append(self._get_cpu_remaining_capacity(batches[1-i].s, batches[i].x_c + 1, batches[i].n_c + req.seq_len))
+            min_R0 = min(slf_Rs[0], opp_Rs[1])
+            min_R1 = min(slf_Rs[1], opp_Rs[0])
             if min_R0 < 0 and min_R1 < 0:
                 # Both are negative, skip this request
                 budget.add(1)
@@ -234,6 +241,10 @@ class Scheduler:
 
         # The coefficient theoretically should be 2.0, but we use 2.4 here for performance guarantee
         if sum(b.x for b in batches) > 2.4 * sequential_batch.x:
+#             print(f"Estimated linear time: {(self._get_linr_T(batches[0].s) + self._get_linr_T(batches[1].s))/2}")
+#             print(f"Estimated CPU decoding time: {(self._get_cdec_T(batches[0].x_c, batches[0].n_c) + self._get_cdec_T(batches[1].x_c, batches[1].n_c))/2}")
+#             print(f"Remaining cpu capacity: {self._get_cpu_remaining_capacity(batches[0].s, batches[0].x_c, batches[0].n_c)},\
+#  {self._get_cpu_remaining_capacity(batches[1].s, batches[1].x_c, batches[1].n_c)}")
             return batches[0], batches[1]
         else:
             return sequential_batch, None
@@ -245,7 +256,11 @@ class Scheduler:
         Returns (new_batch, newly_swapped_in, newly_swapped_out)
         """
         # We have a budget mainly because we should avoid CUDA OOM
-        budget = ScheduleBudget(self.engine_config.max_batch_size, self.engine_config.max_tokens_in_batch)
+        budget = ScheduleBudget(
+            self.engine_config.max_batch_size,
+            self.engine_config.max_prefill_tokens,
+            self.engine_config.max_tokens_in_batch
+        )
         swpout_reqs = []
         swpin_reqs = []
 
@@ -254,10 +269,10 @@ class Scheduler:
             swap_out_threshold = self.num_gpu_blocks
             cpu_threshold = 0
         else:
-            swap_out_threshold = self.num_gpu_blocks - self.engine_config.max_tokens_in_batch // self.engine_config.block_size
-            cpu_threshold = self.num_cpu_blocks - self.engine_config.max_blocks_per_seq 
+            swap_out_threshold = self.num_gpu_blocks - self.engine_config.max_prefill_tokens // self.engine_config.block_size
+            cpu_threshold = self.num_cpu_blocks - self.num_gpu_blocks
         
-        swap_in_threshold = round(swap_out_threshold * 0.95)
+        swap_in_threshold = round(swap_out_threshold * 0.97)
 
 
         # Step 1: Try to launch as many GPU decoding requests as possible
@@ -295,7 +310,7 @@ class Scheduler:
             cur_block_needed = self._get_block_needed(candidate)
             if gpu_block_needed + cur_block_needed > self.num_gpu_blocks or \
                (self.cpu_decoding_q and cpu_block_needed + cur_block_needed > cpu_threshold) or \
-               not budget.check_and_substract(candidate.prompt_len):
+               not budget.check_and_substract(candidate.prompt_len, True):
                 break
             gpu_block_needed += cur_block_needed
             cpu_block_needed += cur_block_needed
