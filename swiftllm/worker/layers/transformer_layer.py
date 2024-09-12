@@ -2,19 +2,24 @@ import time
 import dataclasses
 import torch
 import vllm_flash_attn
-from swiftllm_c import fused_add_rmsnorm_inplace, silu_and_mul_inplace, rotary_embedding_inplace, store_kvcache
+from swiftllm_c import \
+    fused_add_rmsnorm_inplace, \
+    silu_and_mul_inplace, \
+    rotary_embedding_inplace, \
+    linear, \
+    store_kvcache#, paged_attention
 
 from swiftllm.model_config import LlamaModelConfig
 from swiftllm.engine_config import EngineConfig
 from swiftllm.worker.weight import LlamaTransformerLayerWeight
 from swiftllm.worker.infer_state import LlamaInferState
 
-from swiftllm.worker.kernels.linear import linear
+# from swiftllm.worker.kernels.linear import linear
 # from swiftllm.worker.kernels.rotary_emb import rotary_embedding_inplace
-from swiftllm.worker.kernels.paged_attn import paged_attention
 # from swiftllm.worker.kernels.kvcache_mgmt import store_kvcache
 # from swiftllm.worker.kernels.silu_and_mul import silu_and_mul_inplace
 # from swiftllm.worker.kernels.rmsnorm import fused_add_rmsnorm_inplace
+from swiftllm.worker.kernels.paged_attn import paged_attention
 
 @dataclasses.dataclass
 class KVCacheArgs:
@@ -133,7 +138,7 @@ class LlamaTransformerLayer:
         gpu_block_table = kvargs.gpu_block_table
         cpu_block_table = kvargs.cpu_block_table
 
-        cur_layer_id = self.layer_id + cur_stage
+        cur_layer_id = (self.layer_id + cur_stage) % self.model_config.num_layers
 
         start = time.perf_counter()*1e6
         if infer_state.num_prefill_seqs > 0:
@@ -162,8 +167,8 @@ class LlamaTransformerLayer:
             torch.cuda.current_stream().wait_event(self.events[cur_stage].stage_s)
             if infer_state.num_prefill_seqs > 0 and not self.engine_config.ignore_kvcache:
                 store_kvcache(
-                    k[:infer_state.num_prefill_tokens, :, :],
-                    v[:infer_state.num_prefill_tokens, :, :],
+                    k,
+                    v, # Here we only store k, v for prefilling, the kernel won't store decoding KVs
                     k_cache, v_cache,
                     gpu_block_table,
                     infer_state.gpu_seq_ids[:infer_state.num_prefill_seqs],
@@ -180,13 +185,14 @@ class LlamaTransformerLayer:
                     k[infer_state.num_prefill_tokens:infer_state.gpu_token_end, :, :],
                     v[infer_state.num_prefill_tokens:infer_state.gpu_token_end, :, :],
                     o[infer_state.num_prefill_tokens:infer_state.gpu_token_end, :],
-                    k_cache, v_cache, gpu_block_table,
+                    k_cache, v_cache,
+                    infer_state.softmax_scale,
+                    gpu_block_table,
                     infer_state.gpu_seq_ids[infer_state.num_prefill_seqs:],
                     infer_state.gpu_decoding_seq_lens,
                     cur_layer_id,
                     infer_state.seq_block_size,
                     infer_state.num_seq_blocks,
-                    infer_state.softmax_scale
                 )
             self.events[cur_stage].gpudec_e.record()
         torch.cuda.default_stream().wait_event(self.events[cur_stage].gpudec_e)
@@ -241,7 +247,7 @@ class LlamaTransformerLayer:
         mid2 = time.perf_counter()*1e6
         silu_and_mul_inplace(up_gate_proj)
         mid3 = time.perf_counter()*1e6
-        ffn_out = linear(up_gate_proj[:, :self.model_config.ffn_inter_dim], self.weight.down_proj)
+        ffn_out = torch.nn.functional.linear(up_gate_proj[:, :self.model_config.ffn_inter_dim], self.weight.down_proj)
         end = time.perf_counter()*1e6
         # print(f"Output GEMM: {mid0 - start:.2f}, RMSNorm: {mid1 - mid0:.2f}, FFN GEMM: {mid2 - mid1:.2f}, SiLU: {mid3 - mid2:.2f}, Down-proj GEMM: {end - mid3:.2f}")
         return ffn_out

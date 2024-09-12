@@ -2,10 +2,14 @@ import time
 import torch
 import triton
 import triton.language as tl
+from triton.compiler.compiler import CompiledKernel
 
 from swiftllm.model_config import LlamaModelConfig
 from swiftllm.engine_config import EngineConfig
 from swiftllm.worker.infer_state import LlamaInferState
+
+# Map from seq_block_size to the compiled kernel, the former must be power of 2
+cached_phase1_bin = {}
 
 @triton.jit
 def _fwd_paged_attention_phase1(
@@ -36,6 +40,7 @@ def _fwd_paged_attention_phase1(
     my_batch_id = tl.program_id(0).to(tl.int64)
     my_q_head_id = tl.program_id(1).to(tl.int64)
     my_seq_block_id = tl.program_id(2)
+    # num_my_heads = num_q_heads // num_kv_heads
     my_kv_head_id = my_q_head_id // num_my_heads
 
     my_seq_id = tl.load(seq_ids + my_batch_id)
@@ -62,20 +67,21 @@ def _fwd_paged_attention_phase1(
     #     are needed.
     #   - We can use tl.arange() when the sequence block is not the last one,
     #     leading to better performance.
-    if my_start_token_idx + seq_block_size > my_seq_len:
+    if my_start_token_idx + seq_block_size >= my_seq_len:
+        # First store the new KV cache
+        my_block_pos = (my_seq_len-1) // block_size
+        my_block_offset = (my_seq_len-1) % block_size
+        my_block_index = tl.load(block_table + my_seq_id*max_blocks_per_seq + my_block_pos).to(tl.int64)
+        offs_kv = (my_batch_id * num_kv_heads + my_kv_head_id) * head_dim + tl.arange(0, head_dim)
+        offs_kvcache = (((my_block_index * num_layers + cur_layer) * num_kv_heads + my_kv_head_id) * block_size + my_block_offset) * head_dim + tl.arange(0, head_dim)
+        tl.store(k_cache + offs_kvcache, tl.load(k + offs_kv))
+        tl.store(v_cache + offs_kvcache, tl.load(v + offs_kv))
+        
         # The seq block I am processing is the last one in the sequence
         my_num_blocks = tl.cdiv(
             my_seq_len - my_start_token_idx,
             block_size
         )
-        # First store the new KV cache
-        my_block_id = (my_seq_len-1) // block_size
-        my_block_offset = (my_seq_len-1) % block_size
-        my_block_index = tl.load(block_table + my_seq_id*max_blocks_per_seq + my_block_id).to(tl.int64)
-        offs_kv = my_batch_id*num_kv_heads*head_dim + (tl.arange(0, num_kv_heads)*head_dim)[:, None] + tl.arange(0, head_dim)[None, :]
-        offs_kvcache = (my_block_index*num_layers+cur_layer)*num_kv_heads*block_size*head_dim + (tl.arange(0, num_kv_heads)*block_size*head_dim)[:, None] + my_block_offset*head_dim + tl.arange(0, head_dim)[None, :]
-        tl.store(k_cache + offs_kvcache, tl.load(k + offs_kv))
-        tl.store(v_cache + offs_kvcache, tl.load(v + offs_kv))
 
         for block_i in range(0, my_num_blocks):
             block_idx = start_block_idx + block_i
@@ -119,6 +125,8 @@ def _fwd_paged_attention_phase1(
     offs_mid_o_logexpsum = my_batch_id*num_q_heads*num_seq_blocks + my_seq_block_id + my_q_head_id*num_seq_blocks
     tl.store(mid_o_logexpsum + offs_mid_o_logexpsum, tl.math.log2(sum_exp) + max_score)   # Here tl.log(sum_exp) + max_score = log(sum(e^{a_i}))
 
+
+cached_phase2_bin = {}
 
 @triton.jit
 def _fwd_paged_attention_phase2(
@@ -168,14 +176,15 @@ def paged_attention(
     o: torch.Tensor,     # [num_decoding_seqs, num_q_heads, head_dim]
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
+    softmax_scale: float,
     block_table: torch.Tensor,
     seq_ids: torch.Tensor,
     seq_lens: torch.Tensor,
     cur_layer: int,
     seq_block_size: int,
-    num_seq_blocks: int,
-    softmax_scale: float
+    num_seq_blocks: int
 ):
+    start = time.perf_counter()
     assert q.is_contiguous()
     assert k_cache.is_contiguous()
     assert v_cache.is_contiguous()
@@ -192,6 +201,7 @@ def paged_attention(
 
     num_decoding_seqs = seq_ids.shape[0]
 
+
     mid_o = torch.empty((
         num_decoding_seqs,
         num_q_heads,
@@ -205,43 +215,69 @@ def paged_attention(
     ), device=q.device, dtype=torch.float32)
 
     grid = (num_decoding_seqs, num_q_heads, num_seq_blocks)
-    _fwd_paged_attention_phase1[grid](
-        mid_o, mid_o_logexpsum,
-        q, k, v, k_cache, v_cache,
-        block_table,
 
-        # Here we multiply softmax_scale by log2(e) and use `exp2` instead of
-        # `exp` because of two reasons:
-        # 1. Up to 12 Jun 2024, all NVIDIA GPUs does not have a `exp` instruction
-        #    in PTX. When calculating `exp`, they multiply the input by log2(e)
-        #    and use `exp2` instead.
-        # 2. Some optimizations are disabled while using `exp` in a loop, see
-        #    https://github.com/triton-lang/triton/issues/2961
-        softmax_scale * 1.442695040888963,
-        seq_lens,
-        seq_ids,
-        num_seq_blocks,
-        cur_layer,
+    global cached_phase1_bin
+    if seq_block_size not in cached_phase1_bin:
+        cached_phase1_bin[seq_block_size] = _fwd_paged_attention_phase1[grid](
+            mid_o, mid_o_logexpsum,
+            q, k, v, k_cache, v_cache,
+            block_table,
 
-        num_layers,
-        num_q_heads,
-        num_kv_heads,
-        num_q_heads // num_kv_heads,
-        block_size,
-        head_dim,
-        seq_block_size,
-        block_table_width,
-        num_warps = 1,
-        num_stages = 4
-    )
+            # Here we multiply softmax_scale by log2(e) and use `exp2` instead of
+            # `exp` because of two reasons:
+            # 1. Up to 12 Jun 2024, all NVIDIA GPUs does not have a `exp` instruction
+            #    in PTX. When calculating `exp`, they multiply the input by log2(e)
+            #    and use `exp2` instead.
+            # 2. Some optimizations are disabled while using `exp` in a loop, see
+            #    https://github.com/triton-lang/triton/issues/2961
+            softmax_scale * 1.442695040888963,
+            seq_lens,
+            seq_ids,
+            num_seq_blocks,
+            cur_layer,
 
-    grid = (num_decoding_seqs, num_q_heads)
-    _fwd_paged_attention_phase2[grid](
-        mid_o, mid_o_logexpsum,
-        o,
-        seq_lens,
-        num_q_heads,
-        head_dim,
-        num_seq_blocks,
-        seq_block_size
-    )
+            num_layers,
+            num_q_heads,
+            num_kv_heads,
+            num_q_heads // num_kv_heads,
+            block_size,
+            head_dim,
+            seq_block_size,
+            block_table_width,
+            num_warps = 1,
+            num_stages = 4
+        )
+    else:
+        cached_phase1_bin[seq_block_size][grid](
+            mid_o, mid_o_logexpsum,
+            q, k, v, k_cache, v_cache,
+            block_table,
+            softmax_scale * 1.442695040888963,
+            seq_lens,
+            seq_ids,
+            num_seq_blocks,
+            cur_layer
+        )
+
+    grid = (num_decoding_seqs, num_q_heads, 1)
+
+    global cached_phase2_bin
+    if seq_block_size not in cached_phase2_bin:
+        cached_phase2_bin[seq_block_size] = _fwd_paged_attention_phase2[grid](
+            mid_o, mid_o_logexpsum,
+            o,
+            seq_lens,
+            num_q_heads,
+            head_dim,
+            num_seq_blocks,
+            seq_block_size
+        )
+    else:
+        cached_phase2_bin[seq_block_size][grid](
+            mid_o, mid_o_logexpsum,
+            o,
+            seq_lens
+        )
+    
+    end = time.perf_counter()
+    return end - start
