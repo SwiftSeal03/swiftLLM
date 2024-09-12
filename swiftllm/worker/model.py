@@ -495,13 +495,11 @@ class LlamaModel:
             cpuwrk_times = [[0 for _ in self.transformer_layers] for _ in infer_states]
             cpudec_times = [[0 for _ in self.transformer_layers] for _ in infer_states]
 
-            print("getting stage times")
             for i in range(2):
                 linear_times[i] = [layer.events[i].get_linear_time() for layer in self.transformer_layers]
                 if infer_states[1-i].cpu_num_decoding_seqs > 0:
                     cpuwrk_times[i] = [layer.events[i].get_cpuwrk_time() for layer in self.transformer_layers]
                     cpudec_times[i] = [layer.events[i].get_cpudec_time() for layer in self.transformer_layers]
-            print("got stage times")
 
             num_layers = len(self.transformer_layers)
 

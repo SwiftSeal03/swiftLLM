@@ -1,7 +1,7 @@
 import time
 import dataclasses
 import torch
-import vllm_flash_attn
+import vllm_flash_attn_2_cuda as flash_attn_cuda
 from swiftllm_c import \
     fused_add_rmsnorm_inplace, \
     silu_and_mul_inplace, \
@@ -146,17 +146,27 @@ class LlamaTransformerLayer:
                 torch.cuda.current_stream().wait_event(self.events[cur_stage].stage_s)
                 # Here the performance of vLLM's flash attention is better than us,
                 # so use vllm_flash_attn
-                o[:infer_state.num_prefill_tokens, :] = vllm_flash_attn.flash_attn_varlen_func(
+                o[:infer_state.num_prefill_tokens, :] = flash_attn_cuda.varlen_fwd(
                     q[:infer_state.num_prefill_tokens, :, :],
                     k[:infer_state.num_prefill_tokens, :, :],
                     v[:infer_state.num_prefill_tokens, :, :],
+                    None,
                     infer_state.prefill_seq_start_locs_with_end,
                     infer_state.prefill_seq_start_locs_with_end,
+                    None,
+                    None,
+                    None,
                     infer_state.max_prefill_len,
                     infer_state.max_prefill_len,
-                    softmax_scale=infer_state.softmax_scale,
-                    causal=True
-                ).reshape(-1, self.model_config.hidden_size)
+                    0.0,
+                    infer_state.softmax_scale,
+                    False,
+                    True,
+                    -1, 
+                    -1,
+                    False,
+                    None
+                )[0].reshape(-1, self.model_config.hidden_size)
                 self.events[cur_stage].prefill_e.record()
             torch.cuda.default_stream().wait_event(self.events[cur_stage].prefill_e)
         mid0 = time.perf_counter()*1e6
@@ -198,7 +208,7 @@ class LlamaTransformerLayer:
         torch.cuda.default_stream().wait_event(self.events[cur_stage].gpudec_e)
 
         end = time.perf_counter()*1e6
-        # print(f"Prefill launch: {mid0 - start:.2f}, KV-cache store: {mid1 - mid0:.2f}, GPU decoding: {end - mid1:.2f}")
+        print(f"Prefill launch: {mid0 - start:.2f}, KV-cache store: {mid1 - mid0:.2f}, GPU decoding: {end - mid1:.2f}")
                 
         if infer_state.cpu_num_decoding_seqs > 0:
             with torch.cuda.stream(self.cpu_communication_stream):
