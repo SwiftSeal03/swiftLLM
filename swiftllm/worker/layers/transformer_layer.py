@@ -208,17 +208,18 @@ class LlamaTransformerLayer:
         torch.cuda.default_stream().wait_event(self.events[cur_stage].gpudec_e)
 
         end = time.perf_counter()*1e6
-        print(f"Prefill launch: {mid0 - start:.2f}, KV-cache store: {mid1 - mid0:.2f}, GPU decoding: {end - mid1:.2f}")
+        # print(f"Prefill launch: {mid0 - start:.2f}, KV-cache store: {mid1 - mid0:.2f}, GPU decoding: {end - mid1:.2f}")
                 
         if infer_state.cpu_num_decoding_seqs > 0:
             with torch.cuda.stream(self.cpu_communication_stream):
                 torch.cuda.current_stream().wait_event(self.events[cur_stage].stage_s)
                 self.events[cur_stage].cpudec_s.record()
-                q_cpu = q[infer_state.gpu_token_end:, :, :].cpu()
-                k_cpu = k[infer_state.gpu_token_end:, :, :].cpu()
-                v_cpu = v[infer_state.gpu_token_end:, :, :].cpu()
+                q_cpu = q[infer_state.gpu_token_end:, :, :].to(device='cpu', non_blocking=True)
+                k_cpu = k[infer_state.gpu_token_end:, :, :].to(device='cpu', non_blocking=True)
+                v_cpu = v[infer_state.gpu_token_end:, :, :].to(device='cpu', non_blocking=True)
+                torch.cuda.current_stream().synchronize()
                 oc = o[infer_state.gpu_token_end:, :]
-                o_cpu = torch.empty_like(oc, device='cpu', dtype=torch.float32)
+                o_cpu = torch.empty_like(oc, device='cpu', dtype=torch.float32, pin_memory=True)
                 torch.ops.pacpu.paged_attention_cpu(
                     cur_layer_id,
                     infer_state.softmax_scale,

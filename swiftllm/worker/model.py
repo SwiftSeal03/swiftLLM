@@ -190,8 +190,8 @@ class LlamaModel:
             self.engine_config.block_size,
             self.model_config.head_dim
         )
-        self.k_swap = torch.zeros(kvswap_shape, dtype=torch.float16, device="cpu")
-        self.v_swap = torch.zeros(kvswap_shape, dtype=torch.float16, device="cpu")
+        self.k_swap = torch.zeros(kvswap_shape, dtype=torch.float16, device="cpu", pin_memory=True)
+        self.v_swap = torch.zeros(kvswap_shape, dtype=torch.float16, device="cpu", pin_memory=True)
 
         # Initialize block manager
         self.gpu_block_manager = BlockManager(
@@ -564,6 +564,7 @@ class LlamaModel:
             self.k_cache, self.v_cache,
             self.k_swap, self.v_swap
         )
+        # torch.cuda.synchronize()
         
     @torch.inference_mode()
     def swap_in_seqs(
