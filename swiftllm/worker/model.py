@@ -564,7 +564,7 @@ class LlamaModel:
             self.k_cache, self.v_cache,
             self.k_swap, self.v_swap
         )
-        # torch.cuda.synchronize()
+        torch.cuda.synchronize()
         
     @torch.inference_mode()
     def swap_in_seqs(
