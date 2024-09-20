@@ -2,14 +2,14 @@ import itertools
 import math
 import dataclasses
 import json
-from concurrent.futures import ThreadPoolExecutor
+from pprint import pprint
 
 import torch
 
 from swiftllm.engine_config import EngineConfig
 from swiftllm.model_config import LlamaModelConfig
 from swiftllm.worker.weight import load_weights
-from swiftllm.worker.block_manager import BlockManager
+from swiftllm.worker.block_manager import BlockManager, Swapper
 from swiftllm.utils import GB
 import swiftllm_c
 
@@ -86,6 +86,10 @@ class LlamaModel:
         
         # List of performance results, unused if monitor_performance is False
         self.perf_results = []
+
+        self.prefilling_stream = torch.cuda.Stream()
+        self.decoding_piggyback_stream = torch.cuda.Stream()
+        self.cpu_communication_stream = torch.cuda.Stream()
         
     @torch.inference_mode()
     def load_weights(self):
@@ -104,9 +108,6 @@ class LlamaModel:
         self._init_to_get_rotary()
 
         # Initialize layers
-        prefilling_stream = torch.cuda.Stream()
-        decoding_piggyback_stream = torch.cuda.Stream()
-        cpu_communication_stream = torch.cuda.Stream()
         self.pre_layer = LlamaPreLayer(self.model_config, self.weight)
         self.transformer_layers = [
             LlamaTransformerLayer(
@@ -114,9 +115,9 @@ class LlamaModel:
                 self.engine_config,
                 self.weight.layers[layer_id],
                 self.weight.layers[layer_id + 1 - self.model_config.num_layers],
-                prefilling_stream,
-                decoding_piggyback_stream,
-                cpu_communication_stream,
+                self.prefilling_stream,
+                self.decoding_piggyback_stream,
+                self.cpu_communication_stream,
                 layer_id
             )
             for layer_id in range(self.model_config.num_layers)
@@ -209,6 +210,18 @@ class LlamaModel:
             self.engine_config.block_size
         )
 
+        self.swapper = Swapper(
+            self.engine_config,
+            self.k_cache,
+            self.v_cache,
+            self.k_swap,
+            self.v_swap,
+            self.gpu_block_manager,
+            self.cpu_block_manager
+        )
+
+        self.transformer_layers[-1].set_swapper(self.swapper)
+
     def _init_to_get_rotary(self):
         rope_scaling_factor = self.model_config.rope_scaling
         base = self.model_config.rope_theta
@@ -274,6 +287,9 @@ class LlamaModel:
             seq_block_size //= 2
         num_seq_blocks = (_max_decoding_len + seq_block_size - 1) // seq_block_size
 
+        _position_cos = self._cos_cached.index_select(0, position_indices)
+        _position_sin = self._sin_cached.index_select(0, position_indices)
+
         infer_state = LlamaInferState(
             softmax_scale = self.model_config.head_dim ** -0.5,
 
@@ -299,8 +315,8 @@ class LlamaModel:
             seq_block_size = seq_block_size,
             num_seq_blocks = num_seq_blocks,
 
-            position_cos = self._cos_cached[position_indices],
-            position_sin = self._sin_cached[position_indices],
+            position_cos = _position_cos,
+            position_sin = _position_sin
         )
 
         if not self.engine_config.ignore_kvcache:
@@ -322,6 +338,7 @@ class LlamaModel:
         self,
         input_ids: torch.Tensor,    # [total_token_num]
         infer_state: LlamaInferState,
+        pre_swap_out: list[int] | None
     ) -> torch.Tensor:
         """
         Run a forward pass of the LlamaModel.
@@ -342,6 +359,9 @@ class LlamaModel:
         # Main body of the forward pass
         input_embds = self.pre_layer.forward(input_ids)
 
+        # Wait for swappings to finish
+        torch.cuda.current_stream().wait_stream(self.cpu_communication_stream)
+
         if self.engine_config.monitor_performance:
             mainbody_s_event = torch.cuda.Event(enable_timing=True)
             mainbody_s_event.record()
@@ -359,6 +379,9 @@ class LlamaModel:
         if self.engine_config.monitor_performance:
             mainbody_e_event = torch.cuda.Event(enable_timing=True)
             mainbody_e_event.record()
+        
+        if pre_swap_out:
+            self.swap_out_seqs(pre_swap_out)
 
         output_tokens = self.post_layer.forward(input_embds, infer_state)
 
@@ -394,7 +417,8 @@ class LlamaModel:
     @torch.inference_mode()
     def forward(
         self,
-        args: ModelForwardArgs
+        args: ModelForwardArgs,
+        pre_swap_out: list[int] | None = None
     ) -> list[int]:
         """
         Run a forward pass of the LlamaModel.
@@ -409,7 +433,8 @@ class LlamaModel:
 
         return self._forward(
             torch.tensor(flattened_input_ids, dtype=torch.int32, device="cuda"),
-            infer_state
+            infer_state,
+            pre_swap_out
         ).tolist()
     
     @torch.inference_mode()
@@ -417,6 +442,7 @@ class LlamaModel:
         self,
         input_ids: torch.Tensor,
         infer_states: list[LlamaInferState],
+        pre_swap_out: list[int] | None
     ) -> torch.Tensor:
         """
         Run a forward pass of the LlamaModel in a pipelined manner.
@@ -437,13 +463,14 @@ class LlamaModel:
         # input_embds would serve as a buffer for all attention outputs
         input_embds = self.pre_layer.forward(input_ids)
         residual_buf = torch.zeros_like(input_embds)
-        input_embds0, input_embds1 = torch.split(input_embds, infer_states[0].num_tokens, dim=0)
-        residual_buf0, residual_buf1 = torch.split(residual_buf, infer_states[0].num_tokens, dim=0)
+        input_embds0, input_embds1 = torch.split(input_embds, [infer_states[0].num_tokens, infer_states[1].num_tokens], dim=0)
+        residual_buf0, residual_buf1 = torch.split(residual_buf, [infer_states[0].num_tokens, infer_states[1].num_tokens], dim=0)
 
         if self.engine_config.monitor_performance:
             pipeline_s_event = torch.cuda.Event(enable_timing=True)
             pipeline_s_event.record()
         
+        # First stage of the forward pass
         q1, k1, v1 = self.transformer_layers[-1].forward_first_stage(
             input_embds0, input_embds1, residual_buf0, residual_buf1,
             kvargs, infer_states
@@ -466,11 +493,12 @@ class LlamaModel:
         if self.engine_config.monitor_performance:
             mainbody_e_event = torch.cuda.Event(enable_timing=True)
             mainbody_e_event.record()
-            
 
+        # Last stage of the forward pass, also begin predicted swapping
         f0, f1 = self.transformer_layers[-1].forward_last_stage(
             q1, k1, v1, input_embds0, input_embds1, residual_buf0, residual_buf1,
-            kvargs, infer_states
+            kvargs, infer_states,
+            pre_swap_out
         )
 
         if self.engine_config.monitor_performance:
@@ -529,7 +557,8 @@ class LlamaModel:
     @torch.inference_mode()
     def forward_pipeline(
         self,
-        argss: list[ModelForwardArgs]
+        argss: list[ModelForwardArgs],
+        pre_swap_out: list[int] | None = None
     ) -> list[int]:
         """
         Forward 2 sub-batches in a pipelined manner.
@@ -540,31 +569,9 @@ class LlamaModel:
 
         return self._forward_pipeline(
             torch.tensor(finput_ids0 + finput_ids1, dtype=torch.int32, device="cuda"),
-            [infer_state0, infer_state1]
+            [infer_state0, infer_state1],
+            pre_swap_out
         ).tolist()
-
-    def _swap(
-        self,
-        seq_ids_list: list[int],
-        is_swap_in: bool
-    ):
-        src_block_manager = self.cpu_block_manager if is_swap_in else self.gpu_block_manager
-        dst_block_manager = self.gpu_block_manager if is_swap_in else self.cpu_block_manager
-        src_seq_ids = torch.tensor(seq_ids_list, dtype=torch.int32, device=src_block_manager.device_name)
-        dst_seq_ids = src_seq_ids.to(dst_block_manager.device_name)
-        src_seq_lengths = src_block_manager.get_num_allocated_blocks(src_seq_ids) * self.engine_config.block_size
-        dst_seq_lengths = src_seq_lengths.to(dst_block_manager.device_name)
-        src_block_ids = src_block_manager.gather_allocated_blocks_and_free(src_seq_ids)
-        dst_block_ids = dst_block_manager.allocate_blocks_for_seqs(dst_seq_ids, dst_seq_lengths)
-        swiftllm_c.swap_blocks(
-            src_block_ids.tolist(),
-            dst_block_ids.tolist(),
-            is_swap_in,
-
-            self.k_cache, self.v_cache,
-            self.k_swap, self.v_swap
-        )
-        torch.cuda.synchronize()
         
     @torch.inference_mode()
     def swap_in_seqs(
@@ -574,7 +581,8 @@ class LlamaModel:
         """
         Swap in (move blocks from CPU to GPU) the specified sequences.
         """
-        self._swap(seq_ids_list, True)
+        with torch.cuda.stream(self.cpu_communication_stream):
+            self.swapper.swap_in_seqs(seq_ids_list)
     
     @torch.inference_mode()
     def swap_out_seqs(
@@ -584,7 +592,8 @@ class LlamaModel:
         """
         Swap out (move blocks from GPU to CPU) the specified sequences.
         """
-        self._swap(seq_ids_list, False)
+        with torch.cuda.stream(self.cpu_communication_stream):
+            self.swapper.swap_out_seqs(seq_ids_list)
 
     @torch.inference_mode()
     def free_seqs_resources(self, seq_ids_list: list[int]):

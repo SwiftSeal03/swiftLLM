@@ -118,12 +118,16 @@ class Engine:
         """
         Event loop for forwarding the model
         """
-        # Loop invariant (at beginning):
-        # 1. All GPU requests arrives earlier than CPU requests
         while True:
             # Get the next batch from the scheduler
             batch = [None] * 2
-            batch[0], batch[1], cur_swap_out, cur_swap_in = self.scheduler.get_next_batch()
+            
+            if self.engine_config.always_use_gpu:
+                pre_swap_out = None
+                batch[0], cur_swap_out, cur_swap_in = self.scheduler.get_next_batch_old()
+            else:
+                batch[0], batch[1], pre_swap_out, cur_swap_out, cur_swap_in = self.scheduler.get_next_batch()
+
             if all(not (batch[i] and batch[i].x) for i in range(2)) and not cur_swap_in and not cur_swap_out:
                 # No new batch, sleep for a bit
                 await asyncio.sleep(0.005)
@@ -149,16 +153,18 @@ class Engine:
                 batch[i].get_model_forward_args() if batch[i] else None
                 for i in range(2)
             ]
+            pre_swap_out_ids = [req.request_id for req in pre_swap_out] if pre_swap_out else None
             if not batch[1]:
                 # Sequential mode
                 reqs = batch[0].get_all_reqs()
                 print(f"Using sequential mode (batch_size = {len(reqs)})")
-                output_tokens = await self._run_on_model_async(self.model.forward, argss[0])
+                output_tokens = await self._run_on_model_async(self.model.forward, argss[0], pre_swap_out_ids)
             else:
                 # Pipelined mode
                 reqs = batch[0].get_all_reqs() + batch[1].get_all_reqs()
                 print(f"Using pipelined mode (batch_size = {len(reqs)})")
-                output_tokens = await self._run_on_model_async(self.model.forward_pipeline, argss)
+                self.engine_config.monitor_performance = True
+                output_tokens = await self._run_on_model_async(self.model.forward_pipeline, argss, pre_swap_out_ids)
 
             # Deal with output tokens
             finished_req_ids = []
@@ -169,22 +175,17 @@ class Engine:
                 if req.is_finished():
                     finished_req_ids.append(req.request_id)
                     req.finished_event.set()
-            await self._run_on_model_async(
-                self.model.free_seqs_resources,
-                finished_req_ids
-            )
+            if finished_req_ids:
+                await self._run_on_model_async(
+                    self.model.free_seqs_resources,
+                    finished_req_ids
+                )
             
             iter_end = time.perf_counter()
             # Inform the scheduler, swap out newly prefilled requests if necessary
-            cur_swap_out = self.scheduler.on_batch_finish(reqs)
-            if cur_swap_out:
-                await self._run_on_model_async(
-                    self.model.swap_out_seqs,
-                    [req.request_id for req in cur_swap_out]
-                )
+            self.scheduler.on_batch_finish(reqs)
 
-            end = time.perf_counter()
-            # print(f"Time: {end-start:.3f}s, Swap out: {swp_out_finish-start:.3f}s, Swap in: {swp_in_finish-swp_out_finish:.3f}s, Forward: {iter_end-swp_in_finish:.3f}s, Swap out (new): {end-iter_end:.3f}s")
+            print(f"Time: {iter_end-start:.3f}s, Swap out: {swp_out_finish-start:.3f}s, Swap in: {swp_in_finish-swp_out_finish:.3f}s, Forward: {iter_end-swp_in_finish:.3f}s")
     
     async def start_all_event_loops(self):
         """

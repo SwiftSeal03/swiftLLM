@@ -93,7 +93,7 @@ class ModelProfiler:
       j = i
       block_needed = 0
       while j < len(seq_ids):
-        seq_len = seq_lens[i]
+        seq_len = seq_lens[j]
         nblocks = (seq_len - 1) // self.model.engine_config.block_size + 1
         if block_needed + nblocks > num_gpu_free_blocks:
           break
@@ -232,6 +232,8 @@ class ModelProfiler:
         res = json.load(f)
         if res["S_list"] == S_list and res["N_list"] == N_list:
           return res["T_list"]
+
+    print(f"S_list: {S_list}, N_list: {N_list}")
 
     T_list = []
     for S in tqdm(S_list):

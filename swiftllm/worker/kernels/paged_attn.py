@@ -217,7 +217,7 @@ def paged_attention(
     grid = (num_decoding_seqs, num_q_heads, num_seq_blocks)
 
     global cached_phase1_bin
-    if seq_block_size not in cached_phase1_bin:
+    if True: #seq_block_size not in cached_phase1_bin:
         cached_phase1_bin[seq_block_size] = _fwd_paged_attention_phase1[grid](
             mid_o, mid_o_logexpsum,
             q, k, v, k_cache, v_cache,
@@ -262,7 +262,7 @@ def paged_attention(
     grid = (num_decoding_seqs, num_q_heads, 1)
 
     global cached_phase2_bin
-    if seq_block_size not in cached_phase2_bin:
+    if True: #seq_block_size not in cached_phase2_bin:
         cached_phase2_bin[seq_block_size] = _fwd_paged_attention_phase2[grid](
             mid_o, mid_o_logexpsum,
             o,

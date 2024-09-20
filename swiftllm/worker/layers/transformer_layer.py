@@ -74,8 +74,12 @@ class LlamaTransformerLayer:
         self.decoding_piggyback_stream = decoding_piggyback_stream
         self.cpu_communication_stream = cpu_communication_stream
         self.layer_id = layer_id
+        self.swapper = None
         
         self.events = [TransformerEvents() for _ in range(2)]
+
+    def set_swapper(self, swapper):
+        self.swapper = swapper
 
     def _preproj(
         self,
@@ -375,10 +379,12 @@ class LlamaTransformerLayer:
         batch1 : input_embeds1 |=>                  pre-projection   |=> q1, k1, v1
         """
         q0, k0, v0 = self._preproj(input_embds0, residual_buf0, infer_states[0], use_next_layer=True)
-        # This event of first layer would be recorded again
+        # Wait for swappings to finish
+        torch.cuda.current_stream().wait_stream(self.cpu_communication_stream)
         self.events[1].stage_s.record()
         q1, k1, v1 = self._preproj(input_embds1, residual_buf1, infer_states[1], use_next_layer=True)
         self.events[1].linear_e.record()
+        # We use the last layer's last stage for the very first stage
         self._attention(
             input_embds0, q0, k0, v0,
             kvargs, infer_states[0], cur_stage=1
@@ -395,7 +401,8 @@ class LlamaTransformerLayer:
         residual_buf0: torch.Tensor, # [num_tokens, hidden_size]
         residual_buf1: torch.Tensor, # [num_tokens, hidden_size]
         kvargs: KVCacheArgs,
-        infer_states: list[LlamaInferState]
+        infer_states: list[LlamaInferState],
+        swap_out_seq_ids: list[int] | None,
     ) -> tuple[torch.Tensor]:
         """
         Do the last stage of the pipeline for 2 batches
@@ -411,6 +418,10 @@ class LlamaTransformerLayer:
             o1, q1, k1, v1,
             kvargs, infer_states[1], cur_stage=0
         )
+        # Initiate swap out, this is safe because we won't use KV-cache until first stage of next iteration
+        if swap_out_seq_ids:
+            with torch.cuda.stream(self.cpu_communication_stream):
+                self.swapper.swap_out_seqs(swap_out_seq_ids)
         f1 = self._postproj(o1, residual_buf1)
         return f0, f1
     

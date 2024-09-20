@@ -16,9 +16,8 @@ async def send_request_and_wait_non_streaming_mode(engine: swiftllm.Engine, toke
     start = time.perf_counter()
     (_, output_token_ids) = await engine.add_request_and_wait(raw_request)
     end = time.perf_counter()
-    return start, end
-    # print(f"Prompt: {prompt}")
     # print(f"Output: {tokenizer.decode(output_token_ids)}")
+    return start, end
 
 async def run_latency_test(
     nrequests: int,
@@ -51,7 +50,7 @@ async def run_throughput_test(
     tokenizer: AutoTokenizer
 ):
     promptlen = len(tokenizer.encode(prompt))
-    data_file = f"../data/d0828/{nrequests}-{promptlen}-{output_len}-{gpu_only}.json"
+    data_file = f"../data/d0920/{nrequests}-{promptlen}-{output_len}-{gpu_only}.json"
     if os.path.exists(data_file):
         return
     
@@ -63,7 +62,7 @@ async def run_throughput_test(
         tasks.append(task)
     times = await asyncio.gather(*tasks)
     times = [end for _, end in times]
-    with open(f"../data/d0827/{nrequests}-{promptlen}-{output_len}-{gpu_only}.json", "w") as f:
+    with open(f"../data/d0920/{nrequests}-{promptlen}-{output_len}-{gpu_only}.json", "w") as f:
         deltas = [times[i] - times[i-1] for i in range(1, len(times))]
         json.dump(deltas, f, indent=4)
     times.sort()
@@ -78,7 +77,7 @@ async def warm_up(
     tokenizer: AutoTokenizer
 ):
     logger.info("Warming up...")
-    await run_throughput_test(400, prompt, 200, False, engine, tokenizer)
+    await run_throughput_test(300, prompt, 100, False, engine, tokenizer)
     logger.info("Warm up complete")
 
 
@@ -109,12 +108,12 @@ async def main():
         block_size = 16,
         gpu_mem_utilization = 0.99,
         num_cpu_blocks = 15000,
-        max_seqs_in_block_table = 2048,
+        max_seqs_in_block_table = 1024,
         max_blocks_per_seq = 512,
 
         max_batch_size = 512,
-        max_prefill_tokens = 3072,
-        max_tokens_in_batch = 4096,
+        max_prefill_tokens = 2500,
+        max_tokens_in_batch = 3000,
 
         library_path="/home/ubuntu/pacpu/build/libpacpu.so",
         profile_result_path="/home/ubuntu/swiftLLM/profile_results/",
@@ -134,14 +133,14 @@ async def main():
     
     print([len(tokenizer.encode(prompt)) for prompt in prompts])
 
-    # await warm_up(prompts[1], engine, tokenizer)
+    # await warm_up(prompts[4], engine, tokenizer)
 
     for prompt in prompts:
-        if len(tokenizer.encode(prompt)) == 986:
-            # for outlen in range(60, 61, 10):
-                # await run_throughput_test(3000, prompt, outlen, True, engine, tokenizer)
-            outlen = 60
-            await run_throughput_test(3000, prompt, outlen, False, engine, tokenizer)
+        if len(tokenizer.encode(prompt)) == 2203:
+            for outlen in range(50, 100, 10):
+                if outlen == 70:
+                    await run_throughput_test(1000, prompt, outlen, False, engine, tokenizer)
+                    # await run_throughput_test(1000, prompt, outlen, True, engine, tokenizer)
     # for rate in [8, 10]:
     #     await run_latency_test(1200, prompt, 40, rate, True, engine, tokenizer)
     #     await run_latency_test(1200, prompt, 40, rate, False, engine, tokenizer)

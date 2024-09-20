@@ -1,4 +1,6 @@
 import torch
+import swiftllm_c
+from swiftllm.engine_config import EngineConfig
 
 from .kernels.block_mgmt import set_block_table_and_num_seq_alloc_blocks, unset_block_table_and_num_seq_alloc_blocks, gather_allocated_blocks_and_unset
 
@@ -101,4 +103,90 @@ class BlockManager:
         Useful for swapping
         """
         return self.num_seq_allocated_blocks[seq_ids]
+
+class Swapper:
+    """
+    Swapper - Manage the swapping of sequences in and out of the model
+
+    This manager is responsible for swapping sequences in and out of the model.
+    It maintains the block manager, and provides methods to swap sequences in
+    and out.
+    """
+
+    def __init__(
+        self,
+        engine_config: EngineConfig,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        k_swap: torch.Tensor,
+        v_swap: torch.Tensor,
+        gpu_block_manager: BlockManager,
+        cpu_block_manager: BlockManager
+    ):
+        assert gpu_block_manager.device_name == "cuda"
+        assert cpu_block_manager.device_name == "cpu"
+        self.engine_config = engine_config
+        self.k_cache = k_cache
+        self.v_cache = v_cache
+        self.k_swap = k_swap
+        self.v_swap = v_swap
+        self.gpu_block_manager = gpu_block_manager
+        self.cpu_block_manager = cpu_block_manager
+
+    def _initiate_swap(
+        self,
+        seq_ids_list: list[int],
+        is_swap_in: bool
+    ) -> tuple[list[int], list[int]]:
+        """
+        Do all the set-up work for swapping in/out sequences.
+        Returns src and dst block ids.
+        """
+        src_block_manager = self.cpu_block_manager if is_swap_in else self.gpu_block_manager
+        dst_block_manager = self.gpu_block_manager if is_swap_in else self.cpu_block_manager
+        src_seq_ids = torch.tensor(seq_ids_list, dtype=torch.int32, device=src_block_manager.device_name)
+        dst_seq_ids = src_seq_ids.to(dst_block_manager.device_name)
+        src_seq_lengths = src_block_manager.get_num_allocated_blocks(src_seq_ids) * self.engine_config.block_size
+        dst_seq_lengths = src_seq_lengths.to(dst_block_manager.device_name)
+        src_block_ids = src_block_manager.gather_allocated_blocks_and_free(src_seq_ids)
+        dst_block_ids = dst_block_manager.allocate_blocks_for_seqs(dst_seq_ids, dst_seq_lengths)
+        return src_block_ids.tolist(), dst_block_ids.tolist()
+    
+    def _swap(
+        self,
+        src_block_ids: list[int],
+        dst_block_ids: list[int],
+        is_swap_in: bool, 
+    ):
+        swiftllm_c.swap_blocks(
+            src_block_ids,
+            dst_block_ids,
+            is_swap_in,
+
+            self.k_cache, self.v_cache,
+            self.k_swap, self.v_swap
+        )
+        
+    @torch.inference_mode()
+    def swap_in_seqs(
+        self,
+        seq_ids_list: list[int]
+    ):
+        """
+        Swap in (move blocks from CPU to GPU) the specified sequences.
+        """
+        src_block_ids, dst_block_ids = self._initiate_swap(seq_ids_list, True)
+        self._swap(src_block_ids, dst_block_ids, True)
+    
+    @torch.inference_mode()
+    def swap_out_seqs(
+        self,
+        seq_ids_list: list[int]
+    ):
+        """
+        Swap out (move blocks from GPU to CPU) the specified sequences.
+        """
+        src_block_ids, dst_block_ids = self._initiate_swap(seq_ids_list, False)
+        self._swap(src_block_ids, dst_block_ids, False)
+    
     

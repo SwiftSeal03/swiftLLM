@@ -1,13 +1,119 @@
-Rome had begun expanding shortly after the founding of the Roman Republic in the 6th century BC, though not outside the Italian Peninsula until the 3rd century BC. Thus, it was an "empire" (a great power) long before it had an emperor.[21] The Republic was not a nation-state in the modern sense, but a network of self-ruled towns (with varying degrees of independence from the Senate) and provinces administered by military commanders. It was governed by annually elected magistrates (Roman consuls above all) in conjunction with the Senate.[22] The 1st century BC was a time of political and military upheaval, which ultimately led to rule by emperors.[23][24][25] The consuls' military power rested in the Roman legal concept of imperium, meaning "command" (typically in a military sense).[26] Occasionally, successful consuls or generals were given the honorary title imperator (commander); this is the origin of the word emperor, since this title was always bestowed to the early emperors.[27][g]
-
-Rome suffered a long series of internal conflicts, conspiracies, and civil wars from the late second century BC (see Crisis of the Roman Republic) while greatly extending its power beyond Italy. In 44 BC Julius Caesar was briefly perpetual dictator before being assassinated by a faction that opposed his concentration of power. This faction was driven from Rome and defeated at the Battle of Philippi in 42 BC by Mark Antony and Caesar's adopted son Octavian. Antony and Octavian divided the Roman world between them, but this did not last long. Octavian's forces defeated those of Mark Antony and Cleopatra at the Battle of Actium in 31 BC. In 27 BC the Senate gave him the title Augustus ("venerated") and made him princeps ("foremost") with proconsular imperium, thus beginning the Principate, the first epoch of Roman imperial history. Although the republic stood in name, Augustus had all meaningful authority.[29] During his 40-year rule, a new constitutional order emerged so that, upon his death, Tiberius would succeed him as the new de facto monarch.[30]
-
-As Roman provinces were being established throughout the Mediterranean, Italy maintained a special status which made it domina provinciarum ("ruler of the provinces"),[31][32][33] and – especially in relation to the first centuries of imperial stability – rectrix mundi ("governor of the world")[34][35] and omnium terrarum parens ("parent of all lands").[36][37]
-
-The 200 years that began with Augustus's rule is traditionally regarded as the Pax Romana ("Roman Peace"). The cohesion of the empire was furthered by a degree of social stability and economic prosperity that Rome had never before experienced. Uprisings in the provinces were infrequent and put down "mercilessly and swiftly".[38] The success of Augustus in establishing principles of dynastic succession was limited by his outliving a number of talented potential heirs. The Julio-Claudian dynasty lasted for four more emperors—Tiberius, Caligula, Claudius, and Nero—before it yielded in 69 AD to the strife-torn Year of the Four Emperors, from which Vespasian emerged as victor. Vespasian became the founder of the brief Flavian dynasty, followed by the Nerva–Antonine dynasty which produced the "Five Good Emperors": Nerva, Trajan, Hadrian, Antoninus Pius, and Marcus Aurelius.[39]
-
-In the view of contemporary Greek historian Cassius Dio, the accession of Commodus in 180 marked the descent "from a kingdom of gold to one of rust and iron",[40] a comment which has led some historians, notably Edward Gibbon, to take Commodus' reign as the beginning of the Empire's decline.[41][42]
-
-In 212, during the reign of Caracalla, Roman citizenship was granted to all freeborn inhabitants of the empire. The Severan dynasty was tumultuous; an emperor's reign was ended routinely by his murder or execution and, following its collapse, the Empire was engulfed by the Crisis of the Third Century, a period of invasions, civil strife, economic disorder, and plague.[43] In defining historical epochs, this crisis sometimes marks the transition from Classical to Late Antiquity. Aurelian (r. 270–275) stabilised the empire militarily and Diocletian reorganised and restored much of it in 285.[44] Diocletian's reign brought the empire's most concerted effort against the perceived threat of Christianity, the "Great Persecution".[45]
-
-Diocletian divided the empire into four regions, each ruled by a separate tetrarch.[46] Confident that he fixed the disorder plaguing Rome, he abdicated along with his co-emperor, but the Tetrarchy collapsed shortly after. Order was eventually restored by Constantine the Great, who became the first emperor to convert to Christianity, and who established Constantinople as the new capital of the Eastern Empire. During the decades of the Constantinian and Valentinian dynasties, the empire was divided along an east–west axis, with dual power centres in Constantinople and Rome. Julian, who under the influence of his adviser Mardonius attempted to restore Classical Roman and Hellenistic religion, only briefly interrupted the succession of Christian emperors. Theodosius I, the last emperor to rule over both East and West, died in 395 after making Christianity the state religion.[47]
+In streaming stored video applications, the underlying medium is prerecorded video, 
+such as a movie, a television show, a prerecorded sporting event, or a prerecorded 
+user-generated video (such as those commonly seen on YouTube). These prerecorded videos are placed on servers, and users send requests to the servers to view 
+the videos on demand. Many Internet companies today provide streaming video, 
+including, Netflix, YouTube (Google), Amazon, and TikTok.
+But before launching into a discussion of video streaming, we should first get 
+a quick feel for the video medium itself. A video is a sequence of images, typically being displayed at a constant rate, for example, at 24 or 30 images per second. 
+An uncompressed, digitally encoded image consists of an array of pixels, with each 
+pixel encoded into a number of bits to represent luminance and color. An important 
+characteristic of video is that it can be compressed, thereby trading off video quality 
+with bit rate. Today’s off-the-shelf compression algorithms can compress a video to 
+essentially any bit rate desired. Of course, the higher the bit rate, the better the image 
+quality and the better the overall user viewing experience.
+From a networking perspective, perhaps the most salient characteristic of video 
+is its high bit rate. Compressed Internet video typically ranges from 100 kbps for 
+low-quality video to over 4 Mbps for streaming high-definition movies; 4K streaming envisions a bitrate of more than 10 Mbps. This can translate to huge amount of 
+traffic and storage, particularly for high-end video. For example, a single 2 Mbps video with a duration of 67 minutes will consume 1 gigabyte of storage and traffic. 
+By far, the most important performance measure for streaming video is average endto-end throughput. In order to provide continuous playout, the network must provide 
+an average throughput to the streaming application that is at least as large as the bit 
+rate of the compressed video.
+We can also use compression to create multiple versions of the same video, each 
+at a different quality level. For example, we can use compression to create, say, three 
+versions of the same video, at rates of 300 kbps, 1 Mbps, and 3 Mbps. Users can then 
+decide which version they want to watch as a function of their current available bandwidth. Users with high-speed Internet connections might choose the 3 Mbps version; 
+users watching the video over 3G with a smartphone might choose the 300 kbps version.
+In HTTP streaming, the video is simply stored at an HTTP server as an ordinary 
+file with a specific URL. When a user wants to see the video, the client establishes 
+a TCP connection with the server and issues an HTTP GET request for that URL. 
+The server then sends the video file, within an HTTP response message, as quickly 
+as the underlying network protocols and traffic conditions will allow. On the client 
+side, the bytes are collected in a client application buffer. Once the number of bytes 
+in this buffer exceeds a predetermined threshold, the client application begins playback—specifically, the streaming video application periodically grabs video frames 
+from the client application buffer, decompresses the frames, and displays them on 
+the user’s screen. Thus, the video streaming application is displaying video as it is 
+receiving and buffering frames corresponding to latter parts of the video.
+Although HTTP streaming, as described in the previous paragraph, has been 
+extensively deployed in practice (for example, by YouTube since its inception), it has 
+a major shortcoming: All clients receive the same encoding of the video, despite the 
+large variations in the amount of bandwidth available to a client, both across different 
+clients and also over time for the same client. This has led to the development of a new 
+type of HTTP-based streaming, often referred to as Dynamic Adaptive Streaming 
+over HTTP (DASH). In DASH, the video is encoded into several different versions, 
+with each version having a different bit rate and, correspondingly, a different quality 
+level. The client dynamically requests chunks of video segments of a few seconds in 
+length. When the amount of available bandwidth is high, the client naturally selects 
+chunks from a high-rate version; and when the available bandwidth is low, it naturally 
+selects from a low-rate version. The client selects different chunks one at a time with 
+HTTP GET request messages [Akhshabi 2011].
+DASH allows clients with different Internet access rates to stream in video at 
+different encoding rates. Clients with low-speed 3G connections can receive a low 
+bit-rate (and low-quality) version, and clients with fiber connections can receive a 
+high-quality version. DASH also allows a client to adapt to the available bandwidth 
+if the available end-to-end bandwidth changes during the session. This feature is particularly important for mobile users, who typically see their bandwidth availability fluctuate as they move with respect to the base stations.
+With DASH, each video version is stored in the HTTP server, each with a different URL. The HTTP server also has a manifest file, which provides a URL for each 
+version along with its bit rate. The client first requests the manifest file and learns 
+about the various versions. The client then selects one chunk at a time by specifying a 
+URL and a byte range in an HTTP GET request message for each chunk. While downloading chunks, the client also measures the received bandwidth and runs a rate determination algorithm to select the chunk to request next. Naturally, if the client has a lot 
+of video buffered and if the measured receive bandwidth is high, it will choose a chunk 
+from a high-bitrate version. And naturally if the client has little video buffered and the 
+measured received bandwidth is low, it will choose a chunk from a low-bitrate version. 
+DASH therefore allows the client to freely switch among different quality levels.
+Today, many Internet video companies are distributing on-demand multi-Mbps 
+streams to millions of users on a daily basis. YouTube, for example, with a library 
+of hundreds of millions of videos, distributes hundreds of millions of video streams 
+to users around the world every day. Streaming all this traffic to locations all over 
+the world while providing continuous playout and high interactivity is clearly a challenging task.
+For an Internet video company, perhaps the most straightforward approach to 
+providing streaming video service is to build a single massive data center, store all 
+of its videos in the data center, and stream the videos directly from the data center 
+to clients worldwide. But there are three major problems with this approach. First, if 
+the client is far from the data center, server-to-client packets will cross many communication links and likely pass through many ISPs, with some of the ISPs possibly 
+located on different continents. If one of these links provides a throughput that is less 
+than the video consumption rate, the end-to-end throughput will also be below the 
+consumption rate, resulting in annoying freezing delays for the user. (Recall from 
+Chapter 1 that the end-to-end throughput of a stream is governed by the throughput 
+at the bottleneck link.) The likelihood of this happening increases as the number of 
+links in the end-to-end path increases. A second drawback is that a popular video will 
+likely be sent many times over the same communication links. Not only does this 
+waste network bandwidth, but the Internet video company itself will be paying its 
+provider ISP (connected to the data center) for sending the same bytes into the Internet over and over again. A third problem with this solution is that a single data center 
+represents a single point of failure—if the data center or its links to the Internet goes 
+down, it would not be able to distribute any video streams.
+In order to meet the challenge of distributing massive amounts of video data 
+to users distributed around the world, almost all major video-streaming companies 
+make use of Content Distribution Networks (CDNs). A CDN manages servers in multiple geographically distributed locations, stores copies of the videos (and other 
+types of Web content, including documents, images, and audio) in its servers, and 
+attempts to direct each user request to a CDN location that will provide the best user 
+experience. The CDN may be a private CDN, that is, owned by the content provider 
+itself; for example, Google’s CDN distributes YouTube videos and other types of 
+content. The CDN may alternatively be a third-party CDN that distributes content 
+on behalf of multiple content providers; Akamai, Limelight and Level-3 all operate 
+third-party CDNs. A very readable overview of modern CDNs is [Leighton 2009; 
+Nygren 2010].
+CDNs typically adopt one of two different server placement philosophies 
+[Huang 2008]:
+Enter Deep. One philosophy, pioneered by Akamai, is to enter deep into the 
+access networks of Internet Service Providers, by deploying server clusters in 
+access ISPs all over the world. (Access networks are described in Section 1.3.) 
+Akamai takes this approach with clusters in thousands of locations. The goal is 
+to get close to end users, thereby improving user-perceived delay and throughput 
+by decreasing the number of links and routers between the end user and the CDN 
+server from which it receives content. Because of this highly distributed design, 
+the task of maintaining and managing the clusters becomes challenging.
+Bring Home. A second design philosophy, taken by Limelight and many 
+other CDN companies, is to bring the ISPs home by building large clusters 
+at a smaller number (for example, tens) of sites. Instead of getting inside the 
+access ISPs, these CDNs typically place their clusters in Internet Exchange 
+Points (IXPs) (see Section 1.3). Compared with the enter-deep design philosophy, the bring-home design typically results in lower maintenance and 
+management overhead, possibly at the expense of higher delay and lower 
+throughput to end users.
+Once its clusters are in place, the CDN replicates content across its clusters. The 
+CDN may not want to place a copy of every video in each cluster, since some videos 
+are rarely viewed or are only popular in some countries. In fact, many CDNs do not 
+push videos to their clusters but instead use a simple pull strategy: If a client requests 
+a video from a cluster that is not storing the video, then the cluster retrieves the 
+video (from a central repository or from another cluster) and stores a copy locally 
+while streaming the video to the client at the same time. Similar Web caching (see 
+Section 2.2.5), when a cluster’s storage becomes full, it removes videos that are not 
+frequently requested.
