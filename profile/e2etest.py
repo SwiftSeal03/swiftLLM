@@ -51,8 +51,6 @@ async def run_throughput_test(
 ):
     promptlen = len(tokenizer.encode(prompt))
     data_file = f"../data/d0920/{nrequests}-{promptlen}-{output_len}-{gpu_only}.json"
-    if os.path.exists(data_file):
-        return
     
     logger.info(f"Throughput test: input_len={promptlen}, output_len={output_len}, nrequests={nrequests}, gpu_only={gpu_only}")
     engine.engine_config.always_use_gpu = gpu_only
@@ -133,14 +131,13 @@ async def main():
     
     print([len(tokenizer.encode(prompt)) for prompt in prompts])
 
-    # await warm_up(prompts[4], engine, tokenizer)
+    await warm_up(prompts[4], engine, tokenizer)
 
     for prompt in prompts:
         if len(tokenizer.encode(prompt)) == 2203:
-            for outlen in range(50, 100, 10):
-                if outlen == 70:
-                    await run_throughput_test(1000, prompt, outlen, False, engine, tokenizer)
-                    # await run_throughput_test(1000, prompt, outlen, True, engine, tokenizer)
+            for outlen in range(60, 100, 10):
+                await run_throughput_test(1000, prompt, outlen, False, engine, tokenizer)
+                await run_throughput_test(1000, prompt, outlen, True, engine, tokenizer)
     # for rate in [8, 10]:
     #     await run_latency_test(1200, prompt, 40, rate, True, engine, tokenizer)
     #     await run_latency_test(1200, prompt, 40, rate, False, engine, tokenizer)

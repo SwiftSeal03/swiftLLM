@@ -18,8 +18,8 @@ def _fwd_paged_attention_phase1(
     q: torch.Tensor,    	# [num_decoding_seqs, num_q_heads, head_dim], contiguous
     k: torch.Tensor,		# [num_decoding_seqs, num_kv_heads, head_dim], contiguous
     v: torch.Tensor,		# [num_decoding_seqs, num_kv_heads, head_dim], contiguous
-    k_cache: torch.Tensor,	# [num_blocks, num_layers, num_kv_heads, block_size, head_dim], contiguous
-    v_cache: torch.Tensor,	# [num_blocks, num_layers, num_kv_heads, block_size, head_dim], contiguous
+    k_cache: torch.Tensor,	# [num_layers, num_blocks, num_kv_heads, block_size, head_dim], contiguous
+    v_cache: torch.Tensor,	# [num_layers, num_blocks, num_kv_heads, block_size, head_dim], contiguous
     block_table: torch.Tensor,  # [*, max_blocks_per_seq], contiguous
     softmax_scale: tl.float16,
     decoding_seq_lens: torch.Tensor,	# [num_decoding_seqs], contiguous
@@ -27,7 +27,7 @@ def _fwd_paged_attention_phase1(
     num_seq_blocks: int,
     cur_layer: int,
 
-    num_layers: tl.constexpr,
+    num_blocks: tl.constexpr,
     num_q_heads: tl.constexpr,
     num_kv_heads: tl.constexpr,
     num_my_heads: tl.constexpr,
@@ -54,8 +54,8 @@ def _fwd_paged_attention_phase1(
     my_q = tl.load(q + offs_q) # [head_dim]    
 
     start_block_idx = my_seq_block_id*(seq_block_size//block_size)
-    k_ptrs = k_cache + (cur_layer*num_kv_heads+my_kv_head_id)*block_size*head_dim + tl.arange(0, block_size)[:, None]*head_dim + tl.arange(0, head_dim)[None, :]
-    v_ptrs = v_cache + (cur_layer*num_kv_heads+my_kv_head_id)*block_size*head_dim + tl.arange(0, block_size)[:, None]*head_dim + tl.arange(0, head_dim)[None, :]
+    k_ptrs = k_cache + (cur_layer*num_blocks*num_kv_heads+my_kv_head_id)*block_size*head_dim + tl.arange(0, block_size)[:, None]*head_dim + tl.arange(0, head_dim)[None, :]
+    v_ptrs = v_cache + (cur_layer*num_blocks*num_kv_heads+my_kv_head_id)*block_size*head_dim + tl.arange(0, block_size)[:, None]*head_dim + tl.arange(0, head_dim)[None, :]
 
     max_score = float("-1e20")
     sum_exp = 0.0
@@ -73,7 +73,7 @@ def _fwd_paged_attention_phase1(
         my_block_offset = (my_seq_len-1) % block_size
         my_block_index = tl.load(block_table + my_seq_id*max_blocks_per_seq + my_block_pos).to(tl.int64)
         offs_kv = (my_batch_id * num_kv_heads + my_kv_head_id) * head_dim + tl.arange(0, head_dim)
-        offs_kvcache = (((my_block_index * num_layers + cur_layer) * num_kv_heads + my_kv_head_id) * block_size + my_block_offset) * head_dim + tl.arange(0, head_dim)
+        offs_kvcache = (((cur_layer*num_blocks + my_block_index) * num_kv_heads + my_kv_head_id) * block_size + my_block_offset) * head_dim + tl.arange(0, head_dim)
         tl.store(k_cache + offs_kvcache, tl.load(k + offs_kv))
         tl.store(v_cache + offs_kvcache, tl.load(v + offs_kv))
         
@@ -86,12 +86,12 @@ def _fwd_paged_attention_phase1(
         for block_i in range(0, my_num_blocks):
             block_idx = start_block_idx + block_i
             block_index = tl.load(block_table + my_seq_id*max_blocks_per_seq + block_idx).to(tl.int64)
-            k_block = tl.load(k_ptrs + block_index*num_layers*num_kv_heads*block_size*head_dim) # [block_size, head_dim]
+            k_block = tl.load(k_ptrs + block_index*num_kv_heads*block_size*head_dim) # [block_size, head_dim]
             attn_score = tl.sum(my_q[None, :] * k_block, axis=1) # [block_size]
             attn_score = attn_score * softmax_scale
             offs_token = block_i*block_size + my_start_token_idx + tl.arange(0, block_size)
             attn_score = tl.where(offs_token < my_seq_len, attn_score, float('-1e20'))
-            v_block = tl.load(v_ptrs + block_index*num_layers*num_kv_heads*block_size*head_dim) # [block_size, head_dim]
+            v_block = tl.load(v_ptrs + block_index*num_kv_heads*block_size*head_dim) # [block_size, head_dim]
             
             cur_max_score = tl.max(attn_score, axis=0)
             new_max_score = tl.maximum(max_score, cur_max_score)
@@ -106,10 +106,10 @@ def _fwd_paged_attention_phase1(
         for block_i in tl.static_range(0, seq_block_size // block_size):
             block_idx = start_block_idx + block_i
             block_index = tl.load(block_table + my_seq_id*max_blocks_per_seq + block_idx).to(tl.int64)
-            k_block = tl.load(k_ptrs + block_index*num_layers*num_kv_heads*block_size*head_dim) # [block_size, head_dim]
+            k_block = tl.load(k_ptrs + block_index*num_kv_heads*block_size*head_dim) # [block_size, head_dim]
             attn_score = tl.sum(my_q[None, :] * k_block, axis=1) # [block_size]
             attn_score = attn_score * softmax_scale
-            v_block = tl.load(v_ptrs + block_index*num_layers*num_kv_heads*block_size*head_dim) # [block_size, head_dim]
+            v_block = tl.load(v_ptrs + block_index*num_kv_heads*block_size*head_dim) # [block_size, head_dim]
             
             cur_max_score = tl.max(attn_score, axis=0)
             new_max_score = tl.maximum(max_score, cur_max_score)
@@ -193,7 +193,7 @@ def paged_attention(
 
     num_q_heads = q.shape[1]
     head_dim = q.shape[2]
-    num_layers = k_cache.shape[1]
+    num_blocks = k_cache.shape[1]
     num_kv_heads = k_cache.shape[2]
     block_size = k_cache.shape[3]
     block_table_width = block_table.shape[1]
@@ -236,7 +236,7 @@ def paged_attention(
             num_seq_blocks,
             cur_layer,
 
-            num_layers,
+            num_blocks,
             num_q_heads,
             num_kv_heads,
             num_q_heads // num_kv_heads,

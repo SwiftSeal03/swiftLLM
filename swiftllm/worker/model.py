@@ -172,8 +172,8 @@ class LlamaModel:
 
         # Initialize KV cache
         kvcache_shape = (
-            self.num_blocks,
             self.model_config.num_layers,
+            self.num_blocks,
             self.model_config.num_kv_heads,
             self.engine_config.block_size,
             self.model_config.head_dim
@@ -185,8 +185,8 @@ class LlamaModel:
 
         # Initialize KV swap space
         kvswap_shape = (
-            self.engine_config.num_cpu_blocks,
             self.model_config.num_layers,
+            self.engine_config.num_cpu_blocks,
             self.model_config.num_kv_heads,
             self.engine_config.block_size,
             self.model_config.head_dim
@@ -220,7 +220,8 @@ class LlamaModel:
             self.cpu_block_manager
         )
 
-        self.transformer_layers[-1].set_swapper(self.swapper)
+        for layer in self.transformer_layers:
+            layer.set_swapper(self.swapper)
 
     def _init_to_get_rotary(self):
         rope_scaling_factor = self.model_config.rope_scaling
@@ -456,6 +457,8 @@ class LlamaModel:
             self.cpu_block_manager.block_table if not self.engine_config.ignore_kvcache else None
         )
 
+        src_block_ids, dst_block_ids = self.swapper.initiate_swap_out(pre_swap_out) if pre_swap_out else ([], [])
+
         if self.engine_config.monitor_performance:
             forward_s_event = torch.cuda.Event(enable_timing=True)
             forward_s_event.record()
@@ -487,7 +490,8 @@ class LlamaModel:
             q1, k1, v1 = layer.forward_double(
                 q1, k1, v1, 
                 input_embds0, input_embds1, residual_buf0, residual_buf1,
-                kvargs, infer_states
+                kvargs, infer_states,
+                src_block_ids, dst_block_ids
             )
 
         if self.engine_config.monitor_performance:
@@ -498,7 +502,7 @@ class LlamaModel:
         f0, f1 = self.transformer_layers[-1].forward_last_stage(
             q1, k1, v1, input_embds0, input_embds1, residual_buf0, residual_buf1,
             kvargs, infer_states,
-            pre_swap_out
+            src_block_ids, dst_block_ids
         )
 
         if self.engine_config.monitor_performance:
@@ -581,8 +585,10 @@ class LlamaModel:
         """
         Swap in (move blocks from CPU to GPU) the specified sequences.
         """
+        src_block_ids, dst_block_ids = self.swapper.initiate_swap_in(seq_ids_list)
         with torch.cuda.stream(self.cpu_communication_stream):
-            self.swapper.swap_in_seqs(seq_ids_list)
+            for layer_id in range(len(self.transformer_layers)):
+                self.swapper.swap_in_blocks(layer_id, src_block_ids, dst_block_ids)
     
     @torch.inference_mode()
     def swap_out_seqs(
@@ -592,8 +598,10 @@ class LlamaModel:
         """
         Swap out (move blocks from GPU to CPU) the specified sequences.
         """
+        src_block_ids, dst_block_ids = self.swapper.initiate_swap_out(seq_ids_list)
         with torch.cuda.stream(self.cpu_communication_stream):
-            self.swapper.swap_out_seqs(seq_ids_list)
+            for layer_id in range(len(self.transformer_layers)):
+                self.swapper.swap_out_blocks(layer_id, src_block_ids, dst_block_ids)
 
     @torch.inference_mode()
     def free_seqs_resources(self, seq_ids_list: list[int]):

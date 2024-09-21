@@ -194,8 +194,8 @@ template<int NUM_KV_HEADS>
 __global__ void prefill_store_kvcache_Kernel(
 	const half* __restrict__ k, // [num_tokens, num_heads, head_dim]
 	const half* __restrict__ v, // [num_tokens, num_heads, head_dim]
-	half* __restrict__ k_cache, // [... , num_layers, num_kv_heads, block_size, head_dim]
-	half* __restrict__ v_cache, // [... , num_layers, num_kv_heads, block_size, head_dim]
+	half* __restrict__ k_cache, // [... , num_blocks, num_kv_heads, block_size, head_dim]
+	half* __restrict__ v_cache, // [... , num_blocks, num_kv_heads, block_size, head_dim]
 	const int32_t* __restrict__ block_table,
 	const int32_t* __restrict__ seq_ids,
 	const int32_t* __restrict__ seq_start_locs,
@@ -203,7 +203,7 @@ __global__ void prefill_store_kvcache_Kernel(
 	const int64_t cur_layer,
 	const int64_t block_size,
 	const int64_t block_table_width,
-	const int64_t num_layers,
+	const int64_t num_blocks,
 	const int64_t head_dim
 ) {
 	const int64_t batch_pos = blockIdx.x;
@@ -222,7 +222,7 @@ __global__ void prefill_store_kvcache_Kernel(
 		int64_t src_off = 
 			(seq_start_loc + block_pos * block_size + i) * NUM_KV_HEADS * head_dim + threadIdx.x;
 		int64_t dst_off = 
-			((block_idx * num_layers + cur_layer) * NUM_KV_HEADS * block_size + i) * head_dim + threadIdx.x;
+			((cur_layer * num_blocks + block_idx) * NUM_KV_HEADS * block_size + i) * head_dim + threadIdx.x;
 		#pragma unroll
 		for (int j = 0; j < NUM_KV_HEADS; j++) {
 			k_cache[dst_off] = k[src_off];
@@ -237,7 +237,7 @@ __global__ void prefill_store_kvcache_Kernel(
 	prefill_store_kvcache_Kernel<kvh><<<grid, block_dim_x>>>( \
 		k_p, v_p, k_cache_p, v_cache_p, \
 		block_table_p, seq_ids_p, seq_start_locs_p, seq_lens_p, \
-		cur_layer, block_size, block_table_width, num_layers, head_dim \
+		cur_layer, block_size, block_table_width, num_blocks, head_dim \
 	);
 
 void store_kvcache(
@@ -252,7 +252,7 @@ void store_kvcache(
   const int64_t cur_layer,
   const int64_t max_prefill_len
 ) {
-	const int64_t num_layers = k_cache.size(1);
+	const int64_t num_blocks = k_cache.size(1);
 	const int64_t num_kv_heads = k_cache.size(2);
 	const int64_t block_size = k_cache.size(3);
 	const int64_t head_dim = k_cache.size(4);

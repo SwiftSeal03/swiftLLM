@@ -132,6 +132,7 @@ class Swapper:
         self.v_swap = v_swap
         self.gpu_block_manager = gpu_block_manager
         self.cpu_block_manager = cpu_block_manager
+        self.num_layers = k_cache.size(0)
 
     def _initiate_swap(
         self,
@@ -156,37 +157,64 @@ class Swapper:
         self,
         src_block_ids: list[int],
         dst_block_ids: list[int],
-        is_swap_in: bool, 
+        is_swap_in: bool,
+        cur_layer: int
     ):
         swiftllm_c.swap_blocks(
             src_block_ids,
             dst_block_ids,
             is_swap_in,
+            cur_layer,
 
             self.k_cache, self.v_cache,
             self.k_swap, self.v_swap
         )
         
     @torch.inference_mode()
-    def swap_in_seqs(
+    def initiate_swap_in(
         self,
         seq_ids_list: list[int]
+    ):
+        """
+        Do all the set-up work for swapping in sequences.
+        Returns src and dst block ids.
+        """
+        return self._initiate_swap(seq_ids_list, True)
+
+    @torch.inference_mode()
+    def initiate_swap_out(
+        self,
+        seq_ids_list: list[int]
+    ):
+        """
+        Do all the set-up work for swapping out sequences.
+        Returns src and dst block ids.
+        """
+        return self._initiate_swap(seq_ids_list, False)
+
+
+    @torch.inference_mode()
+    def swap_in_blocks(
+        self,
+        cur_layer: int,
+        src_block_ids: list[int],
+        dst_block_ids: list[int]
     ):
         """
         Swap in (move blocks from CPU to GPU) the specified sequences.
         """
-        src_block_ids, dst_block_ids = self._initiate_swap(seq_ids_list, True)
-        self._swap(src_block_ids, dst_block_ids, True)
+        self._swap(src_block_ids, dst_block_ids, True, cur_layer)
     
     @torch.inference_mode()
-    def swap_out_seqs(
+    def swap_out_blocks(
         self,
-        seq_ids_list: list[int]
+        cur_layer: int,
+        src_block_ids: list[int],
+        dst_block_ids: list[int]
     ):
         """
         Swap out (move blocks from GPU to CPU) the specified sequences.
         """
-        src_block_ids, dst_block_ids = self._initiate_swap(seq_ids_list, False)
-        self._swap(src_block_ids, dst_block_ids, False)
+        self._swap(src_block_ids, dst_block_ids, False, cur_layer)
     
     

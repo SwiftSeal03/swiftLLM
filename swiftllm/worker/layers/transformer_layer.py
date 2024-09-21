@@ -301,7 +301,9 @@ class LlamaTransformerLayer:
         v1: torch.Tensor,  # [num_tokens, num_kv_heads, head_dim]
         kvargs: KVCacheArgs,
         infer_states: list[LlamaInferState],
-        cur_stage: int
+        cur_stage: int,
+        src_block_ids: list[int],
+        dst_block_ids: list[int]
     ) -> tuple[torch.Tensor]:
         """
         Do 1 pipeline stage:
@@ -323,6 +325,10 @@ class LlamaTransformerLayer:
         del f0
 
         self.events[cur_stage].linear_e.record()
+        
+        if src_block_ids:
+            with torch.cuda.stream(self.cpu_communication_stream):
+                self.swapper.swap_out_blocks(self.layer_id, src_block_ids, dst_block_ids)
 
         self._attention(
             o1, q1, k1, v1,
@@ -342,6 +348,8 @@ class LlamaTransformerLayer:
         residual_buf1: torch.Tensor, # [num_tokens, hidden_size]
         kvargs: KVCacheArgs,
         infer_states: list[LlamaInferState],
+        src_block_ids: list[int],
+        dst_block_ids: list[int]
     ) -> tuple[torch.Tensor]:
         """
         Do all jobs for 1 transformer layer for 2 batches
@@ -354,11 +362,11 @@ class LlamaTransformerLayer:
         rev_infer_states = infer_states[::-1]
         q0, k0, v0 = self._forward_pipeline_stage(
             o0, residual_buf0, o1, q1, k1, v1, 
-            kvargs, infer_states, cur_stage=0
+            kvargs, infer_states, 0, [], []
         )
         q1, k1, v1 = self._forward_pipeline_stage(
             o1, residual_buf1, o0, q0, k0, v0,
-            kvargs, rev_infer_states, cur_stage=1
+            kvargs, rev_infer_states, 1, src_block_ids, dst_block_ids
         )
 
         return q1, k1, v1
@@ -402,7 +410,8 @@ class LlamaTransformerLayer:
         residual_buf1: torch.Tensor, # [num_tokens, hidden_size]
         kvargs: KVCacheArgs,
         infer_states: list[LlamaInferState],
-        swap_out_seq_ids: list[int] | None,
+        src_block_ids: list[int],
+        dst_block_ids: list[int]
     ) -> tuple[torch.Tensor]:
         """
         Do the last stage of the pipeline for 2 batches
@@ -419,9 +428,9 @@ class LlamaTransformerLayer:
             kvargs, infer_states[1], cur_stage=0
         )
         # Initiate swap out, this is safe because we won't use KV-cache until first stage of next iteration
-        if swap_out_seq_ids:
+        if src_block_ids:
             with torch.cuda.stream(self.cpu_communication_stream):
-                self.swapper.swap_out_seqs(swap_out_seq_ids)
+                self.swapper.swap_out_blocks(self.layer_id, src_block_ids, dst_block_ids)
         f1 = self._postproj(o1, residual_buf1)
         return f0, f1
     
