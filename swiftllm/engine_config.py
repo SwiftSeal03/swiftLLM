@@ -35,6 +35,10 @@ class EngineConfig:
     @property
     def max_seq_len(self) -> int:
         return self.block_size * self.max_blocks_per_seq
+    
+    @property
+    def max_tokens_on_cpu(self) -> int:
+        return self.block_size * self.num_cpu_blocks
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):

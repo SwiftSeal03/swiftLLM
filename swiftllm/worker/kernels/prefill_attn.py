@@ -110,7 +110,7 @@ def prefill_attention(
 ):
     is_rtx4090 = '4090' in torch.cuda.get_device_name(0)
     BLOCK_Q = 128 if not is_rtx4090 else 128
-    BLOCK_K = 128 if not is_rtx4090 else 64
+    BLOCK_K = 64
 
     # Here we reduce BLOCK_Q and BLOCK_K, since that when max_prefill_len is
     # small, large block size introduces unnecessary computation when computing

@@ -70,6 +70,9 @@ class RequestIdManager:
         if not self.available_ids:
             raise RuntimeError("No more available request ids. Please try to increase `max_seqs_in_block_table`")
         return self.available_ids.popleft()
+
+    def get_num_available_ids(self) -> int:
+        return len(self.available_ids)
     
     def free_id(self, req_id: int):
         self.available_ids.append(req_id)
@@ -114,12 +117,38 @@ class Scheduler:
         self.num_cpu_blocks = model.cpu_block_manager.num_blocks
 
         # Ensure engine can always prefill a sequence
+        assert self.engine_config.max_prefill_tokens <= self.engine_config.max_tokens_in_batch, \
+            f"max_prefill_tokens {self.engine_config.max_prefill_tokens} exceeds max_tokens_in_batch {self.engine_config.max_tokens_in_batch}"
+        assert self.engine_config.max_batch_size <= self.engine_config.max_tokens_in_batch, \
+            f"max_batch_size {self.engine_config.max_batch_size} exceeds max_tokens_in_batch {self.engine_config.max_tokens_in_batch}"
+        assert self.engine_config.max_batch_size <= self.engine_config.max_seqs_in_block_table, \
+            f"max_batch_size {self.engine_config.max_batch_size} exceeds max_seqs_in_block_table {self.engine_config.max_seqs_in_block_table}"
         
         profiler = ModelProfiler(model)
-        linr_S_list = list(range(32, 512, 32)) + list(range(512, self.engine_config.max_seq_len + 512, 512))
+        linr_S_list = [2 ** i for i in range(
+            (self.engine_config.block_size - 1).bit_length(),
+            (self.engine_config.max_tokens_in_batch - 1).bit_length(),
+        )] + [self.engine_config.max_tokens_in_batch]
         linr_T_list = profiler.profile_linear(linr_S_list)
-        cdec_S_list = [2 ** i - 1 for i in range(6, self.engine_config.max_batch_size.bit_length() + 1)]
-        cdec_N_list = [2 ** i for i in range(13, 18)] + [200000]
+
+        cdec_S_list = [2 ** i for i in range(
+            ((self.engine_config.max_tokens_on_cpu - 1) // self.engine_config.max_seq_len).bit_length(),
+            (self.engine_config.max_batch_size - 1).bit_length()
+        )] + [self.engine_config.max_batch_size]
+        cdec_N_list = [2 ** i for i in range(
+            ((self.engine_config.max_batch_size * self.engine_config.block_size) - 1).bit_length(),
+            (self.engine_config.max_tokens_on_cpu - 1).bit_length()
+        )] + [self.engine_config.max_tokens_on_cpu]
+
+        assert all(cdec_S_list[i] < cdec_S_list[i+1] for i in range(len(cdec_S_list)-1)), f"cdec_S_list {cdec_S_list} is not strictly increasing"
+        assert all(cdec_N_list[i] < cdec_N_list[i+1] for i in range(len(cdec_N_list)-1)), f"cdec_N_list {cdec_N_list} is not strictly increasing"
+        assert cdec_S_list[-1] <= self.engine_config.max_batch_size, f"cdec_S_list {cdec_S_list} exceeds max_batch_size {self.engine_config.max_batch_size}"
+        assert cdec_N_list[-1] <= self.engine_config.max_tokens_on_cpu, f"cdec_N_list {cdec_N_list} exceeds max_tokens_on_cpu {self.engine_config.max_tokens_on_cpu}"
+        assert (cdec_N_list[-1] - 1) // cdec_S_list[0] + 1 <= self.engine_config.max_seq_len, \
+            f"max_seq_len {self.engine_config.max_seq_len} is not enough for cdec_S_list[0] {cdec_S_list[0]} and cdec_N_list[-1] {cdec_N_list[-1]}"
+        assert cdec_N_list[0] // cdec_S_list[-1] >= self.engine_config.block_size, \
+            f"block_size {self.engine_config.block_size} is not enough for cdec_S_list[-1] {cdec_S_list[-1]} and cdec_N_list[0] {cdec_N_list[0]}"
+
         cdec_T_list = profiler.profile_cpu_attn(cdec_S_list, cdec_N_list)
         del profiler
 
@@ -168,8 +197,7 @@ class Scheduler:
         using bilinear interpolation
         """
         assert S <= self.cdec_S_arr[-1], f"CPU batch size {S} exceeds the maximum {self.cdec_S_arr[-1]}"
-        # NOTE: We don't check N because it can be arbitrarily large, in that case we just use the last value
-        # assert N <= self.cdec_N_arr[-1], f"Number of tokens {N} exceeds the maximum {self.cdec_N_arr[-1]}"
+        assert N <= self.cdec_N_arr[-1], f"Number of tokens {N} exceeds the maximum {self.cdec_N_arr[-1]}"
         if S == 0:
             return 0.0
         idx = np.searchsorted(self.cdec_S_arr, S)
@@ -333,6 +361,7 @@ class Scheduler:
             cur_block_needed = self._get_block_needed(candidate)
             if gpu_block_needed + cur_block_needed > self.num_gpu_blocks or \
                (self.cpu_decoding_q and cpu_block_needed + cur_block_needed > cpu_threshold) or \
+               self.request_id_manager.get_num_available_ids() == 0 or \
                not budget.check_and_substract(candidate.prompt_len, True):
                 break
             gpu_block_needed += cur_block_needed
