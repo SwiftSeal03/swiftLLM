@@ -13,33 +13,20 @@ class ModelProfiler:
   @torch.inference_mode()
   def __init__(
     self, 
-    model: LlamaModel, 
-    base_tokens: list[int] | None = None,
+    model: LlamaModel,
     nwarmup: int = 2,
     nrepeat: int = 3
   ):
     self.model = model
-    self.base_tokens = base_tokens
     self.nrepeat = nrepeat
     self.nwarmup = nwarmup
-
-    if not self.base_tokens:
-      # Use dummy tokens
-      self.base_tokens = [10] * model.engine_config.max_seq_len
     
     os.makedirs(model.engine_config.profile_result_path, exist_ok=True)
-
-    print("[ModelProfiler] Initializing base KV entries")
-    self.model.forward(ModelForwardArgs(
-      [self.base_tokens],
-      [0],
-      []
-    ))
   
   @torch.inference_mode()
   def __del__(self):
     self.model.engine_config.monitor_performance = False
-    self.model.free_seqs_resources([0])
+    # self.model.free_seqs_resources([0])
 
   @torch.inference_mode()
   def _gpu_fake_prefill(
@@ -55,28 +42,22 @@ class ModelProfiler:
     We simple allocate and copy corresponding KV entries.
     """
 
-    assert all(0 < seq_id for seq_id in seq_ids), "Sequence ids must be positive"
+    assert all(0 <= seq_id for seq_id in seq_ids), "Sequence ids must be positive"
 
     seq_ids = torch.tensor(seq_ids, dtype=torch.int32, device="cuda")
     seq_lens = torch.tensor(seq_lens, dtype=torch.int32, device="cuda")
 
     self.model.gpu_block_manager.allocate_blocks_for_seqs(seq_ids, seq_lens)
 
-    nbase_blocks = (len(self.base_tokens) - 1) // self.model.engine_config.block_size + 1
-    base_block_table = self.model.gpu_block_manager.block_table[0][:nbase_blocks]
-
-    base_k = self.model.k_cache[base_block_table]
-    base_v = self.model.v_cache[base_block_table]
-
     block_size = self.model.engine_config.block_size
     nblocks = [(seq_len - 1) // block_size + 1 for seq_len in seq_lens]
 
     for i, seq_id in enumerate(seq_ids):
       nblock = nblocks[i]
-      assert nblock <= nbase_blocks, f"Sequence {seq_id} has {nblock} blocks, but only {nbase_blocks} are available"
       block_ids = self.model.gpu_block_manager.block_table[seq_id][:nblock]
-      self.model.k_cache[block_ids] = base_k[:nblock]
-      self.model.v_cache[block_ids] = base_v[:nblock]
+      for layer_id in range(self.model.model_config.num_layers):
+        self.model.k_cache[layer_id, block_ids].random_().normal_()
+        self.model.v_cache[layer_id, block_ids].random_().normal_()
 
   @torch.inference_mode()
   def _cpu_fake_prefill(
@@ -123,8 +104,7 @@ class ModelProfiler:
     all_prefill_ids = []
     all_decode_ids = []
 
-    # Seq 0 is the base tokens
-    offs = 1
+    offs = 0
     for _ in range(2 if use_pipeline else 1):
       prefill_ids = list(range(offs, offs + npref))
       gpu_decode_ids = list(range(offs + npref, offs + npref + ngdec))
@@ -139,13 +119,14 @@ class ModelProfiler:
       if ngdec > 0:
         self._gpu_fake_prefill(gpu_decode_ids, gpu_decode_lens)
 
-      input_ids = [
-        self.base_tokens[:seq_len] for seq_len in prefill_lens
-      ] + [
-        [self.base_tokens[seq_len - 1]] for seq_len in gpu_decode_lens
-      ] + [
-        [self.base_tokens[seq_len - 1]] for seq_len in cpu_decode_lens
-      ]
+      input_ids = [[10] * seq_len for seq_len in prefill_lens] + [[10]] * (ngdec + ncdec)
+      # input_ids = [
+      #   self.base_tokens[:seq_len] for seq_len in prefill_lens
+      # ] + [
+      #   [self.base_tokens[seq_len - 1]] for seq_len in gpu_decode_lens
+      # ] + [
+      #   [self.base_tokens[seq_len - 1]] for seq_len in cpu_decode_lens
+      # ]
 
       argss.append(ModelForwardArgs(
         input_ids,
@@ -184,7 +165,7 @@ class ModelProfiler:
     """
     Profile model's linear part performance.
     """
-    print(f"Profiling linear part ...")
+    print(f"Profiling linear part with S_list={S_list} ...")
     result_path = self.model.engine_config.profile_result_path + "linear.json"
 
     if os.path.exists(result_path):
@@ -224,7 +205,7 @@ class ModelProfiler:
     """
     Profile model's CPU attention part performance.
     """
-    print(f"Profiling CPU attention part ...")
+    print(f"Profiling CPU attention part with S_list={S_list}, N_list={N_list} ...")
     result_path = self.model.engine_config.profile_result_path + "cpu_attn.json"
 
     if os.path.exists(result_path):
@@ -232,16 +213,17 @@ class ModelProfiler:
         res = json.load(f)
         if res["S_list"] == S_list and res["N_list"] == N_list:
           return res["T_list"]
-
-    print(f"S_list: {S_list}, N_list: {N_list}")
-
+        
     T_list = []
+    block_size = self.model.engine_config.block_size
+    assert all(N % block_size == 0 for N in N_list), "N must be divisible by block size"
     for S in tqdm(S_list):
       T_list.append([])
       for N in N_list:
+        NB = N // block_size
         T_list[-1].append(self._run_test_case(
           # Divide N into S segments as even as possible
-          cpu_decode_lens=[N // S] * (S - N % S) + [N // S + 1] * (N % S),
+          cpu_decode_lens=[NB // S * block_size] * (S - NB % S) + [(NB // S + 1) * block_size] * (NB % S),
         ).avg_cpu_attn_time)
 
     T_array = np.array(T_list)
