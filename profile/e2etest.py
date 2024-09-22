@@ -50,7 +50,7 @@ async def run_throughput_test(
     tokenizer: AutoTokenizer
 ):
     promptlen = len(tokenizer.encode(prompt))
-    data_file = f"../data/d0920/{nrequests}-{promptlen}-{output_len}-{gpu_only}.json"
+    data_file = f"../data/d0921/{nrequests}-{promptlen}-{output_len}-{gpu_only}.json"
     
     logger.info(f"Throughput test: input_len={promptlen}, output_len={output_len}, nrequests={nrequests}, gpu_only={gpu_only}")
     engine.engine_config.always_use_gpu = gpu_only
@@ -60,7 +60,7 @@ async def run_throughput_test(
         tasks.append(task)
     times = await asyncio.gather(*tasks)
     times = [end for _, end in times]
-    with open(f"../data/d0920/{nrequests}-{promptlen}-{output_len}-{gpu_only}.json", "w") as f:
+    with open(f"../data/d0921/{nrequests}-{promptlen}-{output_len}-{gpu_only}.json", "w") as f:
         deltas = [times[i] - times[i-1] for i in range(1, len(times))]
         json.dump(deltas, f, indent=4)
     times.sort()
@@ -75,7 +75,7 @@ async def warm_up(
     tokenizer: AutoTokenizer
 ):
     logger.info("Warming up...")
-    await run_throughput_test(300, prompt, 100, False, engine, tokenizer)
+    await run_throughput_test(200, prompt, 50, False, engine, tokenizer)
     logger.info("Warm up complete")
 
 
@@ -88,7 +88,7 @@ async def main():
         "--model-path",
         help="Path to the model. Note: please download the model weights from HuggingFace in advance and specify the path here.",
         type=str,
-        default="/home/ubuntu/weights/Llama-3-8B-Instruct-Gradient-1048k"
+        default="/home/ubuntu/weights/Llama-2-7b-hf"
     )
     parser.add_argument(
         "--streaming",
@@ -105,13 +105,13 @@ async def main():
         
         block_size = 16,
         gpu_mem_utilization = 0.99,
-        num_cpu_blocks = 15000,
-        max_seqs_in_block_table = 1024,
-        max_blocks_per_seq = 512,
+        num_cpu_blocks = 4000,
+        max_seqs_in_block_table = 512,
+        max_blocks_per_seq = 48,
 
-        max_batch_size = 512,
-        max_prefill_tokens = 2500,
-        max_tokens_in_batch = 3000,
+        max_batch_size = 256,
+        max_prefill_tokens = 800,
+        max_tokens_in_batch = 900,
 
         library_path="/home/ubuntu/pacpu/build/libpacpu.so",
         profile_result_path="/home/ubuntu/swiftLLM/profile_results/",
@@ -134,7 +134,7 @@ async def main():
     await warm_up(prompts[4], engine, tokenizer)
 
     for prompt in prompts:
-        if len(tokenizer.encode(prompt)) == 2203:
+        if len(tokenizer.encode(prompt)) == 550:
             for outlen in range(60, 100, 10):
                 await run_throughput_test(1000, prompt, outlen, False, engine, tokenizer)
                 await run_throughput_test(1000, prompt, outlen, True, engine, tokenizer)
