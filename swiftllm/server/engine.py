@@ -163,6 +163,7 @@ class Engine:
                 # Pipelined mode
                 reqs = batch[0].get_all_reqs() + batch[1].get_all_reqs()
                 print(f"Using pipelined mode (batch_size = {len(reqs)})")
+                self.engine_config.monitor_performance = True
                 output_tokens = await self._run_on_model_async(self.model.forward_pipeline, argss, pre_swap_out_ids)
 
             # Deal with output tokens

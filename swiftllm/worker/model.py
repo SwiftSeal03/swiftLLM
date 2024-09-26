@@ -353,6 +353,8 @@ class LlamaModel:
             forward_s_event = torch.cuda.Event(enable_timing=True)
             forward_s_event.record()
 
+        src_block_ids, dst_block_ids = self.swapper.initiate_swap_out(pre_swap_out) if pre_swap_out else ([], [])
+
         kvargs = KVCacheArgs(
             self.k_cache,
             self.v_cache,
@@ -382,15 +384,14 @@ class LlamaModel:
                 residual_buf,
                 kvargs,
                 infer_state,
+                src_block_ids,
+                dst_block_ids
             )
         input_embds += residual_buf
 
         if self.engine_config.monitor_performance:
             mainbody_e_event = torch.cuda.Event(enable_timing=True)
             mainbody_e_event.record()
-        
-        if pre_swap_out:
-            self.swap_out_seqs(pre_swap_out)
 
         output_tokens = self.post_layer.forward(input_embds, infer_state)
 

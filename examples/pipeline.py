@@ -38,11 +38,11 @@ if __name__ == '__main__':
         block_size = 16,
         gpu_mem_utilization = 0.995,
         num_cpu_blocks = 4000,
-        max_seqs_in_block_table = 384,
+        max_seqs_in_block_table = 1024,
         max_blocks_per_seq = 512,
 
         # The following are not used in the offline example
-        max_batch_size = 16,
+        max_batch_size = 512,
         max_prefill_tokens = 2048*16,
         max_tokens_in_batch = 2048*16,
 

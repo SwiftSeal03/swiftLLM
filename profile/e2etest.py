@@ -16,7 +16,7 @@ async def send_request_and_wait_non_streaming_mode(engine: swiftllm.Engine, toke
     start = time.perf_counter()
     (_, output_token_ids) = await engine.add_request_and_wait(raw_request)
     end = time.perf_counter()
-    # print(f"Output: {tokenizer.decode(output_token_ids)}")
+    print(f"Output: {tokenizer.decode(output_token_ids)}")
     return start, end
 
 async def run_latency_test(
@@ -50,7 +50,7 @@ async def run_throughput_test(
     tokenizer: AutoTokenizer
 ):
     promptlen = len(tokenizer.encode(prompt))
-    data_file = f"../data/d0920/{nrequests}-{promptlen}-{output_len}-{gpu_only}.json"
+    data_file = f"../data/d0926/{nrequests}-{promptlen}-{output_len}-{gpu_only}.json"
     
     logger.info(f"Throughput test: input_len={promptlen}, output_len={output_len}, nrequests={nrequests}, gpu_only={gpu_only}")
     engine.engine_config.always_use_gpu = gpu_only
@@ -60,7 +60,7 @@ async def run_throughput_test(
         tasks.append(task)
     times = await asyncio.gather(*tasks)
     times = [end for _, end in times]
-    with open(f"../data/d0920/{nrequests}-{promptlen}-{output_len}-{gpu_only}.json", "w") as f:
+    with open(data_file, "w") as f:
         deltas = [times[i] - times[i-1] for i in range(1, len(times))]
         json.dump(deltas, f, indent=4)
     times.sort()
@@ -110,7 +110,7 @@ async def main():
         max_blocks_per_seq = 512,
 
         max_batch_size = 512,
-        max_prefill_tokens = 2500,
+        max_prefill_tokens = 1000,
         max_tokens_in_batch = 3000,
 
         library_path="/home/ubuntu/pacpu/build/libpacpu.so",
@@ -131,13 +131,13 @@ async def main():
     
     print([len(tokenizer.encode(prompt)) for prompt in prompts])
 
-    await warm_up(prompts[4], engine, tokenizer)
+    await warm_up(prompts[6], engine, tokenizer)
 
     for prompt in prompts:
-        if len(tokenizer.encode(prompt)) == 2203:
-            for outlen in range(60, 100, 10):
+        if len(tokenizer.encode(prompt)) == 98:
+            for outlen in range(500, 1500, 500):
                 await run_throughput_test(1000, prompt, outlen, False, engine, tokenizer)
-                await run_throughput_test(1000, prompt, outlen, True, engine, tokenizer)
+                # await run_throughput_test(1000, prompt, outlen, True, engine, tokenizer)
     # for rate in [8, 10]:
     #     await run_latency_test(1200, prompt, 40, rate, True, engine, tokenizer)
     #     await run_latency_test(1200, prompt, 40, rate, False, engine, tokenizer)
