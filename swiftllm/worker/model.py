@@ -194,6 +194,11 @@ class LlamaModel:
         self.k_swap = torch.zeros(kvswap_shape, dtype=torch.float16, device="cpu", pin_memory=True)
         self.v_swap = torch.zeros(kvswap_shape, dtype=torch.float16, device="cpu", pin_memory=True)
 
+        # Initialize CPU QKV buffer
+        self.q_cpu = torch.zeros((self.engine_config.max_batch_size, self.model_config.num_q_heads, self.model_config.head_dim), dtype=torch.float16, device="cpu", pin_memory=True)
+        self.k_cpu = torch.zeros((self.engine_config.max_batch_size, self.model_config.num_kv_heads, self.model_config.head_dim), dtype=torch.float16, device="cpu", pin_memory=True)
+        self.v_cpu = torch.zeros((self.engine_config.max_batch_size, self.model_config.num_kv_heads, self.model_config.head_dim), dtype=torch.float16, device="cpu", pin_memory=True)
+
         # Initialize block manager
         self.gpu_block_manager = BlockManager(
             "cuda",
@@ -353,6 +358,9 @@ class LlamaModel:
             self.v_cache,
             self.k_swap,
             self.v_swap,
+            self.q_cpu,
+            self.k_cpu,
+            self.v_cpu,
             self.gpu_block_manager.block_table if not self.engine_config.ignore_kvcache else None,
             self.cpu_block_manager.block_table if not self.engine_config.ignore_kvcache else None
         )
@@ -453,6 +461,9 @@ class LlamaModel:
             self.v_cache,
             self.k_swap,
             self.v_swap,
+            self.q_cpu,
+            self.k_cpu,
+            self.v_cpu,
             self.gpu_block_manager.block_table if not self.engine_config.ignore_kvcache else None,
             self.cpu_block_manager.block_table if not self.engine_config.ignore_kvcache else None
         )

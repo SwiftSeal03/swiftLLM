@@ -27,6 +27,9 @@ class KVCacheArgs:
     v_cache: torch.Tensor
     k_swap: torch.Tensor
     v_swap: torch.Tensor
+    q_cpu: torch.Tensor
+    k_cpu: torch.Tensor
+    v_cpu: torch.Tensor
     gpu_block_table: torch.Tensor | None
     cpu_block_table: torch.Tensor | None
 
@@ -38,6 +41,7 @@ class TransformerEvents:
         self.gpudec_e = torch.cuda.Event(enable_timing=True)
         self.cpudec_e = torch.cuda.Event(enable_timing=True)
         self.cpudec_s = torch.cuda.Event(enable_timing=True)
+        self.qkvtr_e = torch.cuda.Event(enable_timing=True)
 
     def get_prefill_time(self) -> float:
         return self.stage_s.elapsed_time(self.prefill_e)
@@ -80,6 +84,29 @@ class LlamaTransformerLayer:
 
     def set_swapper(self, swapper):
         self.swapper = swapper
+
+    def _transfer_qkv(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        kvargs: KVCacheArgs,
+        infer_state: LlamaInferState,
+        cur_stage: int = 0
+    ):
+        """
+        Initiate transfer of QKV to CPU buffers
+        """
+        if infer_state.cpu_num_decoding_seqs > 0:
+            with torch.cuda.stream(self.cpu_communication_stream):
+                torch.cuda.current_stream().wait_event(self.events[cur_stage].stage_s)
+                qc = kvargs.q_cpu[:infer_state.cpu_num_decoding_seqs]
+                kc = kvargs.k_cpu[:infer_state.cpu_num_decoding_seqs]
+                vc = kvargs.v_cpu[:infer_state.cpu_num_decoding_seqs]
+                qc.copy_(q[infer_state.gpu_token_end:], non_blocking=True)
+                kc.copy_(k[infer_state.gpu_token_end:], non_blocking=True)
+                vc.copy_(v[infer_state.gpu_token_end:], non_blocking=True)
+                self.events[cur_stage].qkvtr_e.record()
 
     def _preproj(
         self,
@@ -139,6 +166,9 @@ class LlamaTransformerLayer:
         v_cache = kvargs.v_cache
         k_swap = kvargs.k_swap
         v_swap = kvargs.v_swap
+        q_cpu = kvargs.q_cpu
+        k_cpu = kvargs.k_cpu
+        v_cpu = kvargs.v_cpu
         gpu_block_table = kvargs.gpu_block_table
         cpu_block_table = kvargs.cpu_block_table
 
@@ -216,12 +246,8 @@ class LlamaTransformerLayer:
                 
         if infer_state.cpu_num_decoding_seqs > 0:
             with torch.cuda.stream(self.cpu_communication_stream):
-                torch.cuda.current_stream().wait_event(self.events[cur_stage].stage_s)
+                self.events[cur_stage].qkvtr_e.synchronize()
                 self.events[cur_stage].cpudec_s.record()
-                q_cpu = q[infer_state.gpu_token_end:, :, :].to(device='cpu', non_blocking=True)
-                k_cpu = k[infer_state.gpu_token_end:, :, :].to(device='cpu', non_blocking=True)
-                v_cpu = v[infer_state.gpu_token_end:, :, :].to(device='cpu', non_blocking=True)
-                torch.cuda.current_stream().synchronize()
                 oc = o[infer_state.gpu_token_end:, :]
                 o_cpu = torch.empty_like(oc, device='cpu', dtype=torch.float32, pin_memory=True)
                 torch.ops.pacpu.paged_attention_cpu(
@@ -230,9 +256,9 @@ class LlamaTransformerLayer:
                     infer_state.cpu_seq_ids.tolist(),
                     infer_state.cpu_decoding_seq_lens.tolist(),
 
-                    q_cpu,
-                    k_cpu,
-                    v_cpu,
+                    q_cpu[:infer_state.cpu_num_decoding_seqs],
+                    k_cpu[:infer_state.cpu_num_decoding_seqs],
+                    v_cpu[:infer_state.cpu_num_decoding_seqs],
                     k_swap,
                     v_swap,
                     cpu_block_table,
@@ -282,8 +308,12 @@ class LlamaTransformerLayer:
         #        used as the residual after the attention block)
         q, k, v = self._preproj(input_embds, residual_buf, infer_state)
         self.events[0].stage_s.record()
+        self._transfer_qkv(
+            q, k, v, 
+            kvargs, infer_state
+        )
         self._attention(
-            input_embds, q, k, v, 
+            input_embds, q, k, v,
             kvargs, infer_state
         )
         del q, k, v
@@ -319,6 +349,11 @@ class LlamaTransformerLayer:
         
         # Here we put the linear_end_event at the beginning because batch 1 don't need to wait for batch 0's linear
         self.events[cur_stage].stage_s.record()
+
+        self._transfer_qkv(
+            q1, k1, v1, 
+            kvargs, infer_states[1], cur_stage
+        )
 
         f0 = self._postproj(o0, residual_buf0)
         q0, k0, v0 = self._preproj(f0, residual_buf0, infer_states[0], use_next_layer=True)
@@ -362,11 +397,11 @@ class LlamaTransformerLayer:
         rev_infer_states = infer_states[::-1]
         q0, k0, v0 = self._forward_pipeline_stage(
             o0, residual_buf0, o1, q1, k1, v1, 
-            kvargs, infer_states, 0, [], []
+            kvargs, infer_states, 0, src_block_ids, dst_block_ids
         )
         q1, k1, v1 = self._forward_pipeline_stage(
             o1, residual_buf1, o0, q0, k0, v0,
-            kvargs, rev_infer_states, 1, src_block_ids, dst_block_ids
+            kvargs, rev_infer_states, 1, [], []
         )
 
         return q1, k1, v1
@@ -390,6 +425,10 @@ class LlamaTransformerLayer:
         # Wait for swappings to finish
         torch.cuda.current_stream().wait_stream(self.cpu_communication_stream)
         self.events[1].stage_s.record()
+        self._transfer_qkv(
+            q0, k0, v0, 
+            kvargs, infer_states[0], cur_stage=1
+        )
         q1, k1, v1 = self._preproj(input_embds1, residual_buf1, infer_states[1], use_next_layer=True)
         self.events[1].linear_e.record()
         # We use the last layer's last stage for the very first stage
@@ -420,6 +459,10 @@ class LlamaTransformerLayer:
         batch1 : qkv1 |=> attention -> post-projection |=> [f1]
         """
         self.events[0].stage_s.record()
+        self._transfer_qkv(
+            q1, k1, v1, 
+            kvargs, infer_states[1], cur_stage=0
+        )
         f0 = self._postproj(o0, residual_buf0)
         self.events[0].linear_e.record()
         # Here cur_stage is an offset of layer_id, we use last layer here
