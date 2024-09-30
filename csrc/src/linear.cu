@@ -82,3 +82,31 @@ torch::Tensor linear(
 
 	return r;
 }
+
+void linear_inplace(
+	torch::Tensor a,
+	torch::Tensor w,
+	torch::Tensor r
+) {
+	int m = a.size(0);
+	int k = a.size(1);
+	int n = w.size(0);
+
+	const half* a_data = (half*)a.data_ptr();
+	const half* w_data = (half*)w.data_ptr();
+	half* r_data = (half*)r.data_ptr();
+
+	if (!has_handle) {
+		cublas_init_handle();
+		has_handle = true;
+	}
+
+	array_linear(
+		m,
+		n,
+		k,
+		a_data,
+		w_data,
+		r_data
+	);
+}

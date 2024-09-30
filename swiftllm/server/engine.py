@@ -126,7 +126,7 @@ class Engine:
                 pre_swap_out = None
                 batch[0], cur_swap_out, cur_swap_in = self.scheduler.get_next_batch_old()
             else:
-                batch[0], batch[1], pre_swap_out, cur_swap_out, cur_swap_in = self.scheduler.get_next_batch()
+                batch[0], batch[1], cur_swap_out, cur_swap_in = self.scheduler.get_next_batch()
 
             if all(not (batch[i] and batch[i].x) for i in range(2)) and not cur_swap_in and not cur_swap_out:
                 # No new batch, sleep for a bit
@@ -153,18 +153,17 @@ class Engine:
                 batch[i].get_model_forward_args() if batch[i] else None
                 for i in range(2)
             ]
-            pre_swap_out_ids = [req.request_id for req in pre_swap_out] if pre_swap_out else None
             if not batch[1]:
                 # Sequential mode
                 reqs = batch[0].get_all_reqs()
                 print(f"Using sequential mode (batch_size = {len(reqs)})")
-                output_tokens = await self._run_on_model_async(self.model.forward, argss[0], pre_swap_out_ids)
+                output_tokens = await self._run_on_model_async(self.model.forward, argss[0])
             else:
                 # Pipelined mode
                 reqs = batch[0].get_all_reqs() + batch[1].get_all_reqs()
                 print(f"Using pipelined mode (batch_size = {len(reqs)})")
                 self.engine_config.monitor_performance = True
-                output_tokens = await self._run_on_model_async(self.model.forward_pipeline, argss, pre_swap_out_ids)
+                output_tokens = await self._run_on_model_async(self.model.forward_pipeline, argss)
 
             # Deal with output tokens
             finished_req_ids = []

@@ -143,6 +143,8 @@ class Swapper:
         Do all the set-up work for swapping in/out sequences.
         Returns src and dst block ids.
         """
+        if not seq_ids_list:
+            return [], []
         src_block_manager = self.cpu_block_manager if is_swap_in else self.gpu_block_manager
         dst_block_manager = self.gpu_block_manager if is_swap_in else self.cpu_block_manager
         src_seq_ids = torch.tensor(seq_ids_list, dtype=torch.int32, device=src_block_manager.device_name)

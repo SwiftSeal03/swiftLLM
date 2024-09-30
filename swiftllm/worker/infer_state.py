@@ -32,3 +32,6 @@ class LlamaInferState:
 
     position_cos: torch.Tensor	# [num_tokens, hidden_size]
     position_sin: torch.Tensor	# [num_tokens, hidden_size]
+
+    src_block_ids: list[int]
+    dst_block_ids: list[int]

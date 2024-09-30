@@ -49,7 +49,7 @@ if __name__ == '__main__':
         library_path=library_path,
         profile_result_path=profile_result_path,
 
-        monitor_performance=True,
+        monitor_performance=False,
     )
 
     start_time = time.perf_counter()
@@ -81,13 +81,13 @@ if __name__ == '__main__':
         cpu_prompt_outputs0 = model.forward(swiftllm.ModelForwardArgs(
             input_ids[ngpu_prompts:ngpu_prompts + ncpu_prompts // 2],
             cpu_seq_ids[:ncpu_prompts // 2],
-            []
+            [], []
         ))
         model.swap_out_seqs(cpu_seq_ids[:ncpu_prompts // 2])
         cpu_prompt_outputs1 = model.forward(swiftllm.ModelForwardArgs(
             input_ids[ngpu_prompts + ncpu_prompts // 2:],
             cpu_seq_ids[ncpu_prompts // 2:],
-            []
+            [], []
         ))
         model.swap_out_seqs(cpu_seq_ids[ncpu_prompts // 2:])
     prompt_phase_outputs = []
@@ -95,7 +95,7 @@ if __name__ == '__main__':
         prompt_phase_outputs = model.forward(swiftllm.ModelForwardArgs(
             input_ids[:ngpu_prompts],
             gpu_seq_ids,
-            []
+            [], []
         ))
     if cpu_seq_ids:
         prompt_phase_outputs.extend(cpu_prompt_outputs0 + cpu_prompt_outputs1)
@@ -117,6 +117,7 @@ if __name__ == '__main__':
                 [nprompts + i * 2 + j] + 
                 list(range(0, nprompts // 2) if j == 0 else range(nprompts // 2, nprompts)),
                 seq_lens[:nprompts // 2] if j == 0 else seq_lens[nprompts // 2:],
+                [],
                 cpu_num_decoding_seqs=ncpu_prompts // 2
             )
         last_round_outputs = model.forward_pipeline(argss)

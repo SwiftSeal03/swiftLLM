@@ -14,7 +14,7 @@ from swiftllm.utils import GB
 import swiftllm_c
 
 from .layers.pre_layer import LlamaPreLayer
-from .layers.transformer_layer import LlamaTransformerLayer, KVCacheArgs, TransformerEvents
+from .layers.transformer_layer import LlamaTransformerLayer, TransformerEvents
 from .layers.post_layer import LlamaPostLayer
 from .infer_state import LlamaInferState
 
@@ -23,6 +23,7 @@ class ModelForwardArgs:
     input_ids_list: list[list[int]]
     seq_ids_list: list[int]
     decoding_seq_lens_list: list[int]
+    swap_out_seq_ids: list[int]
     cpu_num_decoding_seqs: int = 0
 
 @dataclasses.dataclass
@@ -198,6 +199,8 @@ class LlamaModel:
         self.q_cpu = torch.zeros((self.engine_config.max_batch_size, self.model_config.num_q_heads, self.model_config.head_dim), dtype=torch.float16, device="cpu", pin_memory=True)
         self.k_cpu = torch.zeros((self.engine_config.max_batch_size, self.model_config.num_kv_heads, self.model_config.head_dim), dtype=torch.float16, device="cpu", pin_memory=True)
         self.v_cpu = torch.zeros((self.engine_config.max_batch_size, self.model_config.num_kv_heads, self.model_config.head_dim), dtype=torch.float16, device="cpu", pin_memory=True)
+        # We store float32 tensors for the output, but convert them to float16 when copying back to GPU
+        self.o_cpu = torch.zeros((self.engine_config.max_batch_size, self.model_config.num_q_heads * self.model_config.head_dim), dtype=torch.float32, device="cpu", pin_memory=True)
 
         # Initialize block manager
         self.gpu_block_manager = BlockManager(
@@ -226,7 +229,19 @@ class LlamaModel:
         )
 
         for layer in self.transformer_layers:
-            layer.set_swapper(self.swapper)
+            layer.set_meta_args(
+                self.k_cache,
+                self.v_cache,
+                self.k_swap,
+                self.v_swap,
+                self.q_cpu,
+                self.k_cpu,
+                self.v_cpu,
+                self.o_cpu,
+                self.gpu_block_manager.block_table,
+                self.cpu_block_manager.block_table,
+                self.swapper
+            )
 
     def _init_to_get_rotary(self):
         rope_scaling_factor = self.model_config.rope_scaling
@@ -244,7 +259,7 @@ class LlamaModel:
     @torch.inference_mode()
     def _prepare_inputs(
         self,
-        args: ModelForwardArgs
+        args: ModelForwardArgs,
     ) -> tuple[list[int], LlamaInferState]:
         """
         Gets input lists and reformats them into a single tensor.
@@ -322,7 +337,10 @@ class LlamaModel:
             num_seq_blocks = num_seq_blocks,
 
             position_cos = _position_cos,
-            position_sin = _position_sin
+            position_sin = _position_sin,
+
+            src_block_ids=[],
+            dst_block_ids=[]
         )
 
         if not self.engine_config.ignore_kvcache:
@@ -336,6 +354,9 @@ class LlamaModel:
                 infer_state.cpu_decoding_seq_lens
             )
         
+        # Need to initiate swapping out after allocating blocks, so that blocks of the swapped-outs are not taken away
+        infer_state.src_block_ids, infer_state.dst_block_ids = self.swapper.initiate_swap_out(args.swap_out_seq_ids)
+        
         return _flattened_input_ids, infer_state
 
 
@@ -343,8 +364,7 @@ class LlamaModel:
     def _forward(
         self,
         input_ids: torch.Tensor,    # [total_token_num]
-        infer_state: LlamaInferState,
-        pre_swap_out: list[int] | None
+        infer_state: LlamaInferState
     ) -> torch.Tensor:
         """
         Run a forward pass of the LlamaModel.
@@ -352,20 +372,6 @@ class LlamaModel:
         if self.engine_config.monitor_performance:
             forward_s_event = torch.cuda.Event(enable_timing=True)
             forward_s_event.record()
-
-        src_block_ids, dst_block_ids = self.swapper.initiate_swap_out(pre_swap_out) if pre_swap_out else ([], [])
-
-        kvargs = KVCacheArgs(
-            self.k_cache,
-            self.v_cache,
-            self.k_swap,
-            self.v_swap,
-            self.q_cpu,
-            self.k_cpu,
-            self.v_cpu,
-            self.gpu_block_manager.block_table if not self.engine_config.ignore_kvcache else None,
-            self.cpu_block_manager.block_table if not self.engine_config.ignore_kvcache else None
-        )
 
         # Main body of the forward pass
         input_embds = self.pre_layer.forward(input_ids)
@@ -379,14 +385,9 @@ class LlamaModel:
         
         residual_buf = torch.zeros_like(input_embds)
         for layer in self.transformer_layers:
-            input_embds = layer.forward(
-                input_embds,
-                residual_buf,
-                kvargs,
-                infer_state,
-                src_block_ids,
-                dst_block_ids
-            )
+            layer.set_infer_states([infer_state])
+            layer.set_buffers([input_embds], [residual_buf])
+            input_embds = layer.forward()
         input_embds += residual_buf
 
         if self.engine_config.monitor_performance:
@@ -428,7 +429,6 @@ class LlamaModel:
     def forward(
         self,
         args: ModelForwardArgs,
-        pre_swap_out: list[int] | None = None
     ) -> list[int]:
         """
         Run a forward pass of the LlamaModel.
@@ -444,7 +444,6 @@ class LlamaModel:
         return self._forward(
             torch.tensor(flattened_input_ids, dtype=torch.int32, device="cuda"),
             infer_state,
-            pre_swap_out
         ).tolist()
     
     @torch.inference_mode()
@@ -452,44 +451,31 @@ class LlamaModel:
         self,
         input_ids: torch.Tensor,
         infer_states: list[LlamaInferState],
-        pre_swap_out: list[int] | None
     ) -> torch.Tensor:
         """
         Run a forward pass of the LlamaModel in a pipelined manner.
         """
-        kvargs = KVCacheArgs(
-            self.k_cache,
-            self.v_cache,
-            self.k_swap,
-            self.v_swap,
-            self.q_cpu,
-            self.k_cpu,
-            self.v_cpu,
-            self.gpu_block_manager.block_table if not self.engine_config.ignore_kvcache else None,
-            self.cpu_block_manager.block_table if not self.engine_config.ignore_kvcache else None
-        )
-
-        src_block_ids, dst_block_ids = self.swapper.initiate_swap_out(pre_swap_out) if pre_swap_out else ([], [])
 
         if self.engine_config.monitor_performance:
             forward_s_event = torch.cuda.Event(enable_timing=True)
             forward_s_event.record()
 
         # input_embds would serve as a buffer for all attention outputs
-        input_embds = self.pre_layer.forward(input_ids)
-        residual_buf = torch.zeros_like(input_embds)
-        input_embds0, input_embds1 = torch.split(input_embds, [infer_states[0].num_tokens, infer_states[1].num_tokens], dim=0)
-        residual_buf0, residual_buf1 = torch.split(residual_buf, [infer_states[0].num_tokens, infer_states[1].num_tokens], dim=0)
+        input_embeds = self.pre_layer.forward(input_ids)
+        residual_buf = torch.zeros_like(input_embeds)
+        input_embedss = torch.split(input_embeds, [infer_states[0].num_tokens, infer_states[1].num_tokens], dim=0)
+        residual_bufs = torch.split(residual_buf, [infer_states[0].num_tokens, infer_states[1].num_tokens], dim=0)
 
         if self.engine_config.monitor_performance:
             pipeline_s_event = torch.cuda.Event(enable_timing=True)
             pipeline_s_event.record()
-        
+
+        for layer in self.transformer_layers:
+            layer.set_infer_states(infer_states)
+            layer.set_buffers(input_embedss, residual_bufs)
+            
         # First stage of the forward pass
-        q1, k1, v1 = self.transformer_layers[-1].forward_first_stage(
-            input_embds0, input_embds1, residual_buf0, residual_buf1,
-            kvargs, infer_states
-        )
+        q1, k1, v1 = self.transformer_layers[-1].forward_first_stage()
 
         if self.engine_config.monitor_performance:
             mainbody_s_event = torch.cuda.Event(enable_timing=True)
@@ -499,30 +485,21 @@ class LlamaModel:
         # In every iteration, input_embds0 is updated to newer version of batch 0's attention output and 
         # q1, k1, v1 are updated to batch 1's newer version of q, k, v
         for layer in self.transformer_layers[:-1]:
-            q1, k1, v1 = layer.forward_double(
-                q1, k1, v1, 
-                input_embds0, input_embds1, residual_buf0, residual_buf1,
-                kvargs, infer_states,
-                src_block_ids, dst_block_ids
-            )
+            q1, k1, v1 = layer.forward_double(q1, k1, v1)
 
         if self.engine_config.monitor_performance:
             mainbody_e_event = torch.cuda.Event(enable_timing=True)
             mainbody_e_event.record()
 
         # Last stage of the forward pass, also begin predicted swapping
-        f0, f1 = self.transformer_layers[-1].forward_last_stage(
-            q1, k1, v1, input_embds0, input_embds1, residual_buf0, residual_buf1,
-            kvargs, infer_states,
-            src_block_ids, dst_block_ids
-        )
+        f0, f1 = self.transformer_layers[-1].forward_last_stage(q1, k1, v1)
 
         if self.engine_config.monitor_performance:
             pipeline_e_event = torch.cuda.Event(enable_timing=True)
             pipeline_e_event.record()
 
-        f0 += residual_buf0
-        f1 += residual_buf1
+        f0 += residual_bufs[0]
+        f1 += residual_bufs[1]
 
         output_tokens = self.post_layer.forward_double(f0, f1, infer_states)
 
@@ -574,7 +551,6 @@ class LlamaModel:
     def forward_pipeline(
         self,
         argss: list[ModelForwardArgs],
-        pre_swap_out: list[int] | None = None
     ) -> list[int]:
         """
         Forward 2 sub-batches in a pipelined manner.
@@ -585,8 +561,7 @@ class LlamaModel:
 
         return self._forward_pipeline(
             torch.tensor(finput_ids0 + finput_ids1, dtype=torch.int32, device="cuda"),
-            [infer_state0, infer_state1],
-            pre_swap_out
+            [infer_state0, infer_state1]
         ).tolist()
         
     @torch.inference_mode()

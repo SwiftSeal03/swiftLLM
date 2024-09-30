@@ -131,7 +131,7 @@ async def main():
     
     print([len(tokenizer.encode(prompt)) for prompt in prompts])
 
-    await warm_up(prompts[6], engine, tokenizer)
+    await warm_up(prompts[3], engine, tokenizer)
 
     for prompt in prompts:
         if len(tokenizer.encode(prompt)) == 98:

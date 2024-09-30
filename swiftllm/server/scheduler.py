@@ -10,7 +10,8 @@ from swiftllm.server.structs import Request
 
 class SubBatch:
     def __init__(self):
-        self.pref_reqs = []
+        self.gprf_reqs = []
+        self.cprf_reqs = []
         self.gdec_reqs = []
         self.cdec_reqs = []
         self.x = 0 # batch size
@@ -19,8 +20,13 @@ class SubBatch:
         self.n_c = 0 # total number of tokens in CPU decoding requests
 
 
-    def add_pref(self, req: Request):
-        self.pref_reqs.append(req)
+    def add_gprf(self, req: Request):
+        self.gprf_reqs.append(req)
+        self.x += 1
+        self.s += req.prompt_len
+    
+    def add_cprf(self, req: Request):
+        self.cprf_reqs.append(req)
         self.x += 1
         self.s += req.prompt_len
         
@@ -37,7 +43,7 @@ class SubBatch:
         self.n_c += req.prompt_len
 
     def get_all_reqs(self) -> list[Request]:
-        return self.pref_reqs + self.gdec_reqs + self.cdec_reqs
+        return self.gprf_reqs + self.cprf_reqs + self.gdec_reqs + self.cdec_reqs
 
     def get_model_forward_args(self) -> ModelForwardArgs:
         all_reqs = self.get_all_reqs()
@@ -51,11 +57,13 @@ class SubBatch:
                 req.seq_len
                 for req in self.gdec_reqs + self.cdec_reqs
             ],
+            swap_out_seq_ids = [req.request_id for req in self.cprf_reqs],
             cpu_num_decoding_seqs=self.x_c
         )
 
     def print_profile(self):
-        print(f"pref lens: {[req.prompt_len for req in self.pref_reqs]}, gdec lens: {[req.seq_len for req in self.gdec_reqs]}, cdec lens: {[req.seq_len for req in self.cdec_reqs]}")
+        print(f"gprf lens: {[req.prompt_len for req in self.gprf_reqs]}, cprf lens: {[req.prompt_len for req in self.cprf_reqs]}, \
+gdec lens: {[req.seq_len for req in self.gdec_reqs]}, cdec lens: {[req.seq_len for req in self.cdec_reqs]}")
 
 class RequestIdManager:
     """
@@ -221,7 +229,8 @@ class Scheduler:
 
     def decide_mode_and_gen_batch(
         self, 
-        prefill_reqs: list[Request],
+        gpu_prefill_reqs: list[Request],
+        cpu_prefill_reqs: list[Request],
         budget: ScheduleBudget
     ) -> tuple[SubBatch, SubBatch | None]:
         """
@@ -237,9 +246,13 @@ class Scheduler:
         sequential_batch = SubBatch()
 
         # Simple heuristic: Put all GPU related seqs in the same batch, all CPU related seqs in the other
-        for req in prefill_reqs:
-            batches[0].add_pref(req)
-            sequential_batch.add_pref(req)
+        for req in gpu_prefill_reqs:
+            batches[0].add_gprf(req)
+            sequential_batch.add_gprf(req)
+
+        for req in cpu_prefill_reqs:
+            batches[0].add_cprf(req)
+            sequential_batch.add_cprf(req)
         
         for req in self.gpu_decoding_q:
             batches[0].add_gdec(req)
@@ -380,7 +393,7 @@ class Scheduler:
         assert not (pref_to_cpu and self.engine_config.always_use_gpu), "In GPU-only mode, there should be no pre-swapped-out requests"
 
         # Step 5: Launch CPU decoding requests and form batches
-        batch0, batch1 = self.decide_mode_and_gen_batch(pref_to_cpu + pref_to_gpu, budget)
+        batch0, batch1 = self.decide_mode_and_gen_batch(pref_to_gpu, pref_to_cpu, budget)
 
         if self.gpu_decoding_q or self.cpu_decoding_q or pref_to_gpu or pref_to_cpu or self.waiting_q:
             print(f"Gdecs: {len(self.gpu_decoding_q)}, Cdecs: {len(self.cpu_decoding_q)}, Pr2gs: {len(pref_to_gpu)}, Pr2cs: {len(pref_to_cpu)}, Waiting: {len(self.waiting_q)}")
@@ -388,7 +401,7 @@ class Scheduler:
         self.gpu_decoding_q.extend(pref_to_gpu)
         self.cpu_decoding_q.extend(pref_to_cpu)
 
-        return batch0, batch1, pref_to_cpu, swpout_reqs, swpin_reqs
+        return batch0, batch1, swpout_reqs, swpin_reqs
 
     def get_next_batch_old(self) -> tuple[SubBatch, list[Request], list[Request]]:
         print(f"Waiting: {len(self.waiting_q)}, Gdecs: {len(self.gpu_decoding_q)}, Cdecs: {len(self.cpu_decoding_q)}")
