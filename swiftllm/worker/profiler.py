@@ -20,15 +20,80 @@ class ModelProfiler:
     self.model = model
     self.nrepeat = nrepeat
     self.nwarmup = nwarmup
-    
     os.makedirs(model.engine_config.profile_result_path, exist_ok=True)
-  
-  @torch.inference_mode()
-  def __del__(self):
-    self.model.engine_config.monitor_performance = False
-    # self.model.free_seqs_resources([0])
+    
+    self._init_profile_tables()
 
-  @torch.inference_mode()
+  def _init_profile_tables(self):
+    """
+    Initialize the profile tables
+    """
+    # Validate necessary constraints
+    engine_config = self.model.engine_config
+    max_gpu_tokens = self.model.gpu_block_manager.num_blocks * engine_config.block_size
+    max_cpu_tokens = self.model.cpu_block_manager.num_blocks * engine_config.block_size
+
+    assert engine_config.max_prefill_tokens <= engine_config.max_tokens_in_batch, \
+        f"max_prefill_tokens {engine_config.max_prefill_tokens} exceeds max_tokens_in_batch {engine_config.max_tokens_in_batch}"
+    assert engine_config.max_batch_size <= engine_config.max_tokens_in_batch, \
+        f"max_batch_size {engine_config.max_batch_size} exceeds max_tokens_in_batch {engine_config.max_tokens_in_batch}"
+    assert engine_config.max_batch_size <= engine_config.max_seqs_in_block_table, \
+        f"max_batch_size {engine_config.max_batch_size} exceeds max_seqs_in_block_table {engine_config.max_seqs_in_block_table}"
+
+    # Linr
+    linr_S_list = [2 ** i for i in range(
+        (engine_config.block_size - 1).bit_length(),
+        (engine_config.max_tokens_in_batch - 1).bit_length(),
+    )] + [engine_config.max_tokens_in_batch]
+    linr_T_list = self._profile_linr(linr_S_list)
+    self.linr_S_arr = np.array(linr_S_list)
+    self.linr_T_arr = np.array(linr_T_list)
+
+    # Pref
+    pref_S_list = [2 ** i for i in range(
+        (engine_config.block_size - 1).bit_length(),
+        (engine_config.max_prefill_tokens - 1).bit_length()
+    )] + [engine_config.max_prefill_tokens]
+    pref_T_list = self._profile_pref(pref_S_list)
+    self.pref_S_arr = np.array(pref_S_list)
+    self.pref_T_arr = np.array(pref_T_list)
+
+    # Gdec
+    gdec_N_list = [2 ** i for i in range(
+        (engine_config.block_size - 1).bit_length(),
+        (max_gpu_tokens - 1).bit_length()
+    )] + [max_gpu_tokens]
+    gdec_T_list = self._profile_gdec(gdec_N_list)
+    self.gdec_N_arr = np.array(gdec_N_list)
+    self.gdec_T_arr = np.array(gdec_T_list)
+
+    # Cdec
+    cdec_S_list = [2 ** i for i in range(
+        ((engine_config.max_tokens_on_cpu - 1) // engine_config.max_seq_len).bit_length(),
+        (engine_config.max_batch_size - 1).bit_length()
+    )] + [engine_config.max_batch_size]
+    cdec_N_list = [2 ** i for i in range(
+        ((engine_config.max_batch_size * engine_config.block_size) - 1).bit_length(),
+        (max_cpu_tokens - 1).bit_length()
+    )] + [max_cpu_tokens]
+
+    # Ensure monotonicity and sequence length are in proper range
+    assert all(cdec_S_list[i] < cdec_S_list[i+1] for i in range(len(cdec_S_list)-1)), f"cdec_S_list {cdec_S_list} is not strictly increasing"
+    assert all(cdec_N_list[i] < cdec_N_list[i+1] for i in range(len(cdec_N_list)-1)), f"cdec_N_list {cdec_N_list} is not strictly increasing"
+    assert (cdec_N_list[-1] - 1) // cdec_S_list[0] + 1 <= engine_config.max_seq_len, \
+        f"max_seq_len {engine_config.max_seq_len} is not enough for cdec_S_list[0] {cdec_S_list[0]} and cdec_N_list[-1] {cdec_N_list[-1]}"
+    assert cdec_N_list[0] // cdec_S_list[-1] >= engine_config.block_size, \
+        f"block_size {engine_config.block_size} is not enough for cdec_S_list[-1] {cdec_S_list[-1]} and cdec_N_list[0] {cdec_N_list[0]}"
+
+    cdec_T_list = self._profile_cdec(cdec_S_list, cdec_N_list)
+    self.cdec_S_arr = np.array(cdec_S_list)
+    self.cdec_N_arr = np.array(cdec_N_list)
+    self.cdec_T_arr = np.array(cdec_T_list)
+    
+    # Lnch
+    lnch_S_list = linr_S_list
+    self.lnch_T = self._profile_lnch(lnch_S_list)
+
   def _gpu_fake_prefill(
     self,
     seq_ids: list[int],
@@ -59,7 +124,6 @@ class ModelProfiler:
         self.model.k_cache[layer_id, block_ids].random_().normal_()
         self.model.v_cache[layer_id, block_ids].random_().normal_()
 
-  @torch.inference_mode()
   def _cpu_fake_prefill(
     self,
     seq_ids: list[int],
@@ -84,6 +148,7 @@ class ModelProfiler:
       self.model.swap_out_seqs(seq_ids[i:j])
       i = j
 
+  @torch.inference_mode()
   def _run_test_case(
     self,
     prefill_lens: list[int] = [],
@@ -120,45 +185,37 @@ class ModelProfiler:
         self._gpu_fake_prefill(gpu_decode_ids, gpu_decode_lens)
 
       input_ids = [[10] * seq_len for seq_len in prefill_lens] + [[10]] * (ngdec + ncdec)
-      # input_ids = [
-      #   self.base_tokens[:seq_len] for seq_len in prefill_lens
-      # ] + [
-      #   [self.base_tokens[seq_len - 1]] for seq_len in gpu_decode_lens
-      # ] + [
-      #   [self.base_tokens[seq_len - 1]] for seq_len in cpu_decode_lens
-      # ]
 
       argss.append(ModelForwardArgs(
         input_ids,
         prefill_ids + gpu_decode_ids + cpu_decode_ids,
         gpu_decode_lens + cpu_decode_lens,
+        [],
         len(cpu_decode_ids)
       ))
 
     for i in range(-self.nwarmup, self.nrepeat):
-      self.model.engine_config.monitor_performance = i >= 0
       if i == 0:
         start = time.perf_counter()
+        self.model.turn_on_perf_monitor()
       if not use_pipeline:
         self.model.forward(argss[0])
       else:
         self.model.forward_pipeline(argss)
       # Note that faked prefilling already allocates memory for the "new" token to be fed
       # into the model, so model.forward won't allocate memory for them and we only need
-      # to free the resources for the prefill tokens.
-      if all_prefill_ids:
-        self.model.free_seqs_resources(all_prefill_ids)
+      # to free the resources of the prefilled tokens.
+      self.model.free_seqs_resources(all_prefill_ids)
 
     elapsed = time.perf_counter() - start
     print(f"Elapsed time: {elapsed * 1000 / self.nrepeat:.3f} ms")
 
     assert len(self.model.perf_results) == self.nrepeat
-    res = self.model.get_perf_results(use_pipeline)
+    res = self.model.flush_perf_results_and_turn_off_perf_monitor()
     self.model.free_seqs_resources(all_decode_ids)
-    self.model.monitor_performance = False
     return res
   
-  def profile_linear(
+  def _profile_linr(
       self, 
       S_list: list[int]
   ) -> list[float]:
@@ -166,7 +223,7 @@ class ModelProfiler:
     Profile model's linear part performance.
     """
     print(f"Profiling linear part with S_list={S_list} ...")
-    result_path = self.model.engine_config.profile_result_path + "linear.json"
+    result_path = self.model.engine_config.profile_result_path + "linr.json"
 
     if os.path.exists(result_path):
       with open(result_path, "r") as f:
@@ -176,9 +233,10 @@ class ModelProfiler:
 
     T_list = []
     for S in tqdm(S_list):
-      T_list.append(self._run_test_case(
+      res = self._run_test_case(
         prefill_lens=[S]
-      ).avg_gpu_linr_time)
+      )
+      T_list.append(ModelPerfResult.mean(res, "avg_linr_time"))
 
     plt.figure(figsize=(16, 12))
     plt.plot(S_list, T_list)
@@ -186,7 +244,7 @@ class ModelProfiler:
     plt.ylim(0)
     plt.xlabel("S")
     plt.ylabel("T_l(ms)")
-    plt.savefig(self.model.engine_config.profile_result_path + "linear.png")
+    plt.savefig(self.model.engine_config.profile_result_path + "linr.png")
     plt.close()
 
     with open(result_path, "w") as f:
@@ -196,8 +254,91 @@ class ModelProfiler:
       }, f, indent=2)
 
     return T_list
-  
-  def profile_cpu_attn(
+
+  def _profile_pref(
+    self,
+    S_list: list[int]
+  ) -> list[list[float]]:
+    """
+    Profile model's GPU prefilling attention part performance.
+    """
+    print(f"Profiling prefill part with S_list={S_list}...")
+    result_path = self.model.engine_config.profile_result_path + "pref.json"
+
+    if os.path.exists(result_path):
+      with open(result_path, "r") as f:
+        res = json.load(f)
+        if res["S_list"] == S_list:
+          return res["T_list"]
+
+    T_list = []
+    for S in tqdm(S_list):
+      res1 = self._run_test_case(
+        prefill_lens=[S]
+      )
+      res2 = self._run_test_case(
+        prefill_lens=[S] * 2
+      )
+      T_list.append(ModelPerfResult.mean(res2, "avg_pref_time") - ModelPerfResult.mean(res1, "avg_pref_time"))
+
+    plt.figure(figsize=(16, 12))
+    plt.plot(S_list, T_list)
+    plt.xlim(0)
+    plt.ylim(0)
+    plt.xlabel("S")
+    plt.ylabel("T(ms)")
+    plt.savefig(self.model.engine_config.profile_result_path + "pref.png")
+    plt.close()
+
+    with open(result_path, "w") as f:
+      json.dump({
+        "S_list": S_list,
+        "T_list": T_list
+      }, f, indent=2)
+
+    return T_list
+
+  def _profile_gdec(
+    self,
+    N_list: list[int]
+  ) -> list[float]:
+    """
+    Profile model's GPU attention part performance.
+    """
+    print(f"Profiling GPU attention part with N_list={N_list} ...")
+    result_path = self.model.engine_config.profile_result_path + "gdec.json"
+
+    if os.path.exists(result_path):
+      with open(result_path, "r") as f:
+        res = json.load(f)
+        if res["N_list"] == N_list:
+          return res["T_list"]
+
+    T_list = []
+    for N in tqdm(N_list):
+      res = self._run_test_case(
+        gpu_decode_lens=[N]
+      )
+      T_list.append(ModelPerfResult.mean(res, "avg_gdec_time"))
+
+    plt.figure(figsize=(16, 12))
+    plt.plot(N_list, T_list)
+    plt.xlim(0)
+    plt.ylim(0)
+    plt.xlabel("N")
+    plt.ylabel("T(ms)")
+    plt.savefig(self.model.engine_config.profile_result_path + "gdec.png")
+    plt.close()
+
+    with open(result_path, "w") as f:
+      json.dump({
+        "N_list": N_list,
+        "T_list": T_list
+      }, f, indent=2)
+
+    return T_list
+
+  def _profile_cdec(
     self,
     S_list: list[int],
     N_list: list[int]
@@ -206,7 +347,7 @@ class ModelProfiler:
     Profile model's CPU attention part performance.
     """
     print(f"Profiling CPU attention part with S_list={S_list}, N_list={N_list} ...")
-    result_path = self.model.engine_config.profile_result_path + "cpu_attn.json"
+    result_path = self.model.engine_config.profile_result_path + "cdec.json"
 
     if os.path.exists(result_path):
       with open(result_path, "r") as f:
@@ -221,10 +362,11 @@ class ModelProfiler:
       T_list.append([])
       for N in N_list:
         NB = N // block_size
-        T_list[-1].append(self._run_test_case(
+        res = self._run_test_case(
           # Divide N into S segments as even as possible
           cpu_decode_lens=[NB // S * block_size] * (S - NB % S) + [(NB // S + 1) * block_size] * (NB % S),
-        ).avg_cpu_attn_time)
+        )
+        T_list[-1].append(ModelPerfResult.mean(res, "avg_cdec_time"))
 
     T_array = np.array(T_list)
 
@@ -245,7 +387,7 @@ class ModelProfiler:
     ax.set_xlabel("S_c")
     ax.set_ylabel("N_c")
     ax.set_zlabel("T(ms)")
-    plt.savefig(self.model.engine_config.profile_result_path + "cpu_attn.png")
+    plt.savefig(self.model.engine_config.profile_result_path + "cdec.png")
     plt.close()
 
     with open(result_path, "w") as f:
@@ -256,3 +398,97 @@ class ModelProfiler:
       }, f, indent=2)
 
     return T_list
+
+  def _profile_lnch(
+    self,
+    S_list: list[int]
+  ) -> list[float]:
+    """
+    Profile model's kernel launch time.
+    """
+    print(f"Profiling kernel launch time with S_list={S_list} ...")
+    result_path = self.model.engine_config.profile_result_path + "lnch.json"
+
+    if os.path.exists(result_path):
+      with open(result_path, "r") as f:
+        res = json.load(f)
+        if res["S_list"] == S_list:
+          return res["T_list"]
+
+    T_list = []
+    for S in tqdm(S_list):
+      res = self._run_test_case(
+        prefill_lens=[S // 2 - 8],
+        gpu_decode_lens=[512] * 4,
+        cpu_decode_lens=[512] * 4,
+        use_pipeline=True
+      )
+      T_list.append(ModelPerfResult.mean(res, "avg_lnch_time"))
+
+    plt.figure(figsize=(16, 12))
+    plt.plot(S_list, T_list)
+    plt.xlim(0)
+    plt.ylim(0)
+    plt.xlabel("S")
+    plt.ylabel("T(ms)")
+    plt.savefig(self.model.engine_config.profile_result_path + "lnch.png")
+    plt.close()
+
+    with open(result_path, "w") as f:
+      json.dump({
+        "S_list": S_list,
+        "T_list": T_list
+      }, f, indent=2)
+
+    T_mean = np.array(T_list).mean()
+
+    return T_mean
+
+  def get_linr_T(self, S: int) -> float:
+      """
+      Get the linear time for iteration width S, using linear interpolation
+      """
+      assert S <= self.linr_S_arr[-1], f"Iteration width {S} exceeds the maximum {self.linr_S_arr[-1]}"
+      return np.interp(S, self.linr_S_arr, self.linr_T_arr)
+
+  def get_pref_T(self, S: int) -> float:
+      """
+      Get the GPU prefilling time for iteration width S, using linear interpolation
+      """
+      assert S <= self.pref_S_arr[-1], f"Iteration width {S} exceeds the maximum {self.pref_S_arr[-1]}"
+      return np.interp(S, self.pref_S_arr, self.pref_T_arr)
+    
+  def get_gdec_T(self, N: int) -> float:
+      """
+      Get the GPU decoding time for number of tokens N, using linear interpolation
+      """
+      assert N <= self.gdec_N_arr[-1], f"Number of tokens {N} exceeds the maximum {self.gdec_N_arr[-1]}"
+      return np.interp(N, self.gdec_N_arr, self.gdec_T_arr)
+  
+  def get_cdec_T(self, S: int, N: int) -> float:
+      """
+      Get the CPU decoding time for iteration width S and number of tokens N,
+      using bilinear interpolation
+      """
+      assert S <= self.cdec_S_arr[-1], f"CPU batch size {S} exceeds the maximum {self.cdec_S_arr[-1]}"
+      assert N <= self.cdec_N_arr[-1], f"Number of tokens {N} exceeds the maximum {self.cdec_N_arr[-1]}"
+      if S == 0:
+          return 0.0
+      idx = np.searchsorted(self.cdec_S_arr, S)
+      if idx == 0 or self.cdec_S_arr[idx] == S:
+          return np.interp(N, self.cdec_N_arr, self.cdec_T_arr[idx])
+      # S is between cdec_S_arr[idx-1] and cdec_S_arr[idx]
+      s0 = self.cdec_S_arr[idx-1]
+      s1 = self.cdec_S_arr[idx]
+      t0 = np.interp(N, self.cdec_N_arr, self.cdec_T_arr[idx-1])
+      t1 = np.interp(N, self.cdec_N_arr, self.cdec_T_arr[idx])
+      return np.interp(S, np.array([s0, s1]), np.array([t0, t1]))
+  
+  def get_cpu_remaining_capacity(self, s: int, x_c: int, n_c: int):
+      """
+      Get the remaining CPU capacity for a batch with 
+      - (opposite batch's) iteration width s
+      - number of CPU decoding requests x_c,
+      - total number of tokens n_c
+      """
+      return self._get_linr_T(s) - self._get_cdec_T(x_c, n_c) - self.kernel_launch_time

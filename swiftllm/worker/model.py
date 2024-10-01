@@ -4,6 +4,7 @@ import dataclasses
 import json
 from pprint import pprint
 
+import numpy as np
 import torch
 
 from swiftllm.engine_config import EngineConfig
@@ -11,7 +12,6 @@ from swiftllm.model_config import LlamaModelConfig
 from swiftllm.worker.weight import load_weights
 from swiftllm.worker.block_manager import BlockManager, Swapper
 from swiftllm.utils import GB
-import swiftllm_c
 
 from .layers.pre_layer import LlamaPreLayer
 from .layers.transformer_layer import LlamaTransformerLayer, TransformerEvents
@@ -26,16 +26,71 @@ class ModelForwardArgs:
     swap_out_seq_ids: list[int]
     cpu_num_decoding_seqs: int = 0
 
-@dataclasses.dataclass
-class ModelPerfResult:
-    avg_gpu_linr_time: float
-    avg_gpu_attn_time: float
-    avg_cpu_work_time: float
-    avg_cpu_attn_time: float
-    margin_layer_time: float # Time for pre-layer and post-layer
-    margin_stage_time: float = 0 # Time for first and last pipeline stage
+class ModelEvents:
+    def __init__(self, engine_config: EngineConfig):
+        self.engine_config = engine_config
+        self.frwd_s = torch.cuda.Event(enable_timing=True)
+        self.fstg_s = torch.cuda.Event(enable_timing=True)
+        self.mnbd_s = torch.cuda.Event(enable_timing=True)
+        self.mnbd_e = torch.cuda.Event(enable_timing=True)
+        self.lstg_e = torch.cuda.Event(enable_timing=True)
+        self.frwd_e = torch.cuda.Event(enable_timing=True)
 
-    total_time: float = 0 # Unused when measuring
+    def pf_record(self, name:str):
+        if self.engine_config.monitor_performance:
+            getattr(self, name).record()
+
+
+class ModelPerfResult:
+    def __init__(
+        self, 
+        layers: list[LlamaTransformerLayer],
+        model_events: ModelEvents,
+        use_pipline: bool
+    ):
+        torch.cuda.synchronize() # Ensure all events are recorded
+        if use_pipline:
+            self.linr_times = np.array([[layer.events[i].linr_time for i in range(2)] for layer in layers[:-1]])
+            self.pref_times = np.array([[layer.events[i].pref_time for i in range(2)] for layer in layers])
+            self.gdec_times = np.array([[layer.events[i].gdec_time for i in range(2)] for layer in layers])
+            self.cdec_times = np.array([[layer.events[i].cdec_time for i in range(2)] for layer in layers])
+            self.lnch_times = np.array([[layer.events[i].lnch_time for i in range(2)] for layer in layers])
+        else:
+            self.linr_times = np.array([sum(layer.events[i].linr_time for i in range(2)) for layer in layers])
+            self.pref_times = np.array([layer.events[0].pref_time for layer in layers])
+            self.gdec_times = np.array([layer.events[0].gdec_time for layer in layers])
+            self.cdec_times = np.array([layer.events[0].cdec_time for layer in layers])
+            self.lnch_times = np.array([layer.events[0].lnch_time for layer in layers])
+
+        self.prlr_time = model_events.frwd_s.elapsed_time(model_events.fstg_s)
+        self.fstg_time = model_events.fstg_s.elapsed_time(model_events.mnbd_s)
+        self.mnbd_time = model_events.mnbd_s.elapsed_time(model_events.mnbd_e)
+        self.lstg_time = model_events.mnbd_e.elapsed_time(model_events.lstg_e)
+        self.polr_time = model_events.lstg_e.elapsed_time(model_events.frwd_e)
+
+        self.avg_linr_time = self.linr_times.mean()
+        self.avg_pref_time = self.pref_times.mean()
+        self.avg_gdec_time = self.gdec_times.mean()
+        self.avg_cdec_time = self.cdec_times.mean()
+        self.avg_lnch_time = self.lnch_times.mean()
+
+    def __repr__(self):
+        return json.dumps({
+            "avg_linr_time": self.avg_linr_time,
+            "avg_pref_time": self.avg_pref_time,
+            "avg_gdec_time": self.avg_gdec_time,
+            "avg_cdec_time": self.avg_cdec_time,
+            "avg_lnch_time": self.avg_lnch_time
+        }, indent=2)
+
+    @staticmethod
+    def mean(results: list["ModelPerfResult"], name: str) -> float:
+        """
+        Compute the average of a field in a list of ModelPerfResult objects.
+        """
+        return np.array([getattr(result, name) for result in results]).mean()
+
+
 
 class LlamaModel:
     """
@@ -78,19 +133,15 @@ class LlamaModel:
         self.k_cache = self.v_cache = None
         self.k_swap = self.v_swap = None
 
-        # Block manager
-        self.cpu_block_manager = self.gpu_block_manager = None
-        self.kvargs = None
-
         if engine_config.library_path:
             torch.ops.load_library(engine_config.library_path)
         
+        self.cpu_communication_stream = torch.cuda.Stream()
+
         # List of performance results, unused if monitor_performance is False
         self.perf_results = []
+        self.events = ModelEvents(engine_config)
 
-        self.prefilling_stream = torch.cuda.Stream()
-        self.decoding_piggyback_stream = torch.cuda.Stream()
-        self.cpu_communication_stream = torch.cuda.Stream()
         
     @torch.inference_mode()
     def load_weights(self):
@@ -116,8 +167,6 @@ class LlamaModel:
                 self.engine_config,
                 self.weight.layers[layer_id],
                 self.weight.layers[layer_id + 1 - self.model_config.num_layers],
-                self.prefilling_stream,
-                self.decoding_piggyback_stream,
                 self.cpu_communication_stream,
                 layer_id
             )
@@ -149,7 +198,7 @@ class LlamaModel:
         seq_ids = list(range(batch_size))
         self.k_cache = self.v_cache = None # pylint: disable=attribute-defined-outside-init
         self.engine_config.ignore_kvcache = True
-        _ = self.forward(ModelForwardArgs(input_ids, seq_ids, []))
+        _ = self.forward(ModelForwardArgs(input_ids, seq_ids, [], []))
         self.engine_config.ignore_kvcache = False
         torch.cuda.synchronize()
 
@@ -355,7 +404,8 @@ class LlamaModel:
             )
         
         # Need to initiate swapping out after allocating blocks, so that blocks of the swapped-outs are not taken away
-        infer_state.src_block_ids, infer_state.dst_block_ids = self.swapper.initiate_swap_out(args.swap_out_seq_ids)
+        if args.swap_out_seq_ids:
+            infer_state.src_block_ids, infer_state.dst_block_ids = self.swapper.initiate_swap_out(args.swap_out_seq_ids)
         
         return _flattened_input_ids, infer_state
 
@@ -369,9 +419,7 @@ class LlamaModel:
         """
         Run a forward pass of the LlamaModel.
         """
-        if self.engine_config.monitor_performance:
-            forward_s_event = torch.cuda.Event(enable_timing=True)
-            forward_s_event.record()
+        self.events.pf_record("frwd_s")
 
         # Main body of the forward pass
         input_embds = self.pre_layer.forward(input_ids)
@@ -379,49 +427,26 @@ class LlamaModel:
         # Wait for swappings to finish
         torch.cuda.current_stream().wait_stream(self.cpu_communication_stream)
 
-        if self.engine_config.monitor_performance:
-            mainbody_s_event = torch.cuda.Event(enable_timing=True)
-            mainbody_s_event.record()
+        self.events.pf_record("fstg_s")
+        self.events.pf_record("mnbd_s")
         
         residual_buf = torch.zeros_like(input_embds)
+        ffn_out = input_embds
         for layer in self.transformer_layers:
             layer.set_infer_states([infer_state])
             layer.set_buffers([input_embds], [residual_buf])
-            input_embds = layer.forward()
-        input_embds += residual_buf
+            ffn_out = layer.forward(ffn_out)
+
+        self.events.pf_record("mnbd_e")
+        self.events.pf_record("lstg_e")
+
+        ffn_out += residual_buf
+        output_tokens = self.post_layer.forward(ffn_out, infer_state)
+
+        self.events.pf_record("frwd_e")
 
         if self.engine_config.monitor_performance:
-            mainbody_e_event = torch.cuda.Event(enable_timing=True)
-            mainbody_e_event.record()
-
-        output_tokens = self.post_layer.forward(input_embds, infer_state)
-
-        if self.engine_config.monitor_performance:
-            forward_e_event = torch.cuda.Event(enable_timing=True)
-            forward_e_event.record()
-            torch.cuda.synchronize()
-            prefill_times = [0 for _ in self.transformer_layers]
-            gpudec_times = [0 for _ in self.transformer_layers]
-            cpuwrk_times = [0 for _ in self.transformer_layers]
-            cpudec_times = [0 for _ in self.transformer_layers]
-            if infer_state.num_prefill_seqs > 0:
-                prefill_times = [layer.events[0].get_prefill_time() for layer in self.transformer_layers]
-            if infer_state.gpu_num_decoding_seqs > 0:
-                gpudec_times = [layer.events[0].get_gpudec_time() for layer in self.transformer_layers]
-            if infer_state.cpu_num_decoding_seqs > 0:
-                cpuwrk_times = [layer.events[0].get_cpuwrk_time() for layer in self.transformer_layers]
-                cpudec_times = [layer.events[0].get_cpudec_time() for layer in self.transformer_layers]
-
-            attn_total_time = sum(max(times) for times in zip(prefill_times, gpudec_times, cpudec_times))
-            linr_total_time = mainbody_s_event.elapsed_time(mainbody_e_event) - attn_total_time
-
-            self.perf_results.append(ModelPerfResult(
-                avg_gpu_linr_time = linr_total_time / len(self.transformer_layers),
-                avg_gpu_attn_time = sum(max(times) for times in zip(prefill_times, gpudec_times)) / len(self.transformer_layers),
-                avg_cpu_work_time = sum(cpuwrk_times) / len(self.transformer_layers),
-                avg_cpu_attn_time = sum(cpudec_times) / len(self.transformer_layers),
-                margin_layer_time = forward_s_event.elapsed_time(mainbody_s_event) + mainbody_e_event.elapsed_time(forward_e_event),
-            ))
+            self.perf_results.append(ModelPerfResult(self.transformer_layers, self.events, False))
 
         return output_tokens
     
@@ -456,9 +481,7 @@ class LlamaModel:
         Run a forward pass of the LlamaModel in a pipelined manner.
         """
 
-        if self.engine_config.monitor_performance:
-            forward_s_event = torch.cuda.Event(enable_timing=True)
-            forward_s_event.record()
+        self.events.pf_record("frwd_s")
 
         # input_embds would serve as a buffer for all attention outputs
         input_embeds = self.pre_layer.forward(input_ids)
@@ -466,20 +489,17 @@ class LlamaModel:
         input_embedss = torch.split(input_embeds, [infer_states[0].num_tokens, infer_states[1].num_tokens], dim=0)
         residual_bufs = torch.split(residual_buf, [infer_states[0].num_tokens, infer_states[1].num_tokens], dim=0)
 
-        if self.engine_config.monitor_performance:
-            pipeline_s_event = torch.cuda.Event(enable_timing=True)
-            pipeline_s_event.record()
 
         for layer in self.transformer_layers:
             layer.set_infer_states(infer_states)
             layer.set_buffers(input_embedss, residual_bufs)
             
+        self.events.pf_record("fstg_s")
+
         # First stage of the forward pass
         q1, k1, v1 = self.transformer_layers[-1].forward_first_stage()
 
-        if self.engine_config.monitor_performance:
-            mainbody_s_event = torch.cuda.Event(enable_timing=True)
-            mainbody_s_event.record()
+        self.events.pf_record("mnbd_s")
 
         # Main body of the forward pass
         # In every iteration, input_embds0 is updated to newer version of batch 0's attention output and 
@@ -487,63 +507,21 @@ class LlamaModel:
         for layer in self.transformer_layers[:-1]:
             q1, k1, v1 = layer.forward_double(q1, k1, v1)
 
-        if self.engine_config.monitor_performance:
-            mainbody_e_event = torch.cuda.Event(enable_timing=True)
-            mainbody_e_event.record()
+        self.events.pf_record("mnbd_e")
 
         # Last stage of the forward pass, also begin predicted swapping
         f0, f1 = self.transformer_layers[-1].forward_last_stage(q1, k1, v1)
 
-        if self.engine_config.monitor_performance:
-            pipeline_e_event = torch.cuda.Event(enable_timing=True)
-            pipeline_e_event.record()
+        self.events.pf_record("lstg_e")
 
         f0 += residual_bufs[0]
         f1 += residual_bufs[1]
-
         output_tokens = self.post_layer.forward_double(f0, f1, infer_states)
 
+        self.events.pf_record("frwd_e")
+
         if self.engine_config.monitor_performance:
-            forward_e_event = torch.cuda.Event(enable_timing=True)
-            forward_e_event.record()
-            torch.cuda.synchronize()
-            pre_layer_time = forward_s_event.elapsed_time(pipeline_s_event)
-            first_stage_time = pipeline_s_event.elapsed_time(mainbody_s_event)
-            last_stage_time = mainbody_e_event.elapsed_time(pipeline_e_event)
-            post_layer_time = pipeline_e_event.elapsed_time(forward_e_event)
-
-            linear_times = [None for _ in infer_states]
-            cpuwrk_times = [[0 for _ in self.transformer_layers] for _ in infer_states]
-            cpudec_times = [[0 for _ in self.transformer_layers] for _ in infer_states]
-
-            for i in range(2):
-                linear_times[i] = [layer.events[i].get_linear_time() for layer in self.transformer_layers]
-                if infer_states[1-i].cpu_num_decoding_seqs > 0:
-                    cpuwrk_times[i] = [layer.events[i].get_cpuwrk_time() for layer in self.transformer_layers]
-                    cpudec_times[i] = [layer.events[i].get_cpudec_time() for layer in self.transformer_layers]
-
-            num_layers = len(self.transformer_layers)
-
-            with open("breakdown.json", "w") as f:
-                json.dump({
-                    "prelayer_time": pre_layer_time,
-                    "postlayer_time": post_layer_time,
-                    "first_stage_time": first_stage_time,
-                    "last_stage_time": last_stage_time,
-                    "linear_times": [linear_times[i][j] for j in range(num_layers) for i in range(2)],
-                    "cpuwrk_times": [cpuwrk_times[i][j] for j in range(num_layers) for i in range(2)],
-                    "cpudec_times": [cpudec_times[i][j] for j in range(num_layers) for i in range(2)]
-                    
-                }, f, indent=2)
-            
-            self.perf_results.append(ModelPerfResult(
-                avg_gpu_linr_time = sum(time for i in range(2) for time in linear_times[i][:-1]) / (num_layers - 1) / 2,
-                avg_gpu_attn_time = 0, # attention goes in parallel with linear here, so omitted
-                avg_cpu_work_time = sum(time for i in range(2) for time in cpuwrk_times[i][:-1]) / (num_layers - 1) / 2,
-                avg_cpu_attn_time = sum(time for i in range(2) for time in cpudec_times[i][:-1]) / (num_layers - 1) / 2,
-                margin_layer_time = pre_layer_time + post_layer_time,
-                margin_stage_time = first_stage_time + last_stage_time
-            ))
+            self.perf_results.append(ModelPerfResult(self.transformer_layers, self.events, True))
 
         return output_tokens
 
@@ -572,6 +550,8 @@ class LlamaModel:
         """
         Swap in (move blocks from CPU to GPU) the specified sequences.
         """
+        if not seq_ids_list:
+            return
         src_block_ids, dst_block_ids = self.swapper.initiate_swap_in(seq_ids_list)
         with torch.cuda.stream(self.cpu_communication_stream):
             for layer_id in range(len(self.transformer_layers)):
@@ -585,6 +565,8 @@ class LlamaModel:
         """
         Swap out (move blocks from GPU to CPU) the specified sequences.
         """
+        if not seq_ids_list:
+            return
         src_block_ids, dst_block_ids = self.swapper.initiate_swap_out(seq_ids_list)
         with torch.cuda.stream(self.cpu_communication_stream):
             for layer_id in range(len(self.transformer_layers)):
@@ -595,53 +577,19 @@ class LlamaModel:
         """
         Free the resources of the specified sequences.
         """
+        if not seq_ids_list:
+            return
         gpu_seq_ids = torch.tensor(seq_ids_list, dtype=torch.int32, device="cuda")
         cpu_seq_ids = gpu_seq_ids.to("cpu")
         self.gpu_block_manager.free_blocks_for_seqs(gpu_seq_ids)
         self.cpu_block_manager.free_blocks_for_seqs(cpu_seq_ids)
 
-    @torch.inference_mode()
-    def get_perf_results(
-        self,
-        is_pipeline: bool = False
-    ) -> ModelPerfResult:
-        """
-        Show the performance results, which is calculated form the average of the list
-        
-        Then clear the results.
-        """
+    def turn_on_perf_monitor(self):
+        self.engine_config.monitor_performance = True
 
-        if not self.engine_config.monitor_performance:
-            print("Performance monitoring is not enabled.")
-            return
-
-        if not self.perf_results:
-            print("No performance results to show.")
-            return
-
-        avg_gpu_linr_time = sum(result.avg_gpu_linr_time for result in self.perf_results) / len(self.perf_results)
-        avg_gpu_attn_time = sum(result.avg_gpu_attn_time for result in self.perf_results) / len(self.perf_results)
-        avg_cpu_work_time = sum(result.avg_cpu_work_time for result in self.perf_results) / len(self.perf_results)
-        avg_cpu_attn_time = sum(result.avg_cpu_attn_time for result in self.perf_results) / len(self.perf_results)
-        margin_layer_time = sum(result.margin_layer_time for result in self.perf_results) / len(self.perf_results)
-        margin_stage_time = sum(result.margin_stage_time for result in self.perf_results) / len(self.perf_results)
-
-        if is_pipeline:
-            total_time = max(avg_gpu_linr_time, avg_gpu_attn_time, avg_cpu_work_time) * (len(self.transformer_layers) - 1) * 2 
-            total_time += margin_layer_time + margin_stage_time
-        else:
-            total_time = (avg_gpu_linr_time + max(avg_gpu_attn_time, avg_cpu_work_time)) * len(self.transformer_layers)
-            total_time += margin_layer_time + margin_stage_time
-
-        self.perf_results.clear()
-
-        return ModelPerfResult(
-            avg_gpu_linr_time,
-            avg_gpu_attn_time,
-            avg_cpu_work_time,
-            avg_cpu_attn_time,
-            margin_layer_time,
-            margin_stage_time,
-            total_time
-        )
+    def flush_perf_results_and_turn_off_perf_monitor(self):
+        self.engine_config.monitor_performance = False
+        ret = self.perf_results
+        self.perf_results = []
+        return ret
         

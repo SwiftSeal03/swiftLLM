@@ -121,51 +121,12 @@ class Scheduler:
 
     def __init__(self, model: LlamaModel):
         self.engine_config = model.engine_config
-        self.num_gpu_blocks = model.gpu_block_manager.num_blocks
-        self.num_cpu_blocks = model.cpu_block_manager.num_blocks
+        self.max_gpu_blocks = model.gpu_block_manager.num_blocks
+        self.max_cpu_blocks = model.cpu_block_manager.num_blocks
+        self.max_gpu_tokens = self.max_gpu_blocks * self.engine_config.block_size
+        self.max_cpu_tokens = self.max_cpu_blocks * self.engine_config.block_size
 
-        # Ensure engine can always prefill a sequence
-        assert self.engine_config.max_prefill_tokens <= self.engine_config.max_tokens_in_batch, \
-            f"max_prefill_tokens {self.engine_config.max_prefill_tokens} exceeds max_tokens_in_batch {self.engine_config.max_tokens_in_batch}"
-        assert self.engine_config.max_batch_size <= self.engine_config.max_tokens_in_batch, \
-            f"max_batch_size {self.engine_config.max_batch_size} exceeds max_tokens_in_batch {self.engine_config.max_tokens_in_batch}"
-        assert self.engine_config.max_batch_size <= self.engine_config.max_seqs_in_block_table, \
-            f"max_batch_size {self.engine_config.max_batch_size} exceeds max_seqs_in_block_table {self.engine_config.max_seqs_in_block_table}"
-        
-        profiler = ModelProfiler(model)
-        linr_S_list = [2 ** i for i in range(
-            (self.engine_config.block_size - 1).bit_length(),
-            (self.engine_config.max_tokens_in_batch - 1).bit_length(),
-        )] + [self.engine_config.max_tokens_in_batch]
-        linr_T_list = profiler.profile_linear(linr_S_list)
-
-        cdec_S_list = [2 ** i for i in range(
-            ((self.engine_config.max_tokens_on_cpu - 1) // self.engine_config.max_seq_len).bit_length(),
-            (self.engine_config.max_batch_size - 1).bit_length()
-        )] + [self.engine_config.max_batch_size]
-        cdec_N_list = [2 ** i for i in range(
-            ((self.engine_config.max_batch_size * self.engine_config.block_size) - 1).bit_length(),
-            (self.engine_config.max_tokens_on_cpu - 1).bit_length()
-        )] + [self.engine_config.max_tokens_on_cpu]
-
-        assert all(cdec_S_list[i] < cdec_S_list[i+1] for i in range(len(cdec_S_list)-1)), f"cdec_S_list {cdec_S_list} is not strictly increasing"
-        assert all(cdec_N_list[i] < cdec_N_list[i+1] for i in range(len(cdec_N_list)-1)), f"cdec_N_list {cdec_N_list} is not strictly increasing"
-        assert cdec_S_list[-1] <= self.engine_config.max_batch_size, f"cdec_S_list {cdec_S_list} exceeds max_batch_size {self.engine_config.max_batch_size}"
-        assert cdec_N_list[-1] <= self.engine_config.max_tokens_on_cpu, f"cdec_N_list {cdec_N_list} exceeds max_tokens_on_cpu {self.engine_config.max_tokens_on_cpu}"
-        assert (cdec_N_list[-1] - 1) // cdec_S_list[0] + 1 <= self.engine_config.max_seq_len, \
-            f"max_seq_len {self.engine_config.max_seq_len} is not enough for cdec_S_list[0] {cdec_S_list[0]} and cdec_N_list[-1] {cdec_N_list[-1]}"
-        assert cdec_N_list[0] // cdec_S_list[-1] >= self.engine_config.block_size, \
-            f"block_size {self.engine_config.block_size} is not enough for cdec_S_list[-1] {cdec_S_list[-1]} and cdec_N_list[0] {cdec_N_list[0]}"
-
-        cdec_T_list = profiler.profile_cpu_attn(cdec_S_list, cdec_N_list)
-        del profiler
-
-        self.linr_S_arr = np.array(linr_S_list)
-        self.linr_T_arr = np.array(linr_T_list)
-        self.cdec_S_arr = np.array(cdec_S_list)
-        self.cdec_N_arr = np.array(cdec_N_list)
-        self.cdec_T_arr = np.array(cdec_T_list)
-        self.kernel_launch_time = 1.0
+        self.profiler = ModelProfiler(model)
 
         # Request in the following three deques are sorted by their arrival time
         self.waiting_q: deque[Request] = deque()
@@ -175,7 +136,6 @@ class Scheduler:
         # Number of GPU blocks occupied by decoding requests
         # This number should always equal to sum(self._get_block_needed(req) for req in self.gpu_decoding_q)
         self.num_decoding_gpu_blocks = 0
-        self.num_free_cpu_blocks = self.engine_config.num_cpu_blocks
 
         self.request_id_manager = RequestIdManager(self.engine_config.max_seqs_in_block_table)
     
@@ -191,43 +151,7 @@ class Scheduler:
         """
         self.waiting_q.extend(requests)
 
-    def _get_linr_T(self, S: int) -> float:
-        """
-        Get the linear time for iteration width S, using linear interpolation
-        """
-        # Note that when S < 32, we use the time for S=32
-        assert S <= self.linr_S_arr[-1], f"Iteration width {S} exceeds the maximum {self.linr_S_arr[-1]}"
-        return np.interp(S, self.linr_S_arr, self.linr_T_arr)
-    
-    def _get_cdec_T(self, S: int, N: int) -> float:
-        """
-        Get the CPU decoding time for iteration width S and number of tokens N,
-        using bilinear interpolation
-        """
-        assert S <= self.cdec_S_arr[-1], f"CPU batch size {S} exceeds the maximum {self.cdec_S_arr[-1]}"
-        assert N <= self.cdec_N_arr[-1], f"Number of tokens {N} exceeds the maximum {self.cdec_N_arr[-1]}"
-        if S == 0:
-            return 0.0
-        idx = np.searchsorted(self.cdec_S_arr, S)
-        if idx == 0 or self.cdec_S_arr[idx] == S:
-            return np.interp(N, self.cdec_N_arr, self.cdec_T_arr[idx])
-        # S is between cdec_S_arr[idx-1] and cdec_S_arr[idx]
-        s0 = self.cdec_S_arr[idx-1]
-        s1 = self.cdec_S_arr[idx]
-        t0 = np.interp(N, self.cdec_N_arr, self.cdec_T_arr[idx-1])
-        t1 = np.interp(N, self.cdec_N_arr, self.cdec_T_arr[idx])
-        return np.interp(S, np.array([s0, s1]), np.array([t0, t1]))
-    
-    def _get_cpu_remaining_capacity(self, s: int, x_c: int, n_c: int):
-        """
-        Get the remaining CPU capacity for a batch with 
-        - (opposite batch's) iteration width s
-        - number of CPU decoding requests x_c,
-        - total number of tokens n_c
-        """
-        return self._get_linr_T(s) - self._get_cdec_T(x_c, n_c) - self.kernel_launch_time
-
-    def decide_mode_and_gen_batch(
+    def _decide_mode_and_gen_batch(
         self, 
         gpu_prefill_reqs: list[Request],
         cpu_prefill_reqs: list[Request],
@@ -292,8 +216,8 @@ class Scheduler:
         #     slf_Rs = [] # slf_Rs[i] is the R value of batch-i if we insert the req to batch-i
         #     opp_Rs = [] # opp_Rs[i] is the R value of batch-i if we insert the req to batch-(1-i)
         #     for i in range(2):
-        #         opp_Rs.append(self._get_cpu_remaining_capacity(batches[1-i].s + 1, batches[i].x_c, batches[i].n_c))
-        #         slf_Rs.append(self._get_cpu_remaining_capacity(batches[1-i].s, batches[i].x_c + 1, batches[i].n_c + req.seq_len))
+        #         opp_Rs.append(self.profiler.get_cpu_remaining_capacity(batches[1-i].s + 1, batches[i].x_c, batches[i].n_c))
+        #         slf_Rs.append(self.profiler.get_cpu_remaining_capacity(batches[1-i].s, batches[i].x_c + 1, batches[i].n_c + req.seq_len))
         #     min_R0 = min(slf_Rs[0], opp_Rs[1])
         #     min_R1 = min(slf_Rs[1], opp_Rs[0])
         #     # if min_R0 < 0 and min_R1 < 0:
@@ -306,10 +230,10 @@ class Scheduler:
 
         # The coefficient theoretically should be 2.0, but we use 2.4 here for performance guarantee
         if sum(b.x for b in batches) > 2.4 * sequential_batch.x:
-#             print(f"Estimated linear time: {(self._get_linr_T(batches[0].s) + self._get_linr_T(batches[1].s))/2}")
-#             print(f"Estimated CPU decoding time: {(self._get_cdec_T(batches[0].x_c, batches[0].n_c) + self._get_cdec_T(batches[1].x_c, batches[1].n_c))/2}")
-#             print(f"Remaining cpu capacity: {self._get_cpu_remaining_capacity(batches[0].s, batches[0].x_c, batches[0].n_c)},\
-#  {self._get_cpu_remaining_capacity(batches[1].s, batches[1].x_c, batches[1].n_c)}")
+#             print(f"Estimated linear time: {(self.profiler.get_linr_T(batches[0].s) + self.profiler.get_linr_T(batches[1].s))/2}")
+#             print(f"Estimated CPU decoding time: {(self.profiler.get_cdec_T(batches[0].x_c, batches[0].n_c) + self.profiler.get_cdec_T(batches[1].x_c, batches[1].n_c))/2}")
+#             print(f"Remaining cpu capacity: {self.profiler.get_cpu_remaining_capacity(batches[0].s, batches[0].x_c, batches[0].n_c)},\
+#  {self.profiler.get_cpu_remaining_capacity(batches[1].s, batches[1].x_c, batches[1].n_c)}")
             return batches[0], batches[1]
         else:
             return sequential_batch, None
@@ -332,13 +256,13 @@ class Scheduler:
 
         # Policy may change, should recompute these thresholds on every iteration
         if self.engine_config.always_use_gpu:
-            swap_out_threshold = self.num_gpu_blocks
+            swap_out_threshold = self.max_gpu_blocks
             swap_in_threshold = round(swap_out_threshold * 0.97)
             cpu_threshold = 0
         else:
-            swap_out_threshold = self.num_gpu_blocks - self.engine_config.max_prefill_tokens // self.engine_config.block_size
+            swap_out_threshold = self.max_gpu_blocks - self.engine_config.max_prefill_tokens // self.engine_config.block_size
             swap_in_threshold = round(swap_out_threshold * 0.8)
-            cpu_threshold = self.num_cpu_blocks - self.num_gpu_blocks
+            cpu_threshold = self.max_cpu_blocks - self.max_gpu_blocks
         
         # Step 1: Try to launch as many GPU decoding requests as possible
         gpu_block_needed = sum(self._get_block_needed(req) for req in self.gpu_decoding_q)
@@ -372,7 +296,7 @@ class Scheduler:
         while self.waiting_q:
             candidate = self.waiting_q[0]
             cur_block_needed = self._get_block_needed(candidate)
-            if gpu_block_needed + cur_block_needed > self.num_gpu_blocks or \
+            if gpu_block_needed + cur_block_needed > self.max_gpu_blocks or \
                (self.cpu_decoding_q and cpu_block_needed + cur_block_needed > cpu_threshold) or \
                self.request_id_manager.get_num_available_ids() == 0 or \
                not budget.check_and_substract(candidate.prompt_len, True):
@@ -393,7 +317,7 @@ class Scheduler:
         assert not (pref_to_cpu and self.engine_config.always_use_gpu), "In GPU-only mode, there should be no pre-swapped-out requests"
 
         # Step 5: Launch CPU decoding requests and form batches
-        batch0, batch1 = self.decide_mode_and_gen_batch(pref_to_gpu, pref_to_cpu, budget)
+        batch0, batch1 = self._decide_mode_and_gen_batch(pref_to_gpu, pref_to_cpu, budget)
 
         if self.gpu_decoding_q or self.cpu_decoding_q or pref_to_gpu or pref_to_cpu or self.waiting_q:
             print(f"Gdecs: {len(self.gpu_decoding_q)}, Cdecs: {len(self.cpu_decoding_q)}, Pr2gs: {len(pref_to_gpu)}, Pr2cs: {len(pref_to_cpu)}, Waiting: {len(self.waiting_q)}")
@@ -415,7 +339,7 @@ class Scheduler:
                 cur_seq_block_needed = self._get_block_needed(cur_seq)
                 if  cur_batch.x+1 <= self.engine_config.max_batch_size and \
                     len(self.gpu_decoding_q)+cur_batch.x+1 <= self.engine_config.max_batch_size and \
-                    cur_batch_block_needed + cur_seq_block_needed + self.num_decoding_gpu_blocks <= self.num_gpu_blocks and \
+                    cur_batch_block_needed + cur_seq_block_needed + self.num_decoding_gpu_blocks <= self.max_gpu_blocks and \
                     cur_num_tokens_sum + cur_seq.prompt_len <= self.engine_config.max_tokens_in_batch:
                     cur_batch.add_pref(cur_seq)
                     cur_batch_block_needed += cur_seq_block_needed
@@ -439,7 +363,7 @@ class Scheduler:
         self.num_decoding_gpu_blocks = sum(self._get_block_needed(req) for req in self.gpu_decoding_q)
         newly_swapped_out = []
         while len(self.gpu_decoding_q) > self.engine_config.max_batch_size or \
-              self.num_decoding_gpu_blocks > self.num_gpu_blocks:
+              self.num_decoding_gpu_blocks > self.max_gpu_blocks:
             # Preempt the last running seq
             victim = self.gpu_decoding_q.pop()
             self.num_decoding_gpu_blocks -= self._get_block_needed(victim)
@@ -455,7 +379,7 @@ class Scheduler:
                 cur_seq = self.cpu_decoding_q[0]
                 num_cur_seq_blocks = self._get_block_needed(cur_seq)
                 if len(self.gpu_decoding_q) + 1 <= self.engine_config.max_batch_size and \
-                   self.num_decoding_gpu_blocks + num_cur_seq_blocks <= self.num_gpu_blocks:
+                   self.num_decoding_gpu_blocks + num_cur_seq_blocks <= self.max_gpu_blocks:
                     self.gpu_decoding_q.append(cur_seq)
                     self.num_decoding_gpu_blocks += num_cur_seq_blocks
                     self.cpu_decoding_q.popleft()

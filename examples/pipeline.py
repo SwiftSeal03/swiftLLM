@@ -58,7 +58,8 @@ if __name__ == '__main__':
     # For instructions on how to initialize the model, see comments in swiftllm/worker/model.py
     model = swiftllm.LlamaModel(engine_config)
     model.load_weights()
-    num_blocks = 1700
+    # num_blocks = 1700
+    num_blocks = model.profile_num_blocks()
     print("Number of blocks:", num_blocks)
     model.init_kvcache_and_swap(num_blocks)
 
@@ -101,6 +102,8 @@ if __name__ == '__main__':
         prompt_phase_outputs.extend(cpu_prompt_outputs0 + cpu_prompt_outputs1)
     outputs.append(prompt_phase_outputs)
 
+    
+    # model.turn_on_perf_monitor()
     seq_lens = [len(x) for x in input_ids]
     last_round_outputs = prompt_phase_outputs
     for i in range(10):
@@ -132,3 +135,6 @@ if __name__ == '__main__':
         output_text = tokenizer.decode(output_tokens, skip_special_tokens=True)
         if i == 0 or i == nprompts - 1:
             print(f"{prompt}|{output_text}")
+
+    # res = model.flush_perf_results_and_turn_off_perf_monitor()
+    # print(res)
