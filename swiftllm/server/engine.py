@@ -8,12 +8,12 @@ import torch
 
 from swiftllm.engine_config import EngineConfig
 from swiftllm.model_config import LlamaModelConfig
-from swiftllm.worker.model import LlamaModel, ModelForwardArgs
+from swiftllm.worker.model import LlamaModel
 from swiftllm.utils import GB
+from swiftllm.structs import Request, RawRequest, StepOutput
 
 from .tokenization_engine import TokenizationEngine
-from .structs import Request, RawRequest, StepOutput
-from .scheduler import Scheduler, SubBatch
+from .scheduler import Scheduler
 
 class Engine:
     def __init__(self, engine_config: EngineConfig):

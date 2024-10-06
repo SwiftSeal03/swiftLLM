@@ -67,7 +67,7 @@ if __name__ == '__main__':
     print(f"Model creation time: {model_creation_time:.2f} seconds")
 
     ngpu_prompts = 40
-    ncpu_prompts = 200
+    ncpu_prompts = 20
     nprompts = ncpu_prompts + ngpu_prompts
     with open("/home/ubuntu/swiftLLM/examples/example.txt", "r") as f:
         prompts = f.readlines() * nprompts
@@ -75,7 +75,7 @@ if __name__ == '__main__':
     outputs = []
 
     # Prompt phase
-    input_ids = [x[:100] for x in tokenizer(prompts)['input_ids']]
+    input_ids = [x for x in tokenizer(prompts)['input_ids']]
     gpu_seq_ids = list(range(ngpu_prompts // 2)) + list(range(nprompts // 2, nprompts // 2 + ngpu_prompts // 2))
     cpu_seq_ids = list(range(ngpu_prompts // 2, nprompts // 2)) + list(range(nprompts // 2 + ngpu_prompts // 2, nprompts))
     if cpu_seq_ids:
@@ -103,7 +103,7 @@ if __name__ == '__main__':
     outputs.append(prompt_phase_outputs)
 
     
-    model.turn_on_perf_monitor()
+    # model.turn_on_perf_monitor()
     seq_lens = [len(x) for x in input_ids]
     last_round_outputs = prompt_phase_outputs
     for i in range(10):
@@ -136,5 +136,5 @@ if __name__ == '__main__':
         if i == 0 or i == nprompts - 1:
             print(f"{prompt}|{output_text}")
 
-    res = model.flush_perf_results_and_turn_off_perf_monitor()
-    print(res)
+    # res = model.flush_perf_results_and_turn_off_perf_monitor()
+    # print(res)

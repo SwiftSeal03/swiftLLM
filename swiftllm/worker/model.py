@@ -83,7 +83,7 @@ class ModelPerfResult:
 
     def __repr__(self):
         return json.dumps({
-            field: getattr(self, field) for field in self.fields_to_dump
+            field: getattr(self, field).tolist() for field in self.fields_to_dump
         }, indent=2)
 
     @staticmethod
@@ -155,7 +155,6 @@ class LlamaModel:
         self.perf_results = []
         self.events = ModelEvents(engine_config)
 
-        
     @torch.inference_mode()
     def load_weights(self):
         """
@@ -232,6 +231,7 @@ class LlamaModel:
     @torch.inference_mode()
     def init_kvcache_and_swap(self, num_blocks: int):
         self.num_blocks = num_blocks
+        self.num_buf_blocks = self.engine_config.max_blocks_per_seq
 
         # Initialize KV cache
         kvcache_shape = (
@@ -245,6 +245,16 @@ class LlamaModel:
         # has the possibility to contain NaNs, which will cause the model to output NaNs.
         self.k_cache = torch.zeros(kvcache_shape, dtype=torch.float16, device="cuda")
         self.v_cache = torch.zeros(kvcache_shape, dtype=torch.float16, device="cuda")
+
+        # Initialize KV buffer, which is used for cprf sequences
+        # kvbuf_shape = (
+        #     self.num_buf_blocks,
+        #     self.model_config.num_kv_heads,
+        #     self.engine_config.block_size,
+        #     self.model_config.head_dim
+        # )
+        # self.k_buf = torch.zeros(kvbuf_shape, dtype=torch.float16, device="cuda")
+        # self.v_buf = torch.zeros(kvbuf_shape, dtype=torch.float16, device="cuda")
 
         # Initialize KV swap space
         kvswap_shape = (

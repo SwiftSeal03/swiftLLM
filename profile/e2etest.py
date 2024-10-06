@@ -16,7 +16,7 @@ async def send_request_and_wait_non_streaming_mode(engine: swiftllm.Engine, toke
     start = time.perf_counter()
     (_, output_token_ids) = await engine.add_request_and_wait(raw_request)
     end = time.perf_counter()
-    # print(f"Output: {tokenizer.decode(output_token_ids)}")
+    print(f"Output: {tokenizer.decode(output_token_ids)}")
     return start, end
 
 async def run_latency_test(
@@ -86,7 +86,7 @@ async def warm_up(
     tokenizer: AutoTokenizer
 ):
     logger.info("Warming up...")
-    await run_throughput_test(300, prompt, 200, False, engine, tokenizer)
+    await run_throughput_test(10, prompt, 200, False, engine, tokenizer)
     logger.info("Warm up complete")
 
 
@@ -145,7 +145,7 @@ async def main():
     await warm_up(prompts[9], engine, tokenizer)
 
     for prompt in prompts:
-        if len(tokenizer.encode(prompt)) == 526:
+        if len(tokenizer.encode(prompt)) == 521:
             for outlen in range(100, 1000, 200):
                 await run_throughput_test(1200, prompt, outlen, False, engine, tokenizer)
                 await run_throughput_test(1200, prompt, outlen, True, engine, tokenizer)
