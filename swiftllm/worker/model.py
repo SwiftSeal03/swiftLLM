@@ -12,19 +12,11 @@ from swiftllm.model_config import LlamaModelConfig
 from swiftllm.worker.weight import load_weights
 from swiftllm.worker.block_manager import BlockManager, Swapper
 from swiftllm.utils import GB
+from swiftllm.structs import SubBatch
 
 from .layers.pre_layer import LlamaPreLayer
 from .layers.transformer_layer import LlamaTransformerLayer, TransformerEvents
 from .layers.post_layer import LlamaPostLayer
-from .infer_state import LlamaInferState
-
-@dataclasses.dataclass
-class ModelForwardArgs:
-    input_ids_list: list[list[int]]
-    seq_ids_list: list[int]
-    decoding_seq_lens_list: list[int]
-    swap_out_seq_ids: list[int]
-    cpu_num_decoding_seqs: int = 0
 
 class ModelEvents:
     def __init__(self, engine_config: EngineConfig):
@@ -141,10 +133,8 @@ class LlamaModel:
         self.transformer_layers = None
         self.post_layer = None
 
-        # KV Cache
-        self.num_blocks = None
-        self.k_cache = self.v_cache = None
-        self.k_swap = self.v_swap = None
+        # Swapper
+        self.swapper = None
 
         if engine_config.library_path:
             torch.ops.load_library(engine_config.library_path)
@@ -259,7 +249,8 @@ class LlamaModel:
         # Initialize KV swap space
         kvswap_shape = (
             self.model_config.num_layers,
-            self.engine_config.num_cpu_blocks,
+            # self.engine_config.num_cpu_blocks,
+            1000,
             self.model_config.num_kv_heads,
             self.engine_config.block_size,
             self.model_config.head_dim
@@ -275,14 +266,14 @@ class LlamaModel:
         self.o_cpu = torch.zeros((self.engine_config.max_batch_size, self.model_config.num_q_heads * self.model_config.head_dim), dtype=torch.float32, device="cpu", pin_memory=True)
 
         # Initialize block manager
-        self.gpu_block_manager = BlockManager(
+        gpu_block_manager = BlockManager(
             "cuda",
             self.num_blocks,
             self.engine_config.max_seqs_in_block_table,
             self.engine_config.max_blocks_per_seq,
             self.engine_config.block_size
         )
-        self.cpu_block_manager = BlockManager(
+        cpu_block_manager = BlockManager(
             "cpu",
             self.engine_config.num_cpu_blocks,
             self.engine_config.max_seqs_in_block_table,
@@ -296,8 +287,8 @@ class LlamaModel:
             self.v_cache,
             self.k_swap,
             self.v_swap,
-            self.gpu_block_manager,
-            self.cpu_block_manager
+            gpu_block_manager,
+            cpu_block_manager
         )
 
         for layer in self.transformer_layers:
@@ -310,8 +301,8 @@ class LlamaModel:
                 self.k_cpu,
                 self.v_cpu,
                 self.o_cpu,
-                self.gpu_block_manager.block_table,
-                self.cpu_block_manager.block_table,
+                self.swapper.gpu_block_manager.block_table,
+                self.swapper.cpu_block_manager.block_table,
                 self.swapper
             )
 
@@ -325,128 +316,68 @@ class LlamaModel:
         t = torch.arange(max_seq_len + 128, device="cuda", dtype=torch.float32) / rope_scaling_factor
         freqs = torch.outer(t, inv_freq)
 
-        self._cos_cached = torch.cos(freqs).to(torch.float16)
-        self._sin_cached = torch.sin(freqs).to(torch.float16)
+        self.cos_cached = torch.cos(freqs).to(torch.float16)
+        self.sin_cached = torch.sin(freqs).to(torch.float16)
 
-    @torch.inference_mode()
     def _prepare_inputs(
         self,
-        args: ModelForwardArgs,
-    ) -> tuple[list[int], LlamaInferState]:
+        batch: SubBatch
+    ):
         """
-        Gets input lists and reformats them into a single tensor.
-
-        Also generates the infer_state object and allocates blocks for the sequences.
+        Prepare the inputs for the forward pass.
         """
+        batch.set_model_forward_args()
 
-        _flattened_input_ids = list(itertools.chain(*args.input_ids_list))
-
-        batch_size = len(args.input_ids_list)
-        _num_decoding_seqs = len(args.decoding_seq_lens_list)
-        num_prefill_seqs = batch_size - _num_decoding_seqs
-        gpu_num_decoding_seqs = _num_decoding_seqs - args.cpu_num_decoding_seqs
-        _gpu_seq_end = batch_size - args.cpu_num_decoding_seqs
-
-        _prefill_seq_lens_list = [len(seq) for seq in args.input_ids_list[:num_prefill_seqs]]
-        _prefill_start_locs_with_end = [0] + list(itertools.accumulate(_prefill_seq_lens_list))
+        batch.softmax_scale = self.model_config.head_dim ** -0.5
 
         position_indices = torch.tensor(
-            [i for seq_len in _prefill_seq_lens_list for i in range(seq_len)] +
-            [seq_len - 1 for seq_len in args.decoding_seq_lens_list],
-            dtype=torch.int32,
-            device="cuda"
+            sum([list(range(req.prompt_len)) for req in batch.pref_reqs], []) + \
+                [req.seq_len - 1 for req in batch.deco_reqs],
+            dtype=torch.int32, device='cuda'
         )
+        batch.position_cos = self.cos_cached[position_indices]
+        batch.position_sin = self.sin_cached[position_indices]
 
-        # Select the seq_block_size
-        #
-        # Here we use a simple heuristic:
-        #
-        # In paged attention phase 1, the grid shape is (num_decoding_seqs, num_kv_heads, cdiv(max_decoding_len, seq_block_size))
-        # and among these blocks, num_kv_heads * sum(cdiv(decoding_seq_lens, seq_block_size)) blocks are useful.
-        # Thus we set seq_block_size to be the largest integer that satisfies
-        #      num_kv_heads * sum(cdiv(decoding_seq_lens, seq_block_size)) >= 1024
-        # to fully utilize the GPU. Here 1024 is a magic number (since most high-end
-        # GPUs have ~128 SMs, so ~512 SMSPs. Since the decoding-stage attention
-        # is mostly a memory-bound operation, I think 1024 is a reasonable number.)
-        #
-        # In practice, we use `decoding_seq_lens_sum/seq_block_size` to approximate
-        # sum(cdiv(decoding_seq_lens, seq_block_size))
-
-        _max_decoding_len = max(args.decoding_seq_lens_list + [0])
+        sum_gdec_toks = sum(batch.gdec_seq_lens_list)
+        max_gdec_toks = max(batch.gdec_seq_lens_list, default=0)
         seq_block_size = 2048
-        decoding_seq_lens_sum = sum(args.decoding_seq_lens_list)
-        while self.model_config.num_kv_heads*(decoding_seq_lens_sum/seq_block_size) < 1024 and seq_block_size//2 >= 64 and \
-            _max_decoding_len / (seq_block_size//2) <= 128:
+        num_kv_heads = self.model_config.num_kv_heads
+        while num_kv_heads*(sum_gdec_toks/seq_block_size) < 1024 and seq_block_size//2 >= 64 and \
+            max_gdec_toks / (seq_block_size//2) <= 128:
             seq_block_size //= 2
-        num_seq_blocks = (_max_decoding_len + seq_block_size - 1) // seq_block_size
+        batch.seq_block_size = seq_block_size
+        batch.num_seq_blocks = (max_gdec_toks + seq_block_size - 1) // seq_block_size
 
-        _position_cos = self._cos_cached.index_select(0, position_indices)
-        _position_sin = self._sin_cached.index_select(0, position_indices)
-
-        infer_state = LlamaInferState(
-            softmax_scale = self.model_config.head_dim ** -0.5,
-
-            batch_size = batch_size,
-            num_tokens = len(_flattened_input_ids),
-            num_prefill_seqs = num_prefill_seqs,
-            gpu_num_decoding_seqs = gpu_num_decoding_seqs,
-            cpu_num_decoding_seqs = args.cpu_num_decoding_seqs,
-
-            gpu_seq_ids = torch.tensor(args.seq_ids_list[:_gpu_seq_end], dtype=torch.int32, device="cuda"),
-            cpu_seq_ids = torch.tensor(args.seq_ids_list[_gpu_seq_end:], dtype=torch.int32, device="cpu"),
-
-            num_prefill_tokens = sum(_prefill_seq_lens_list),
-            max_prefill_len = max(_prefill_seq_lens_list + [0]),
-
-            prefill_seq_lens = torch.tensor(_prefill_seq_lens_list, dtype=torch.int32, device="cuda"),
-            prefill_seq_start_locs = torch.tensor(_prefill_start_locs_with_end[:-1], dtype=torch.int32, device="cuda"),
-            prefill_seq_start_locs_with_end = torch.tensor(_prefill_start_locs_with_end, dtype=torch.int32, device="cuda"),
-
-            gpu_decoding_seq_lens = torch.tensor(args.decoding_seq_lens_list[:gpu_num_decoding_seqs], dtype=torch.int32, device="cuda"),
-            cpu_decoding_seq_lens = torch.tensor(args.decoding_seq_lens_list[gpu_num_decoding_seqs:], dtype=torch.int32, device="cpu"),
-
-            seq_block_size = seq_block_size,
-            num_seq_blocks = num_seq_blocks,
-
-            position_cos = _position_cos,
-            position_sin = _position_sin,
-
-            src_block_ids=[],
-            dst_block_ids=[]
-        )
-
-        if not self.engine_config.ignore_kvcache:
-            self.gpu_block_manager.allocate_blocks_for_seqs(
-                infer_state.gpu_seq_ids,
-                torch.cat([infer_state.prefill_seq_lens, infer_state.gpu_decoding_seq_lens])
+        if self.swapper is not None:
+            self.swapper.gpu_block_manager.allocate_blocks_for_seqs(
+                batch.prgd_seq_ids, batch.prgd_seq_lens
             )
-
-            self.cpu_block_manager.allocate_blocks_for_seqs(
-                infer_state.cpu_seq_ids,
-                infer_state.cpu_decoding_seq_lens
+            self.swapper.cpu_block_manager.allocate_blocks_for_seqs(
+                batch.cdec_seq_ids, batch.cdec_seq_lens
             )
         
-        # Need to initiate swapping out after allocating blocks, so that blocks of the swapped-outs are not taken away
-        if args.swap_out_seq_ids:
-            infer_state.src_block_ids, infer_state.dst_block_ids = self.swapper.initiate_swap_out(args.swap_out_seq_ids)
-        
-        return _flattened_input_ids, infer_state
-
+            if batch.cprf_reqs:
+                batch.src_blk_ids, batch.dst_blk_ids = self.swapper.initiate_swap_out(
+                    [req.request_id for req in batch.cprf_reqs]
+                )
+        else:
+            assert not batch.cprf_reqs and not batch.gdec_reqs and not batch.cdec_reqs
 
     @torch.inference_mode()
-    def _forward(
+    def forward(
         self,
-        input_ids: torch.Tensor,    # [total_token_num]
-        infer_state: LlamaInferState
-    ) -> torch.Tensor:
+        batch: SubBatch
+    ):
         """
         Run a forward pass of the LlamaModel.
         """
+        self._prepare_inputs(batch)
+
         self.events.pf_record("frwd_s")
 
         # Main body of the forward pass
         # start = time.perf_counter()
-        input_embds = self.pre_layer.forward(input_ids)
+        input_embds = self.pre_layer.forward(batch.input_token_ids)
 
         # Wait for swappings to finish
         torch.cuda.current_stream().wait_stream(self.cpu_communication_stream)
@@ -457,7 +388,7 @@ class LlamaModel:
         residual_buf = torch.zeros_like(input_embds)
         ffn_out = input_embds
         for layer in self.transformer_layers:
-            layer.set_infer_states([infer_state])
+            layer.set_batches([batch])
             layer.set_buffers([input_embds], [residual_buf])
             ffn_out = layer.forward(ffn_out)
 
@@ -465,62 +396,43 @@ class LlamaModel:
         self.events.pf_record("lstg_e")
 
         ffn_out += residual_buf
-        output_tokens = self.post_layer.forward(ffn_out, infer_state)
+        output_tokens = self.post_layer.forward(ffn_out, batch)
 
         self.events.pf_record("frwd_e")
-        torch.cuda.synchronize()
         # duration = time.perf_counter() - start
         # print(f"Forward time: {duration*1000:.2f}ms")
+
+        batch.update_output(output_tokens)
 
         if self.engine_config.monitor_performance:
             self.perf_results.append(ModelPerfResult(self.transformer_layers, self.events, False))
 
-        return output_tokens
     
     @torch.inference_mode()
-    def forward(
+    def forward_pipeline(
         self,
-        args: ModelForwardArgs,
-    ) -> list[int]:
-        """
-        Run a forward pass of the LlamaModel.
-
-        This function is a wrapper of the `_forward` function. It prepares the infer_state
-        and calls the `_forward` function.
-
-        This function is intended to be called by the server.
-        """
-
-        flattened_input_ids, infer_state = self._prepare_inputs(args)
-        assert infer_state.batch_size <= self.engine_config.max_batch_size, \
-            f"Batch size {infer_state.batch_size} exceeds the maximum batch size {self.engine_config.max_batch_size}"
-
-        return self._forward(
-            torch.tensor(flattened_input_ids, dtype=torch.int32, device="cuda"),
-            infer_state,
-        ).tolist()
-    
-    @torch.inference_mode()
-    def _forward_pipeline(
-        self,
-        input_ids: torch.Tensor,
-        infer_states: list[LlamaInferState],
-    ) -> torch.Tensor:
+        batches: list[SubBatch]
+    ):
         """
         Run a forward pass of the LlamaModel in a pipelined manner.
         """
 
+        for batch in batches:
+            self._prepare_inputs(batch)
+
         self.events.pf_record("frwd_s")
 
         # input_embds would serve as a buffer for all attention outputs
-        input_embeds = self.pre_layer.forward(input_ids)
+        input_embeds = self.pre_layer.forward(sum([b.input_token_ids for b in batches], []))
         residual_buf = torch.zeros_like(input_embeds)
-        input_embedss = torch.split(input_embeds, [infer_states[0].num_tokens, infer_states[1].num_tokens], dim=0)
-        residual_bufs = torch.split(residual_buf, [infer_states[0].num_tokens, infer_states[1].num_tokens], dim=0)
+        s0 = batches[0].metadata.s
+        s1 = batches[1].metadata.s
+        input_embedss = torch.split(input_embeds, [s0, s1], dim=0)
+        residual_bufs = torch.split(residual_buf, [s0, s1], dim=0)
 
 
         for layer in self.transformer_layers:
-            layer.set_infer_states(infer_states)
+            layer.set_batches(batches)
             layer.set_buffers(input_embedss, residual_bufs)
             
         self.events.pf_record("fstg_s")
@@ -545,34 +457,16 @@ class LlamaModel:
 
         f0 += residual_bufs[0]
         f1 += residual_bufs[1]
-        output_tokens = self.post_layer.forward_double(f0, f1, infer_states)
+        output_tokens = self.post_layer.forward_double(f0, f1, batches)
 
         self.events.pf_record("frwd_e")
 
+        x0 = batches[0].metadata.x
+        batches[0].update_output(output_tokens[:x0])
+        batches[1].update_output(output_tokens[x0:])
+
         if self.engine_config.monitor_performance:
             self.perf_results.append(ModelPerfResult(self.transformer_layers, self.events, True))
-
-        return output_tokens
-
-    @torch.inference_mode()
-    def forward_pipeline(
-        self,
-        argss: list[ModelForwardArgs],
-    ) -> list[int]:
-        """
-        Forward 2 sub-batches in a pipelined manner.
-        """
-        assert len(argss) == 2
-        finput_ids0, infer_state0 = self._prepare_inputs(argss[0])
-        finput_ids1, infer_state1 = self._prepare_inputs(argss[1])
-
-        assert infer_state0.batch_size + infer_state1.batch_size <= self.engine_config.max_batch_size, \
-            f"Batch size {infer_state0.batch_size + infer_state1.batch_size} exceeds the maximum batch size {self.engine_config.max_batch_size}"
-
-        return self._forward_pipeline(
-            torch.tensor(finput_ids0 + finput_ids1, dtype=torch.int32, device="cuda"),
-            [infer_state0, infer_state1]
-        ).tolist()
         
     @torch.inference_mode()
     def swap_in_seqs(
@@ -613,8 +507,8 @@ class LlamaModel:
             return
         gpu_seq_ids = torch.tensor(seq_ids_list, dtype=torch.int32, device="cuda")
         cpu_seq_ids = gpu_seq_ids.to("cpu")
-        self.gpu_block_manager.free_blocks_for_seqs(gpu_seq_ids)
-        self.cpu_block_manager.free_blocks_for_seqs(cpu_seq_ids)
+        self.swapper.gpu_block_manager.free_blocks_for_seqs(gpu_seq_ids)
+        self.swapper.cpu_block_manager.free_blocks_for_seqs(cpu_seq_ids)
 
     def turn_on_perf_monitor(self):
         self.engine_config.monitor_performance = True

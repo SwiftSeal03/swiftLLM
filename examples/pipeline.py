@@ -67,73 +67,62 @@ if __name__ == '__main__':
     print(f"Model creation time: {model_creation_time:.2f} seconds")
 
     ngpu_prompts = 40
-    ncpu_prompts = 20
+    ncpu_prompts = 40
     nprompts = ncpu_prompts + ngpu_prompts
     with open("/home/ubuntu/swiftLLM/examples/example.txt", "r") as f:
-        prompts = f.readlines() * nprompts
+        prompt = ' '.join(f.readlines())
     tokenizer = AutoTokenizer.from_pretrained(model_path)
     outputs = []
 
     # Prompt phase
-    input_ids = [x for x in tokenizer(prompts)['input_ids']]
+    input_ids = tokenizer(prompt)['input_ids']
     gpu_seq_ids = list(range(ngpu_prompts // 2)) + list(range(nprompts // 2, nprompts // 2 + ngpu_prompts // 2))
     cpu_seq_ids = list(range(ngpu_prompts // 2, nprompts // 2)) + list(range(nprompts // 2 + ngpu_prompts // 2, nprompts))
+    reqs = [None] * nprompts
     if cpu_seq_ids:
-        cpu_prompt_outputs0 = model.forward(swiftllm.ModelForwardArgs(
-            input_ids[ngpu_prompts:ngpu_prompts + ncpu_prompts // 2],
-            cpu_seq_ids[:ncpu_prompts // 2],
-            [], []
-        ))
-        model.swap_out_seqs(cpu_seq_ids[:ncpu_prompts // 2])
-        cpu_prompt_outputs1 = model.forward(swiftllm.ModelForwardArgs(
-            input_ids[ngpu_prompts + ncpu_prompts // 2:],
-            cpu_seq_ids[ncpu_prompts // 2:],
-            [], []
-        ))
-        model.swap_out_seqs(cpu_seq_ids[ncpu_prompts // 2:])
-    prompt_phase_outputs = []
+        batch = swiftllm.SubBatch()
+        for i in range(0, ncpu_prompts // 2):
+            seq_id = cpu_seq_ids[i]
+            reqs[seq_id] = swiftllm.create_request(input_ids, seq_id)
+            batch.add_pref(reqs[seq_id], is_gpu=False)
+        model.forward(batch)
+        batch = swiftllm.SubBatch()
+        for i in range(ncpu_prompts // 2, ncpu_prompts):
+            seq_id = cpu_seq_ids[i]
+            reqs[seq_id] = swiftllm.create_request(input_ids, seq_id)
+            batch.add_pref(reqs[seq_id], is_gpu=False)
+        model.forward(batch)
     if gpu_seq_ids:
-        prompt_phase_outputs = model.forward(swiftllm.ModelForwardArgs(
-            input_ids[:ngpu_prompts],
-            gpu_seq_ids,
-            [], []
-        ))
-    if cpu_seq_ids:
-        prompt_phase_outputs.extend(cpu_prompt_outputs0 + cpu_prompt_outputs1)
-    outputs.append(prompt_phase_outputs)
+        batch = swiftllm.SubBatch()
+        for i in range(0, ngpu_prompts):
+            seq_id = gpu_seq_ids[i]
+            reqs[seq_id] = swiftllm.create_request(input_ids, seq_id)
+            batch.add_pref(reqs[seq_id], is_gpu=True)
+        model.forward(batch)
 
-    
     # model.turn_on_perf_monitor()
-    seq_lens = [len(x) for x in input_ids]
-    last_round_outputs = prompt_phase_outputs
-    for i in range(10):
+    for _ in range(10):
+        batches = [swiftllm.SubBatch() for _ in range(2)]
+        for i in range(ngpu_prompts // 2):
+            batches[0].add_gdec(reqs[i])
+        for i in range(ngpu_prompts // 2, nprompts // 2):
+            batches[1].add_cdec(reqs[i])
+        for i in range(nprompts // 2, nprompts // 2 + ngpu_prompts // 2):
+            batches[1].add_gdec(reqs[i])
+        for i in range(nprompts // 2 + ngpu_prompts // 2, nprompts):
+            batches[0].add_cdec(reqs[i])
+        reqs.append(swiftllm.create_request(input_ids, len(reqs)))
+        batches[0].add_pref(reqs[-1], is_gpu=True)
+        reqs.append(swiftllm.create_request(input_ids, len(reqs)))
+        batches[1].add_pref(reqs[-1], is_gpu=True)
         start = time.perf_counter()
-        for j in range(nprompts):
-            seq_lens[j] += 1
-        last_round_outputs0 = last_round_outputs[:nprompts // 2]
-        last_round_outputs1 = last_round_outputs[nprompts // 2:]
-        argss = [None] * 2
-        for j in range(2):
-            argss[j] = swiftllm.ModelForwardArgs(
-                [input_ids[0]] + 
-                [[x] for x in last_round_outputs0],
-                [nprompts + i * 2 + j] + 
-                list(range(0, nprompts // 2) if j == 0 else range(nprompts // 2, nprompts)),
-                seq_lens[:nprompts // 2] if j == 0 else seq_lens[nprompts // 2:],
-                [],
-                cpu_num_decoding_seqs=ncpu_prompts // 2
-            )
-        last_round_outputs = model.forward_pipeline(argss)
-        last_round_outputs = last_round_outputs[1:nprompts // 2 + 1] + last_round_outputs[nprompts // 2 + 2:]
-        # print(tokenizer.batch_decode(last_round_outputs, skip_special_tokens=True))
-        outputs.append(last_round_outputs)
+        model.forward_pipeline(batches)
         end = time.perf_counter()
         print(f"E2E decoding time: {(end - start) * 1000:.4f} ms")
     
-    for i, prompt in enumerate(prompts):
-        output_tokens = [x[i] for x in outputs]
-        output_text = tokenizer.decode(output_tokens, skip_special_tokens=True)
+    for i in range(nprompts):
         if i == 0 or i == nprompts - 1:
+            output_text = tokenizer.decode(reqs[i].output_token_ids, skip_special_tokens=True)
             print(f"{prompt}|{output_text}")
 
     # res = model.flush_perf_results_and_turn_off_perf_monitor()

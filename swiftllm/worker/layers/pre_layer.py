@@ -14,8 +14,9 @@ class LlamaPreLayer:
     
     def forward(
         self,
-        input_ids: torch.Tensor
+        input_ids: list[int]
     ) -> torch.Tensor:
-        input_embdings = torch.embedding(self.weights.wte, input_ids, padding_idx=-1)
+        input_gpu = torch.tensor(input_ids, dtype=torch.int32, device='cuda')
+        input_embdings = torch.embedding(self.weights.wte, input_gpu, padding_idx=-1)
         return input_embdings
     

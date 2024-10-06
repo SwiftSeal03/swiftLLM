@@ -6,7 +6,8 @@ from swiftllm.server.engine import Engine
 from swiftllm.structs import RawRequest
 
 # The Model for offline inference
-from swiftllm.worker.model import LlamaModel, ModelForwardArgs, ModelPerfResult
+from swiftllm.worker.model import LlamaModel, ModelPerfResult
+from swiftllm.structs import create_request, SubBatch
 
 # The Profiler
 from swiftllm.worker.profiler import ModelProfiler

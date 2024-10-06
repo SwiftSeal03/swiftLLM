@@ -64,8 +64,8 @@ class Scheduler:
     def __init__(self, model: LlamaModel):
         self.engine_config = model.engine_config
         self.model_config = model.model_config
-        self.max_gpu_blocks = model.gpu_block_manager.num_blocks
-        self.max_cpu_blocks = model.cpu_block_manager.num_blocks
+        self.max_gpu_blocks = model.swapper.gpu_block_manager.num_blocks
+        self.max_cpu_blocks = model.swapper.cpu_block_manager.num_blocks
         self.max_gpu_tokens = self.max_gpu_blocks * self.engine_config.block_size
         self.max_cpu_tokens = self.max_cpu_blocks * self.engine_config.block_size
 
@@ -114,8 +114,8 @@ class Scheduler:
             (batch0, batch1) if using pipelined mode
         """
         assert not self.engine_config.always_use_gpu, "This function is not designed for GPU-only mode"
-        batches = [SubBatch(self.profiler) for _ in range(2)]
-        gpu_only_batch = SubBatch(self.profiler)
+        batches = [SubBatch(self.profiler.pp) for _ in range(2)]
+        gpu_only_batch = SubBatch()
 
         # Step 1: put all pref and gdec sequences into the first batch.
         for req in gpu_prefill_reqs:
@@ -134,9 +134,9 @@ class Scheduler:
             return []
 
         # Step 2: adjust the number of prefilled sequences in gpu_only_batch
-        while gpu_only_batch.num_prefs:
+        while gpu_only_batch.get_num_prefs():
             req, is_gpu = gpu_only_batch.pop_pref()
-            if gpu_only_batch.metadata.s < self.profiler.linr_S_threshold:
+            if gpu_only_batch.metadata.s < self.profiler.pp.linr_S_threshold:
                 gpu_only_batch.add_pref(req, is_gpu)
                 break
         if not self.cpu_decoding_q:
@@ -163,7 +163,7 @@ class Scheduler:
             next_batch_idx = remains[1] > remains[0]
 
         # Step 4: reduce the number of prefilled sequences in the first batch if CPU is idle for too long
-        while batches[0].num_prefs:
+        while batches[0].get_num_prefs():
             req, is_gpu = batches[0].pop_pref()
             if batches[0].metadata.s < self.profiler.linr_S_threshold or min(self._get_remains(batches)) < 0:
                 batches[0].add_pref(req, is_gpu)
@@ -258,7 +258,7 @@ class Scheduler:
         batches = self._decide_mode_and_gen_batch(pref_to_gpu, pref_to_cpu, budget)
 
         # Step 6: Launch prefilled requests for real
-        real_num_prefs = sum(b.num_prefs for b in batches)
+        real_num_prefs = sum(b.get_num_prefs() for b in batches)
         pref_to_gpu = pref_to_gpu[:real_num_prefs]
         pref_to_cpu = pref_to_cpu[:real_num_prefs - len(pref_to_gpu)]
         for _ in range(real_num_prefs):
@@ -278,7 +278,7 @@ Pr2gs: {len(pref_to_gpu)}, Pr2cs: {len(pref_to_cpu)}, Waiting: {len(self.waiting
         print(f"Waiting: {len(self.waiting_q)}, Gdecs: {len(self.gpu_decoding_q)}, Cdecs: {len(self.cpu_decoding_q)}")
         if not self.cpu_decoding_q:
             # Try to launch a new prefill batch
-            cur_batch = SubBatch(self.profiler)
+            cur_batch = SubBatch()
             cur_batch_block_needed = 0
             cur_num_tokens_sum = 0
             while self.waiting_q:

@@ -151,25 +151,20 @@ class Engine:
             swp_finish = time.perf_counter()
             
             # Forward the model
-            argss = [batch.get_model_forward_args() for batch in batches]
-            if len(argss) == 1:
+            if len(batches) == 1:
                 # Sequential mode
-                reqs = batches[0].get_all_reqs()
-                print(f"Using sequential mode (batch_size = {len(reqs)})")
-                output_tokens = await self._run_on_model_async(self.model.forward, argss[0])
+                print(f"Using sequential mode (batch_size = {len(batches[0])})")
+                await self._run_on_model_async(self.model.forward, batches[0])
             else:
                 # Pipelined mode
-                reqs = sum([batch.get_all_reqs() for batch in batches], [])
-                print(f"Using pipelined mode (batch_size = {len(reqs)})")
+                print(f"Using pipelined mode (batch_size = {len(batches[0]) + len(batches[1])})")
                 self.engine_config.monitor_performance = True
-                output_tokens = await self._run_on_model_async(self.model.forward_pipeline, argss)
+                await self._run_on_model_async(self.model.forward_pipeline, batches)
 
             # Deal with output tokens
+            reqs = sum([b.all_reqs for b in batches], [])
             finished_req_ids = []
-            for req, output_token in zip(reqs, output_tokens):
-                req.cur_output_len += 1
-                req.output_token_ids.append(output_token)
-                req.output_q.put_nowait(StepOutput(output_token, req))
+            for req in reqs:
                 if req.is_finished():
                     finished_req_ids.append(req.request_id)
                     req.finished_event.set()

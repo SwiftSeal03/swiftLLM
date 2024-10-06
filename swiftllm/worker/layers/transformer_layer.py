@@ -12,8 +12,8 @@ from swiftllm_c import \
 from swiftllm.model_config import LlamaModelConfig
 from swiftllm.engine_config import EngineConfig
 from swiftllm.worker.weight import LlamaTransformerLayerWeight
-from swiftllm.worker.infer_state import LlamaInferState
 from swiftllm.worker.block_manager import Swapper
+from swiftllm.structs import SubBatch
 
 from swiftllm.worker.kernels.linear import linear
 # from swiftllm.worker.kernels.rotary_emb import rotary_embedding_inplace
@@ -113,8 +113,8 @@ class LlamaTransformerLayer:
         self.cpu_block_table = cpu_block_table
         self.swapper = swapper
 
-    def set_infer_states(self, infer_states: list[LlamaInferState]):
-        self.infer_states = infer_states
+    def set_batches(self, batches: list[SubBatch]):
+        self.batches = batches
 
     def set_buffers(
         self,
@@ -135,36 +135,33 @@ class LlamaTransformerLayer:
         """
         Initiate transfer of QKV to CPU buffers
         """
-        infer_state = self.infer_states[batch_id]
-        if infer_state.cpu_num_decoding_seqs > 0:
+        batch = self.batches[batch_id]
+        if batch.num_cdecs > 0:
             with torch.cuda.stream(self.cpu_communication_stream):
                 # Wait until QKV is ready
                 torch.cuda.current_stream().wait_stream(torch.cuda.default_stream())
-                qc = self.q_cpu[:infer_state.cpu_num_decoding_seqs]
-                kc = self.k_cpu[:infer_state.cpu_num_decoding_seqs]
-                vc = self.v_cpu[:infer_state.cpu_num_decoding_seqs]
-                qc.copy_(q[infer_state.gpu_token_end:], non_blocking=True)
-                kc.copy_(k[infer_state.gpu_token_end:], non_blocking=True)
-                vc.copy_(v[infer_state.gpu_token_end:], non_blocking=True)
+                qc = self.q_cpu[:batch.num_cdecs]
+                kc = self.k_cpu[:batch.num_cdecs]
+                vc = self.v_cpu[:batch.num_cdecs]
+                qc.copy_(q[-batch.num_cdecs:], non_blocking=True)
+                kc.copy_(k[-batch.num_cdecs:], non_blocking=True)
+                vc.copy_(v[-batch.num_cdecs:], non_blocking=True)
                 self.events[cur_stage].qkvtr_e.record()
 
     def _swap_out_blocks(
         self,
-        batch_id: int = 0,
-        cur_stage: int = 0
+        batch_id: int = 0
     ):
         """
         Swap blocks from GPU to CPU, assume that new prefilled KVs are ready in the last stage
         """
-        infer_state = self.infer_states[batch_id]
-        src_block_ids = infer_state.src_block_ids
-        dst_block_ids = infer_state.dst_block_ids
-        if src_block_ids:
+        batch = self.batches[batch_id]
+        if batch.num_cprfs > 0:
             with torch.cuda.stream(self.cpu_communication_stream):
                 # If there are no decoding sequences, we need to wait for the last stage to finish; otherwise, we already waited
-                if not infer_state.cpu_num_decoding_seqs:
-                    torch.cuda.current_stream().wait_event(self.events[cur_stage].stage_s)
-                self.swapper.swap_out_blocks(self.layer_id, src_block_ids, dst_block_ids)
+                if not batch.cdec_reqs:
+                    torch.cuda.current_stream().wait_stream(torch.cuda.default_stream())
+                self.swapper.swap_out_blocks(self.layer_id, batch.src_blk_ids, batch.dst_blk_ids)
 
     def _preproj(
         self,
@@ -175,7 +172,7 @@ class LlamaTransformerLayer:
         """
         Perform pre-projection, including RMSNorm, QKV calculation, and rotary embedding
         """
-        infer_state = self.infer_states[batch_id]
+        batch = self.batches[batch_id]
         weight = self.weight if not layer_off else self.next_layer_weight
 
         fused_add_rmsnorm_inplace(
@@ -197,22 +194,22 @@ class LlamaTransformerLayer:
         rotary_embedding_inplace(
             q,
             k,
-            infer_state.position_sin,
-            infer_state.position_cos
+            batch.position_sin,
+            batch.position_cos
         )
 
         # Here we only store k, v for prefilling, the kernel won't store decoding KVs
-        if infer_state.num_prefill_seqs > 0 and not self.engine_config.ignore_kvcache:
+        if batch.num_prefs > 0 and not self.engine_config.ignore_kvcache:
             store_kvcache(
                 k,
                 v,
                 self.k_cache, self.v_cache,
                 self.gpu_block_table,
-                infer_state.gpu_seq_ids[:infer_state.num_prefill_seqs],
-                infer_state.prefill_seq_start_locs,
-                infer_state.prefill_seq_lens,
+                batch.prgd_seq_ids[:batch.num_prefs],
+                batch.pref_st_locs_we,
+                batch.prgd_seq_lens[:batch.num_prefs],
                 (self.layer_id + layer_off) % self.model_config.num_layers,
-                infer_state.max_prefill_len
+                batch.max_pref_toks
             )
 
         return q, k, v
@@ -229,75 +226,76 @@ class LlamaTransformerLayer:
         Stores attention output of current batch into buffer o
         """
 
-        infer_state = self.infer_states[batch_id]
+        batch = self.batches[batch_id]
         events = self.events[cur_stage]
         o = self.input_embedss[batch_id]
         cur_layer_id = (self.layer_id + cur_stage) % self.model_config.num_layers
 
-        if infer_state.num_prefill_seqs > 0:
+        if batch.num_prefs > 0:
             # with torch.cuda.stream(self.prefilling_stream):
                 # torch.cuda.current_stream().wait_event(self.events[cur_stage].stage_s)
                 # Here the performance of vLLM's flash attention is better than us,
                 # so use vllm_flash_attn
-            o[:infer_state.num_prefill_tokens, :] = flash_attn_cuda.varlen_fwd(
-                q[:infer_state.num_prefill_tokens, :, :],
-                k[:infer_state.num_prefill_tokens, :, :],
-                v[:infer_state.num_prefill_tokens, :, :],
+            o[:batch.sum_pref_toks, :] = flash_attn_cuda.varlen_fwd(
+                q[:batch.sum_pref_toks, :, :],
+                k[:batch.sum_pref_toks, :, :],
+                v[:batch.sum_pref_toks, :, :],
                 None,
-                infer_state.prefill_seq_start_locs_with_end,
-                infer_state.prefill_seq_start_locs_with_end,
+                batch.pref_st_locs_we,
+                batch.pref_st_locs_we,
                 None,
                 None,
                 None,
-                infer_state.max_prefill_len,
-                infer_state.max_prefill_len,
+                batch.max_pref_toks,
+                batch.max_pref_toks,
                 0.0,
-                infer_state.softmax_scale,
+                batch.softmax_scale,
                 False,
                 True,
                 -1, 
                 -1,
                 False,
                 None
-            )[0].reshape(-1, self.model_config.hidden_size)
+            )[0].view(-1, self.model_config.hidden_size)
         events.pf_record("pref_e")
 
         # Actually we can further separate KV-cache storing for prefilling and decoding,
         # but since the kernel is fast enough, we put all to decoding stream for simplicity
-        if infer_state.gpu_num_decoding_seqs > 0:
+        if batch.num_gdecs > 0:
             # with torch.cuda.stream(self.decoding_piggyback_stream):
             #     torch.cuda.current_stream().wait_event(self.events[cur_stage].stage_s)
+            gpu_token_end = batch.metadata.s - batch.num_cdecs
             paged_attention(
-                q[infer_state.num_prefill_tokens:infer_state.gpu_token_end, :, :],
-                k[infer_state.num_prefill_tokens:infer_state.gpu_token_end, :, :],
-                v[infer_state.num_prefill_tokens:infer_state.gpu_token_end, :, :],
-                o[infer_state.num_prefill_tokens:infer_state.gpu_token_end, :],
+                q[batch.sum_pref_toks:gpu_token_end, :, :],
+                k[batch.sum_pref_toks:gpu_token_end, :, :],
+                v[batch.sum_pref_toks:gpu_token_end, :, :],
+                o[batch.sum_pref_toks:gpu_token_end, :],
                 self.k_cache, self.v_cache,
-                infer_state.softmax_scale,
+                batch.softmax_scale,
                 self.gpu_block_table,
-                infer_state.gpu_seq_ids[infer_state.num_prefill_seqs:],
-                infer_state.gpu_decoding_seq_lens,
+                batch.prgd_seq_ids[batch.num_prefs:],
+                batch.prgd_seq_lens[batch.num_prefs:],
                 cur_layer_id,
-                infer_state.seq_block_size,
-                infer_state.num_seq_blocks,
+                batch.seq_block_size,
+                batch.num_seq_blocks,
             )
         events.pf_record("gdec_e")
                 
-        if infer_state.cpu_num_decoding_seqs > 0:
-            og = o[infer_state.gpu_token_end:, :]
-            oc = self.o_cpu[:infer_state.cpu_num_decoding_seqs]
+        if batch.num_cdecs > 0:
+            og = o[-batch.num_cdecs:, :]
+            oc = self.o_cpu[:batch.num_cdecs]
             events.pf_time("lnch_m")
             self.events[cur_stage].qkvtr_e.synchronize()
             events.pf_time("cdec_s")
             torch.ops.pacpu.paged_attention_cpu(
                 cur_layer_id,
-                infer_state.softmax_scale,
-                infer_state.cpu_seq_ids.tolist(),
-                infer_state.cpu_decoding_seq_lens.tolist(),
+                batch.softmax_scale,
+                batch.cdec_seq_ids_list,
+                batch.cdec_seq_lens_list,
 
-                self.q_cpu[:infer_state.cpu_num_decoding_seqs],
-                self.k_cpu[:infer_state.cpu_num_decoding_seqs],
-                self.v_cpu[:infer_state.cpu_num_decoding_seqs],
+                self.q_cpu[:batch.num_cdecs],
+                self.k_cpu[:batch.num_cdecs],
+                self.v_cpu[:batch.num_cdecs],
                 self.k_swap,
                 self.v_swap,
                 self.cpu_block_table,
@@ -365,7 +363,7 @@ class LlamaTransformerLayer:
         self.events[cur_stage].pf_record("stage_s")
         self.events[cur_stage].pf_time("lnch_s")
         self._transfer_qkv(q1, k1, v1, batch_id=cur_stage^1, cur_stage=cur_stage)
-        self._swap_out_blocks(batch_id=cur_stage, cur_stage=cur_stage)
+        self._swap_out_blocks(batch_id=cur_stage)
         f0 = self._postproj(batch_id=cur_stage)
         q0, k0, v0 = self._preproj(f0, batch_id=cur_stage, layer_off=1)
         del f0
@@ -431,7 +429,7 @@ class LlamaTransformerLayer:
         self.events[0].pf_record("stage_s")
         self.events[0].pf_time("lnch_s")
         self._transfer_qkv(q1, k1, v1, batch_id=1, cur_stage=0)
-        self._swap_out_blocks(batch_id=0, cur_stage=0)
+        self._swap_out_blocks(batch_id=0)
         f0 = self._postproj(batch_id=0)
         self.events[0].pf_record("linr_e")
         self._attention(q1, k1, v1, batch_id=1, cur_stage=0)
