@@ -28,6 +28,8 @@ class Engine:
         self.tokenization_engine = None
 
         self.untokenized_raw_requests: list[tuple[Request, str]] = []
+        self.itr_end_times = []
+        self.ntoken_of_itr = []
 
     async def _run_on_model_async(self, func, *args, **kwargs):
         """
@@ -120,19 +122,20 @@ class Engine:
         """
         while True:
             # Get the next batch from the scheduler
-            batch = [None] * 2
             
-            if self.engine_config.always_use_gpu:
-                pre_swap_out = None
-                batch[0], cur_swap_out, cur_swap_in = self.scheduler.get_next_batch_old()
-            else:
-                batch[0], batch[1], cur_swap_out, cur_swap_in = self.scheduler.get_next_batch()
+            start = time.perf_counter()
+            batches, cur_swap_out, cur_swap_in = self.scheduler.get_next_batch()
 
-            if all(not (batch[i] and batch[i].x) for i in range(2)) and not cur_swap_in and not cur_swap_out:
-                # No new batch, sleep for a bit
+            assert all(batches), "Batch shouldn't be empty"
+            assert not (cur_swap_out and cur_swap_in), "Swap out and swap in should be mutually exclusive"
+            assert len(batches) <= 2, "The number of batches should be at most 2"
+
+            if not (batches or cur_swap_in or cur_swap_out):
+                # Nothing to do, sleep for a bit
                 await asyncio.sleep(0.005)
                 continue
-            start = time.perf_counter()
+
+            scheduler_end = time.perf_counter()
 
             # Perform swap in/out
             if cur_swap_out:
@@ -140,27 +143,23 @@ class Engine:
                     self.model.swap_out_seqs,
                     [req.request_id for req in cur_swap_out]
                 )
-            swp_out_finish = time.perf_counter()
             if cur_swap_in:
                 await self._run_on_model_async(
                     self.model.swap_in_seqs,
                     [req.request_id for req in cur_swap_in]
                 )
-            swp_in_finish = time.perf_counter()
+            swp_finish = time.perf_counter()
             
             # Forward the model
-            argss = [
-                batch[i].get_model_forward_args() if batch[i] else None
-                for i in range(2)
-            ]
-            if not batch[1]:
+            argss = [batch.get_model_forward_args() for batch in batches]
+            if len(argss) == 1:
                 # Sequential mode
-                reqs = batch[0].get_all_reqs()
+                reqs = batches[0].get_all_reqs()
                 print(f"Using sequential mode (batch_size = {len(reqs)})")
                 output_tokens = await self._run_on_model_async(self.model.forward, argss[0])
             else:
                 # Pipelined mode
-                reqs = batch[0].get_all_reqs() + batch[1].get_all_reqs()
+                reqs = sum([batch.get_all_reqs() for batch in batches], [])
                 print(f"Using pipelined mode (batch_size = {len(reqs)})")
                 self.engine_config.monitor_performance = True
                 output_tokens = await self._run_on_model_async(self.model.forward_pipeline, argss)
@@ -184,7 +183,9 @@ class Engine:
             # Inform the scheduler, swap out newly prefilled requests if necessary
             self.scheduler.on_batch_finish(reqs)
 
-            print(f"Time: {iter_end-start:.3f}s, Swap out: {swp_out_finish-start:.3f}s, Swap in: {swp_in_finish-swp_out_finish:.3f}s, Forward: {iter_end-swp_in_finish:.3f}s")
+            print(f"Time: {iter_end-start:.3f}s, scheduler: {scheduler_end-start:.3f}s, swap: {swp_finish-scheduler_end:.3f}s, forward: {iter_end-swp_finish:.3f}s")
+            self.itr_end_times.append(iter_end)
+            self.ntoken_of_itr.append(sum([b.metadata.x for b in batches]))
     
     async def start_all_event_loops(self):
         """

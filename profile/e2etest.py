@@ -16,7 +16,7 @@ async def send_request_and_wait_non_streaming_mode(engine: swiftllm.Engine, toke
     start = time.perf_counter()
     (_, output_token_ids) = await engine.add_request_and_wait(raw_request)
     end = time.perf_counter()
-    print(f"Output: {tokenizer.decode(output_token_ids)}")
+    # print(f"Output: {tokenizer.decode(output_token_ids)}")
     return start, end
 
 async def run_latency_test(
@@ -50,24 +50,35 @@ async def run_throughput_test(
     tokenizer: AutoTokenizer
 ):
     promptlen = len(tokenizer.encode(prompt))
-    data_file = f"../data/d0926/{nrequests}-{promptlen}-{output_len}-{gpu_only}.json"
+    data_file = f"../data/d1006/{nrequests}-{promptlen}-{output_len}-{gpu_only}.json"
     
     logger.info(f"Throughput test: input_len={promptlen}, output_len={output_len}, nrequests={nrequests}, gpu_only={gpu_only}")
     engine.engine_config.always_use_gpu = gpu_only
     tasks = []
+    start = time.perf_counter()
+    engine.itr_end_times = []
+    engine.ntoken_of_itr = []
     for i in range(nrequests):
         task = asyncio.create_task(send_request_and_wait_non_streaming_mode(engine, tokenizer, prompt, output_len))
         tasks.append(task)
-    times = await asyncio.gather(*tasks)
-    times = [end for _, end in times]
+    req_times = await asyncio.gather(*tasks)
+    end = time.perf_counter()
+    req_end_times = sorted([end for _, end in req_times])
+    itr_end_times = [time - start for time in engine.itr_end_times]
     with open(data_file, "w") as f:
-        deltas = [times[i] - times[i-1] for i in range(1, len(times))]
-        json.dump(deltas, f, indent=4)
-    times.sort()
+        deltas = [req_end_times[i] - req_end_times[i-1] for i in range(1, len(req_end_times))]
+        json.dump({
+            "req_end_deltas": deltas,
+            "itr_end_times": itr_end_times,
+            "ntoken_of_itr": engine.ntoken_of_itr
+        }, f, indent=4)
     # Omit first 10% and last 30% of requests to leave out warm-up and cool-down periods
-    times = times[nrequests//10: -nrequests//10*3]
-    throughput = (len(times) - 1) / (times[-1] - times[0])
+    req_end_times = req_end_times[nrequests//10: -nrequests//10*3]
+    throughput = (len(req_end_times) - 1) / (req_end_times[-1] - req_end_times[0])
+
     logger.info(f"Throughput: {throughput:.3f} reqs/s")
+
+
 
 async def warm_up(
     prompt: str,
@@ -75,7 +86,7 @@ async def warm_up(
     tokenizer: AutoTokenizer
 ):
     logger.info("Warming up...")
-    await run_throughput_test(300, prompt, 100, False, engine, tokenizer)
+    await run_throughput_test(300, prompt, 200, False, engine, tokenizer)
     logger.info("Warm up complete")
 
 
@@ -104,14 +115,14 @@ async def main():
         use_dummy = False,
         
         block_size = 16,
-        gpu_mem_utilization = 0.99,
+        gpu_mem_utilization = 0.995,
         num_cpu_blocks = 15000,
-        max_seqs_in_block_table = 1024,
-        max_blocks_per_seq = 512,
+        max_seqs_in_block_table = 2048,
+        max_blocks_per_seq = 1024,
 
         max_batch_size = 512,
-        max_prefill_tokens = 1000,
-        max_tokens_in_batch = 3000,
+        max_prefill_tokens = 10000,
+        max_tokens_in_batch = 20000,
 
         library_path="/home/ubuntu/pacpu/build/libpacpu.so",
         profile_result_path="/home/ubuntu/swiftLLM/profile_results/",
@@ -131,16 +142,18 @@ async def main():
     
     print([len(tokenizer.encode(prompt)) for prompt in prompts])
 
-    await warm_up(prompts[3], engine, tokenizer)
+    await warm_up(prompts[9], engine, tokenizer)
 
     for prompt in prompts:
-        if len(tokenizer.encode(prompt)) == 98:
-            for outlen in range(500, 1500, 500):
-                await run_throughput_test(1000, prompt, outlen, False, engine, tokenizer)
-                # await run_throughput_test(1000, prompt, outlen, True, engine, tokenizer)
-    # for rate in [8, 10]:
-    #     await run_latency_test(1200, prompt, 40, rate, True, engine, tokenizer)
-    #     await run_latency_test(1200, prompt, 40, rate, False, engine, tokenizer)
+        if len(tokenizer.encode(prompt)) == 526:
+            for outlen in range(100, 1000, 200):
+                await run_throughput_test(1200, prompt, outlen, False, engine, tokenizer)
+                await run_throughput_test(1200, prompt, outlen, True, engine, tokenizer)
+    # for prompt in prompts:
+    #     if len(tokenizer.encode(prompt)) == 99:
+    #         for rate in [0.8 + i * 0.2 for i in range(6)]:
+    #             await run_latency_test(1000, prompt, 40, rate, True, engine, tokenizer)
+    #             await run_latency_test(1000, prompt, 40, rate, False, engine, tokenizer)
     
 
 if __name__ == "__main__":

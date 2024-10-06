@@ -8,39 +8,102 @@ from swiftllm.engine_config import EngineConfig
 from swiftllm.utils import cdiv
 from swiftllm.server.structs import Request
 
+class BatchMetaData:
+    def __init__(self, profiler: ModelProfiler):
+        self.x = 0
+        self.s = 0
+        self.n_g = 0
+        self.x_c = 0
+        self.n_c = 0
+
+        self.pref_T = 0
+        self.gdec_T = 0
+        self.profiler = profiler
+        self.lnch_T = profiler.get_lnch_T()
+
+    def add_pref(self, prompt_len):
+        self.x += 1
+        self.s += prompt_len
+        self.pref_T += self.profiler.get_pref_T(prompt_len)
+    
+    def pop_pref(self, prompt_len):
+        self.x -= 1
+        self.s -= prompt_len
+        self.pref_T -= self.profiler.get_pref_T(prompt_len)
+
+    def add_gdec(self, seq_len):
+        self.x += 1
+        self.s += 1
+        self.n_g += seq_len
+        self.gdec_T = self.profiler.get_gdec_T(self.n_g)
+
+    def add_cdec(self, seq_len):
+        self.x += 1
+        self.s += 1
+        self.x_c += 1
+        self.n_c += seq_len
+
+    def pop_cdec(self, seq_len):
+        self.x -= 1
+        self.s -= 1
+        self.x_c -= 1
+        self.n_c -= seq_len
+
+    @property
+    def linr_T(self) -> float:
+        return self.profiler.get_linr_T(self.s)
+    
+    @property
+    def cdec_T(self) -> float:
+        return self.profiler.get_cdec_T(self.x_c, self.n_c)
+    
+    @property
+    def gpu_time(self) -> float:
+        return self.linr_T + self.pref_T + self.gdec_T
+    
+    @property
+    def cpu_time(self) -> float:
+        return self.cdec_T + self.lnch_T
+
 class SubBatch:
-    def __init__(self):
+    def __init__(self, profiler: ModelProfiler):
         self.gprf_reqs = []
         self.cprf_reqs = []
         self.gdec_reqs = []
         self.cdec_reqs = []
-        self.x = 0 # batch size
-        self.s = 0 # iteration width
-        self.x_c = 0 # number of CPU decoding requests
-        self.n_c = 0 # total number of tokens in CPU decoding requests
-
-
-    def add_gprf(self, req: Request):
-        self.gprf_reqs.append(req)
-        self.x += 1
-        self.s += req.prompt_len
+        self.metadata = BatchMetaData(profiler)
     
-    def add_cprf(self, req: Request):
-        self.cprf_reqs.append(req)
-        self.x += 1
-        self.s += req.prompt_len
+    def __len__(self):
+        return self.metadata.x
+
+    def add_pref(self, req: Request, is_gpu: bool):
+        if is_gpu:
+            self.gprf_reqs.append(req)
+        else:
+            self.cprf_reqs.append(req)
+        self.metadata.add_pref(req.prompt_len)
+
+    def pop_pref(self) -> Request:
+        is_gpu = not self.cprf_reqs
+        req = self.gprf_reqs.pop() if is_gpu else self.cprf_reqs.pop()
+        self.metadata.pop_pref(req.prompt_len)
+        return req, is_gpu
+
+    @property
+    def num_prefs(self) -> int:
+        return len(self.gprf_reqs) + len(self.cprf_reqs)
         
     def add_gdec(self, req: Request):
         self.gdec_reqs.append(req)
-        self.x += 1
-        self.s += 1
+        self.metadata.add_gdec(req.seq_len)
 
     def add_cdec(self, req: Request):
         self.cdec_reqs.append(req)
-        self.x += 1
-        self.s += 1
-        self.x_c += 1
-        self.n_c += req.prompt_len
+        self.metadata.add_cdec(req.seq_len)
+
+    def pop_cdec(self):
+        req = self.cdec_reqs.pop()
+        self.metadata.pop_cdec(req.seq_len)
 
     def get_all_reqs(self) -> list[Request]:
         return self.gprf_reqs + self.cprf_reqs + self.gdec_reqs + self.cdec_reqs
@@ -58,7 +121,7 @@ class SubBatch:
                 for req in self.gdec_reqs + self.cdec_reqs
             ],
             swap_out_seq_ids = [req.request_id for req in self.cprf_reqs],
-            cpu_num_decoding_seqs=self.x_c
+            cpu_num_decoding_seqs=self.metadata.x_c
         )
 
     def print_profile(self):
@@ -121,6 +184,7 @@ class Scheduler:
 
     def __init__(self, model: LlamaModel):
         self.engine_config = model.engine_config
+        self.model_config = model.model_config
         self.max_gpu_blocks = model.gpu_block_manager.num_blocks
         self.max_cpu_blocks = model.cpu_block_manager.num_blocks
         self.max_gpu_tokens = self.max_gpu_blocks * self.engine_config.block_size
@@ -151,12 +215,16 @@ class Scheduler:
         """
         self.waiting_q.extend(requests)
 
+    def _get_remains(self, batches: list[SubBatch]) -> float:
+        assert len(batches) == 2
+        return [batches[j^1].metadata.linr_T + batches[j].metadata.pref_T + batches[j].metadata.gdec_T - batches[j].metadata.cpu_time for j in range(2)]
+
     def _decide_mode_and_gen_batch(
         self, 
         gpu_prefill_reqs: list[Request],
         cpu_prefill_reqs: list[Request],
         budget: ScheduleBudget
-    ) -> tuple[SubBatch, SubBatch | None]:
+    ) -> list[SubBatch]:
         """
         Assume that self.gpu_decoding_q and self.prefilling_q are fixed.
 
@@ -166,79 +234,76 @@ class Scheduler:
             (batch, None) if using sequential mode, or
             (batch0, batch1) if using pipelined mode
         """
-        batches = SubBatch(), SubBatch()
-        sequential_batch = SubBatch()
+        assert not self.engine_config.always_use_gpu, "This function is not designed for GPU-only mode"
+        batches = [SubBatch(self.profiler) for _ in range(2)]
+        gpu_only_batch = SubBatch(self.profiler)
 
-        # Simple heuristic: Put all GPU related seqs in the same batch, all CPU related seqs in the other
+        # Step 1: put all pref and gdec sequences into the first batch.
         for req in gpu_prefill_reqs:
-            batches[0].add_gprf(req)
-            sequential_batch.add_gprf(req)
+            batches[0].add_pref(req, is_gpu=True)
+            gpu_only_batch.add_pref(req, is_gpu=True)
 
         for req in cpu_prefill_reqs:
-            batches[0].add_cprf(req)
-            sequential_batch.add_cprf(req)
+            batches[0].add_pref(req, is_gpu=False)
+            gpu_only_batch.add_pref(req, is_gpu=False)
         
         for req in self.gpu_decoding_q:
             batches[0].add_gdec(req)
-            sequential_batch.add_gdec(req)
-        
-        if self.engine_config.always_use_gpu:
-            return sequential_batch, None
-        
+            gpu_only_batch.add_gdec(req)
+
+        if not batches[0]:
+            return []
+
+        # Step 2: adjust the number of prefilled sequences in gpu_only_batch
+        while gpu_only_batch.num_prefs:
+            req, is_gpu = gpu_only_batch.pop_pref()
+            if gpu_only_batch.metadata.s < self.profiler.linr_S_threshold:
+                gpu_only_batch.add_pref(req, is_gpu)
+                break
+        if not self.cpu_decoding_q:
+            return [gpu_only_batch] # This is to prevent division by zero
+
+        # Step 3: split CPU decoding requests.
+        min_out_cpu_len = 1e9
+        next_batch_idx = 1
         for req in self.cpu_decoding_q:
             if not budget.check_and_substract(1):
                 break
-            batches[1].add_cdec(req)
+            if req.seq_len >= min_out_cpu_len:
+                budget.add(1)
+                continue
+            # remains[i] is the remaining of Cdec capacity of batch i
+            batches[next_batch_idx].add_cdec(req)
+            remains = self._get_remains(batches)
+            if min(remains) < 0:
+                # Skip this request
+                min_out_cpu_len = req.seq_len
+                budget.add(1)
+                batches[next_batch_idx].pop_cdec()
+                continue
+            next_batch_idx = remains[1] > remains[0]
 
-        if batches[0].x == 0:
-            return batches[1], None
+        # Step 4: reduce the number of prefilled sequences in the first batch if CPU is idle for too long
+        while batches[0].num_prefs:
+            req, is_gpu = batches[0].pop_pref()
+            if batches[0].metadata.s < self.profiler.linr_S_threshold or min(self._get_remains(batches)) < 0:
+                batches[0].add_pref(req, is_gpu)
+                break
 
-        # # Step 1: split prefilling requests
-        # for req in prefill_reqs:
-        #     b1_has_less_s = int(batches[0].s > batches[1].s)
-        #     batches[b1_has_less_s].add_pref(req)
-        #     sequential_batch.add_pref(req)
-
-        # # Step 2: split GPU decoding requests
-        # for req in self.gpu_decoding_q:
-        #     b1_has_less_s = int(batches[0].s > batches[1].s)
-        #     batches[b1_has_less_s].add_gdec(req)
-        #     sequential_batch.add_gdec(req)
-        
-        # if self.engine_config.always_use_gpu:
-        #     return sequential_batch, None
-
-        # # Step 3: split CPU decoding requests
-        # for req in self.cpu_decoding_q:
-        #     if not budget.check_and_substract(1):
-        #         break
-        #     # We insert the req to the batch that maximizes the min R value, i.e. (T_l - T_c)
-        #     slf_Rs = [] # slf_Rs[i] is the R value of batch-i if we insert the req to batch-i
-        #     opp_Rs = [] # opp_Rs[i] is the R value of batch-i if we insert the req to batch-(1-i)
-        #     for i in range(2):
-        #         opp_Rs.append(self.profiler.get_cpu_remaining_capacity(batches[1-i].s + 1, batches[i].x_c, batches[i].n_c))
-        #         slf_Rs.append(self.profiler.get_cpu_remaining_capacity(batches[1-i].s, batches[i].x_c + 1, batches[i].n_c + req.seq_len))
-        #     min_R0 = min(slf_Rs[0], opp_Rs[1])
-        #     min_R1 = min(slf_Rs[1], opp_Rs[0])
-        #     # if min_R0 < 0 and min_R1 < 0:
-        #     #     # Both are negative, skip this request
-        #     #     budget.add(1)
-        #     #     continue
-
-        #     should_pick_1 = min_R0 < min_R1
-        #     batches[should_pick_1].add_cdec(req)
-
-        # The coefficient theoretically should be 2.0, but we use 2.4 here for performance guarantee
-        if sum(b.x for b in batches) > 2.4 * sequential_batch.x:
-#             print(f"Estimated linear time: {(self.profiler.get_linr_T(batches[0].s) + self.profiler.get_linr_T(batches[1].s))/2}")
-#             print(f"Estimated CPU decoding time: {(self.profiler.get_cdec_T(batches[0].x_c, batches[0].n_c) + self.profiler.get_cdec_T(batches[1].x_c, batches[1].n_c))/2}")
-#             print(f"Remaining cpu capacity: {self.profiler.get_cpu_remaining_capacity(batches[0].s, batches[0].x_c, batches[0].n_c)},\
-#  {self.profiler.get_cpu_remaining_capacity(batches[1].s, batches[1].x_c, batches[1].n_c)}")
-            return batches[0], batches[1]
+        # Step 5: check if pipelined mode is better
+        seqential_time = gpu_only_batch.metadata.gpu_time * self.model_config.num_layers
+        pipelined_time = (batches[0].metadata.gpu_time + batches[1].metadata.gpu_time) * self.model_config.num_layers
+        seqential_rate = len(gpu_only_batch) / seqential_time
+        pipelined_rate = sum(len(batches[i]) for i in range(2)) / pipelined_time
+        print(f"Sequential time: {seqential_time}, Pipelined time: {pipelined_time}")
+        print(f"Sequential rate: {seqential_rate}, Pipelined rate: {pipelined_rate}")
+        if seqential_rate < pipelined_rate:
+            return batches
         else:
-            return sequential_batch, None
+            return [gpu_only_batch]
+        # return [gpu_only_batch]
 
-    def get_next_batch(self) -> tuple[SubBatch, SubBatch | None, list[Request], list[Request], list[Request]]:
+    def get_next_batch_new(self) -> tuple[list[SubBatch], list[Request], list[Request]]:
         """
         Called when the engine wants a new batch to be forwarded
         Returns (new_batch, newly_swapped_in, newly_swapped_out)
@@ -255,14 +320,11 @@ class Scheduler:
         swpin_reqs = []
 
         # Policy may change, should recompute these thresholds on every iteration
-        if self.engine_config.always_use_gpu:
-            swap_out_threshold = self.max_gpu_blocks
-            swap_in_threshold = round(swap_out_threshold * 0.97)
-            cpu_threshold = 0
-        else:
-            swap_out_threshold = self.max_gpu_blocks - self.engine_config.max_prefill_tokens // self.engine_config.block_size
-            swap_in_threshold = round(swap_out_threshold * 0.8)
-            cpu_threshold = self.max_cpu_blocks - self.max_gpu_blocks
+        swap_out_threshold = self.max_gpu_blocks * 0.95
+        # swap_in_threshold = round(swap_out_threshold * 0.95)
+        # swap_out_threshold = self.max_gpu_blocks
+        swap_in_threshold = swap_out_threshold
+        cpu_threshold = self.max_cpu_blocks - self.max_gpu_blocks
         
         # Step 1: Try to launch as many GPU decoding requests as possible
         gpu_block_needed = sum(self._get_block_needed(req) for req in self.gpu_decoding_q)
@@ -291,20 +353,19 @@ class Scheduler:
             self.gpu_decoding_q.append(candidate)
         assert not swpout_reqs or not swpin_reqs
 
-        # Step 4: Launch prefilling requests
+        # Step 4: Launch prefilling requests, just to know the uplimit
         cpu_block_needed = sum(self._get_block_needed(req) for req in self.cpu_decoding_q) # for bounding new prefillings
-        while self.waiting_q:
-            candidate = self.waiting_q[0]
+        for i in range(len(self.waiting_q)):
+            candidate = self.waiting_q[i]
             cur_block_needed = self._get_block_needed(candidate)
             if gpu_block_needed + cur_block_needed > self.max_gpu_blocks or \
                (self.cpu_decoding_q and cpu_block_needed + cur_block_needed > cpu_threshold) or \
-               self.request_id_manager.get_num_available_ids() == 0 or \
+               self.request_id_manager.get_num_available_ids() < i or \
                not budget.check_and_substract(candidate.prompt_len, True):
                 break
             gpu_block_needed += cur_block_needed
             cpu_block_needed += cur_block_needed
-            candidate.request_id = self.request_id_manager.get_id()
-            self.waiting_q.popleft()
+            # self.waiting_q.popleft()
             # The newly prefilled sequences are the major part of swapping out. Here we use a simple heuristic.
             # Note that this might not be necessary since some sequences might finish in this iteration. However, this will not hurt
             #   because the next group of prefilled sequences won't need to be swapped out.
@@ -314,34 +375,41 @@ class Scheduler:
             else:
                 pref_to_cpu.append(candidate)
 
-        assert not (pref_to_cpu and self.engine_config.always_use_gpu), "In GPU-only mode, there should be no pre-swapped-out requests"
-
         # Step 5: Launch CPU decoding requests and form batches
-        batch0, batch1 = self._decide_mode_and_gen_batch(pref_to_gpu, pref_to_cpu, budget)
+        batches = self._decide_mode_and_gen_batch(pref_to_gpu, pref_to_cpu, budget)
+
+        # Step 6: Launch prefilled requests for real
+        real_num_prefs = sum(b.num_prefs for b in batches)
+        pref_to_gpu = pref_to_gpu[:real_num_prefs]
+        pref_to_cpu = pref_to_cpu[:real_num_prefs - len(pref_to_gpu)]
+        for _ in range(real_num_prefs):
+            candidate = self.waiting_q.popleft()
+            candidate.request_id = self.request_id_manager.get_id()
 
         if self.gpu_decoding_q or self.cpu_decoding_q or pref_to_gpu or pref_to_cpu or self.waiting_q:
-            print(f"Gdecs: {len(self.gpu_decoding_q)}, Cdecs: {len(self.cpu_decoding_q)}, Pr2gs: {len(pref_to_gpu)}, Pr2cs: {len(pref_to_cpu)}, Waiting: {len(self.waiting_q)}")
+            print(f"Gdecs: {len(self.gpu_decoding_q)}, Cdecs: {len(self.cpu_decoding_q)}, \
+Pr2gs: {len(pref_to_gpu)}, Pr2cs: {len(pref_to_cpu)}, Waiting: {len(self.waiting_q)}")     
 
         self.gpu_decoding_q.extend(pref_to_gpu)
         self.cpu_decoding_q.extend(pref_to_cpu)
 
-        return batch0, batch1, swpout_reqs, swpin_reqs
+        return batches, swpout_reqs, swpin_reqs
 
-    def get_next_batch_old(self) -> tuple[SubBatch, list[Request], list[Request]]:
+    def get_next_batch_old(self) -> tuple[list[SubBatch], list[Request], list[Request]]:
         print(f"Waiting: {len(self.waiting_q)}, Gdecs: {len(self.gpu_decoding_q)}, Cdecs: {len(self.cpu_decoding_q)}")
         if not self.cpu_decoding_q:
             # Try to launch a new prefill batch
-            cur_batch = SubBatch()
+            cur_batch = SubBatch(self.profiler)
             cur_batch_block_needed = 0
             cur_num_tokens_sum = 0
             while self.waiting_q:
                 cur_seq: Request = self.waiting_q[0]
                 cur_seq_block_needed = self._get_block_needed(cur_seq)
-                if  cur_batch.x+1 <= self.engine_config.max_batch_size and \
-                    len(self.gpu_decoding_q)+cur_batch.x+1 <= self.engine_config.max_batch_size and \
+                if  len(cur_batch)+1 <= self.engine_config.max_batch_size and \
+                    len(self.gpu_decoding_q)+len(cur_batch)+1 <= self.engine_config.max_batch_size and \
                     cur_batch_block_needed + cur_seq_block_needed + self.num_decoding_gpu_blocks <= self.max_gpu_blocks and \
                     cur_num_tokens_sum + cur_seq.prompt_len <= self.engine_config.max_tokens_in_batch:
-                    cur_batch.add_pref(cur_seq)
+                    cur_batch.add_pref(cur_seq, True)
                     cur_batch_block_needed += cur_seq_block_needed
                     cur_num_tokens_sum += cur_seq.prompt_len
                     self.waiting_q.popleft()
@@ -349,14 +417,14 @@ class Scheduler:
                 else:
                     # Strict FCFS
                     break
-            if cur_batch.x:
+            if len(cur_batch):
                 # Going to launch a prefill batch
                 # If you want decoding requests to be piggybacked, you can do it here
-                for req in cur_batch.pref_reqs:
+                for req in cur_batch.gprf_reqs:
                     req.request_id = self.request_id_manager.get_id()
-                self.gpu_decoding_q.extend(cur_batch.pref_reqs)
+                self.gpu_decoding_q.extend(cur_batch.gprf_reqs)
                 self.num_decoding_gpu_blocks += cur_batch_block_needed
-                return cur_batch, [], []
+                return [cur_batch], [], []
         
         # Try to launch a decoding batch
         # TODO Optimize this `sum` if possible
@@ -379,7 +447,7 @@ class Scheduler:
                 cur_seq = self.cpu_decoding_q[0]
                 num_cur_seq_blocks = self._get_block_needed(cur_seq)
                 if len(self.gpu_decoding_q) + 1 <= self.engine_config.max_batch_size and \
-                   self.num_decoding_gpu_blocks + num_cur_seq_blocks <= self.max_gpu_blocks:
+                    self.num_decoding_gpu_blocks + num_cur_seq_blocks <= self.max_gpu_blocks:
                     self.gpu_decoding_q.append(cur_seq)
                     self.num_decoding_gpu_blocks += num_cur_seq_blocks
                     self.cpu_decoding_q.popleft()
@@ -387,10 +455,16 @@ class Scheduler:
                 else:
                     break
         
-        cur_batch = SubBatch()
+        cur_batch = SubBatch(self.profiler)
         for req in self.gpu_decoding_q:
             cur_batch.add_gdec(req)
-        return cur_batch, newly_swapped_out, newly_swapped_in
+        return [cur_batch] if cur_batch else [], newly_swapped_out, newly_swapped_in
+
+    def get_next_batch(self) -> tuple[list[SubBatch], list[Request], list[Request]]:
+        if self.engine_config.always_use_gpu:
+            return self.get_next_batch_old()
+        else:
+            return self.get_next_batch_new()
     
     def on_batch_finish(self, batch: list[Request]):
         """

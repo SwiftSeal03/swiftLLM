@@ -2,7 +2,7 @@ import itertools
 import math
 import dataclasses
 import json
-from pprint import pprint
+import time
 
 import numpy as np
 import torch
@@ -42,6 +42,13 @@ class ModelEvents:
 
 
 class ModelPerfResult:
+    fields_to_dump = [
+        "avg_linr_time",
+        "avg_pref_time",
+        "avg_gdec_time",
+        "avg_cdec_time",
+        "avg_lnch_time"
+    ]
     def __init__(
         self, 
         layers: list[LlamaTransformerLayer],
@@ -50,11 +57,11 @@ class ModelPerfResult:
     ):
         torch.cuda.synchronize() # Ensure all events are recorded
         if use_pipline:
-            self.linr_times = np.array([[layer.events[i].linr_time for i in range(2)] for layer in layers[:-1]])
-            self.pref_times = np.array([[layer.events[i].pref_time for i in range(2)] for layer in layers])
-            self.gdec_times = np.array([[layer.events[i].gdec_time for i in range(2)] for layer in layers])
-            self.cdec_times = np.array([[layer.events[i].cdec_time for i in range(2)] for layer in layers])
-            self.lnch_times = np.array([[layer.events[i].lnch_time for i in range(2)] for layer in layers])
+            self.linr_times = np.array([[layer.events[i].linr_time for layer in layers[:-1]] for i in range(2)])
+            self.pref_times = np.array([[layer.events[i^1].pref_time for layer in layers] for i in range(2)])
+            self.gdec_times = np.array([[layer.events[i^1].gdec_time for layer in layers] for i in range(2)])
+            self.cdec_times = np.array([[layer.events[i^1].cdec_time for layer in layers] for i in range(2)])
+            self.lnch_times = np.array([[layer.events[i].lnch_time for layer in layers] for i in range(2)])
         else:
             self.linr_times = np.array([sum(layer.events[i].linr_time for i in range(2)) for layer in layers])
             self.pref_times = np.array([layer.events[0].pref_time for layer in layers])
@@ -68,19 +75,15 @@ class ModelPerfResult:
         self.lstg_time = model_events.mnbd_e.elapsed_time(model_events.lstg_e)
         self.polr_time = model_events.lstg_e.elapsed_time(model_events.frwd_e)
 
-        self.avg_linr_time = self.linr_times.mean()
-        self.avg_pref_time = self.pref_times.mean()
-        self.avg_gdec_time = self.gdec_times.mean()
-        self.avg_cdec_time = self.cdec_times.mean()
-        self.avg_lnch_time = self.lnch_times.mean()
+        self.avg_linr_time = self.linr_times.mean(-1)
+        self.avg_pref_time = self.pref_times.mean(-1)
+        self.avg_gdec_time = self.gdec_times.mean(-1)
+        self.avg_cdec_time = self.cdec_times.mean(-1)
+        self.avg_lnch_time = self.lnch_times.mean(-1)
 
     def __repr__(self):
         return json.dumps({
-            "avg_linr_time": self.avg_linr_time,
-            "avg_pref_time": self.avg_pref_time,
-            "avg_gdec_time": self.avg_gdec_time,
-            "avg_cdec_time": self.avg_cdec_time,
-            "avg_lnch_time": self.avg_lnch_time
+            field: getattr(self, field) for field in self.fields_to_dump
         }, indent=2)
 
     @staticmethod
@@ -88,7 +91,17 @@ class ModelPerfResult:
         """
         Compute the average of a field in a list of ModelPerfResult objects.
         """
-        return np.array([getattr(result, name) for result in results]).mean()
+        ret = np.array([getattr(result, name) for result in results]).mean(0).tolist()
+        return ret
+
+    @staticmethod
+    def mean_all(results: list["ModelPerfResult"]) -> dict[str, float]:
+        """
+        Compute the average of all fields in a list of ModelPerfResult objects.
+        """
+        return {
+            field: ModelPerfResult.mean(results, field) for field in ModelPerfResult.fields_to_dump
+        }
 
 
 
@@ -422,6 +435,7 @@ class LlamaModel:
         self.events.pf_record("frwd_s")
 
         # Main body of the forward pass
+        # start = time.perf_counter()
         input_embds = self.pre_layer.forward(input_ids)
 
         # Wait for swappings to finish
@@ -444,6 +458,9 @@ class LlamaModel:
         output_tokens = self.post_layer.forward(ffn_out, infer_state)
 
         self.events.pf_record("frwd_e")
+        torch.cuda.synchronize()
+        # duration = time.perf_counter() - start
+        # print(f"Forward time: {duration*1000:.2f}ms")
 
         if self.engine_config.monitor_performance:
             self.perf_results.append(ModelPerfResult(self.transformer_layers, self.events, False))
@@ -465,6 +482,8 @@ class LlamaModel:
         """
 
         flattened_input_ids, infer_state = self._prepare_inputs(args)
+        assert infer_state.batch_size <= self.engine_config.max_batch_size, \
+            f"Batch size {infer_state.batch_size} exceeds the maximum batch size {self.engine_config.max_batch_size}"
 
         return self._forward(
             torch.tensor(flattened_input_ids, dtype=torch.int32, device="cuda"),
@@ -536,6 +555,9 @@ class LlamaModel:
         assert len(argss) == 2
         finput_ids0, infer_state0 = self._prepare_inputs(argss[0])
         finput_ids1, infer_state1 = self._prepare_inputs(argss[1])
+
+        assert infer_state0.batch_size + infer_state1.batch_size <= self.engine_config.max_batch_size, \
+            f"Batch size {infer_state0.batch_size + infer_state1.batch_size} exceeds the maximum batch size {self.engine_config.max_batch_size}"
 
         return self._forward_pipeline(
             torch.tensor(finput_ids0 + finput_ids1, dtype=torch.int32, device="cuda"),
