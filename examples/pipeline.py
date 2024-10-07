@@ -34,10 +34,11 @@ if __name__ == '__main__':
     engine_config = swiftllm.EngineConfig(
         model_path = model_path,
         use_dummy = False,
-        
+
         block_size = 16,
         gpu_mem_utilization = 0.995,
         num_cpu_blocks = 4000,
+        num_gpu_blocks = 1700,
         max_seqs_in_block_table = 1024,
         max_blocks_per_seq = 512,
 
@@ -76,10 +77,8 @@ if __name__ == '__main__':
 
     # Prompt phase
     input_ids = tokenizer(prompt)['input_ids']
-    gpu_seq_ids = list(range(ngpu_prompts // 2)) + list(range(nprompts // 2, nprompts // 2 + ngpu_prompts // 2))
-    cpu_seq_ids = list(range(ngpu_prompts // 2, nprompts // 2)) + list(range(nprompts // 2 + ngpu_prompts // 2, nprompts))
     reqs = [None] * nprompts
-    if cpu_seq_ids:
+    if ncpu_prompts:
         batch = swiftllm.SubBatch()
         for i in range(ngpu_prompts // 2, nprompts // 2):
             reqs[i] = swiftllm.create_request(input_ids, i)
@@ -90,7 +89,7 @@ if __name__ == '__main__':
             reqs[i] = swiftllm.create_request(input_ids, i)
             batch.add_pref(reqs[i], is_gpu=False)
         model.forward(batch)
-    if gpu_seq_ids:
+    if ngpu_prompts:
         batch = swiftllm.SubBatch()
         for i in list(range(ngpu_prompts // 2)) + list(range(nprompts // 2, nprompts // 2 + ngpu_prompts // 2)):
             reqs[i] = swiftllm.create_request(input_ids, i)

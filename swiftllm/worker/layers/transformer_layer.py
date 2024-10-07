@@ -1,5 +1,4 @@
 import time
-import dataclasses
 import torch
 import vllm_flash_attn_2_cuda as flash_attn_cuda
 from swiftllm_c import \
@@ -23,6 +22,9 @@ from swiftllm.worker.kernels.linear import linear
 from swiftllm.worker.kernels.paged_attn import paged_attention
 
 class TransformerEvents:
+    """
+    Performance monitoring & synchronization events for a transformer layer
+    """
     def __init__(self, engine_config: EngineConfig):
         self.engine_config = engine_config
         self.stage_s = torch.cuda.Event(enable_timing=True)
@@ -69,6 +71,9 @@ class TransformerEvents:
             self.lnch_m = self.cdec_s = self.cdec_e = time.perf_counter()
 
 class LlamaTransformerLayer:
+    """
+    A transformer layer in the Llama model, may contain weights of the next layer
+    """
     def __init__(
         self,
         model_config: LlamaModelConfig,
@@ -89,30 +94,7 @@ class LlamaTransformerLayer:
 
         self.swapper = None
 
-    def set_meta_args(
-        self,
-        k_cache: torch.Tensor,
-        v_cache: torch.Tensor,
-        k_swap: torch.Tensor,
-        v_swap: torch.Tensor,
-        q_cpu: torch.Tensor,
-        k_cpu: torch.Tensor,
-        v_cpu: torch.Tensor,
-        o_cpu: torch.Tensor,
-        gpu_block_table: torch.Tensor,
-        cpu_block_table: torch.Tensor,
-        swapper: Swapper
-    ):
-        self.k_cache = k_cache
-        self.v_cache = v_cache
-        self.k_swap = k_swap
-        self.v_swap = v_swap
-        self.q_cpu = q_cpu
-        self.k_cpu = k_cpu
-        self.v_cpu = v_cpu
-        self.o_cpu = o_cpu
-        self.gpu_block_table = gpu_block_table
-        self.cpu_block_table = cpu_block_table
+    def set_swapper(self, swapper: Swapper):
         self.swapper = swapper
 
     def set_batches(self, batches: list[SubBatch]):
@@ -142,9 +124,9 @@ class LlamaTransformerLayer:
             with torch.cuda.stream(self.cpu_communication_stream):
                 # Wait until QKV is ready
                 torch.cuda.current_stream().wait_stream(torch.cuda.default_stream())
-                qc = self.q_cpu[:batch.num_cdecs]
-                kc = self.k_cpu[:batch.num_cdecs]
-                vc = self.v_cpu[:batch.num_cdecs]
+                qc = self.swapper.q_cpu[:batch.num_cdecs]
+                kc = self.swapper.k_cpu[:batch.num_cdecs]
+                vc = self.swapper.v_cpu[:batch.num_cdecs]
                 qc.copy_(q[-batch.num_cdecs:], non_blocking=True)
                 kc.copy_(k[-batch.num_cdecs:], non_blocking=True)
                 vc.copy_(v[-batch.num_cdecs:], non_blocking=True)
@@ -188,9 +170,9 @@ class LlamaTransformerLayer:
         q = linear(input_embds, weight.q_proj)		# [num_total_tokens, hidden_size]
         k = linear(input_embds, weight.k_proj)		# [num_total_tokens, num_kv_heads*head_dim]
         v = linear(input_embds, weight.v_proj)		# [num_total_tokens, num_kv_heads*head_dim]
-        q = q.view(-1, self.model_config.num_q_heads,  self.model_config.head_dim)	# [num_total_tokens, num_q_heads, head_dim]
-        k = k.view(-1, self.model_config.num_kv_heads, self.model_config.head_dim)	# [num_total_tokens, num_kv_heads, head_dim]
-        v = v.view(-1, self.model_config.num_kv_heads, self.model_config.head_dim)	# [num_total_tokens, num_kv_heads, head_dim]
+        q = q.view(-1, self.model_config.num_q_heads,  self.model_config.head_dim)
+        k = k.view(-1, self.model_config.num_kv_heads, self.model_config.head_dim)
+        v = v.view(-1, self.model_config.num_kv_heads, self.model_config.head_dim)
 
         # Rotary emb
         rotary_embedding_inplace(
@@ -205,8 +187,8 @@ class LlamaTransformerLayer:
             store_kvcache(
                 k,
                 v,
-                self.k_cache, self.v_cache,
-                self.gpu_block_table,
+                self.swapper.k_cache, self.swapper.v_cache,
+                self.swapper.gpu_block_manager.block_table,
                 batch.prgd_seq_ids[:batch.num_prefs],
                 batch.pref_st_locs_we,
                 batch.prgd_seq_lens[:batch.num_prefs],
@@ -272,9 +254,9 @@ class LlamaTransformerLayer:
                 k[batch.sum_pref_toks:gpu_token_end, :, :],
                 v[batch.sum_pref_toks:gpu_token_end, :, :],
                 o[batch.sum_pref_toks:gpu_token_end, :],
-                self.k_cache, self.v_cache,
+                self.swapper.k_cache, self.swapper.v_cache,
                 batch.softmax_scale,
-                self.gpu_block_table,
+                self.swapper.gpu_block_manager.block_table,
                 batch.prgd_seq_ids[batch.num_prefs:],
                 batch.prgd_seq_lens[batch.num_prefs:],
                 cur_layer_id,
@@ -285,7 +267,7 @@ class LlamaTransformerLayer:
                 
         if batch.num_cdecs > 0:
             og = o[-batch.num_cdecs:, :]
-            oc = self.o_cpu[:batch.num_cdecs]
+            oc = self.swapper.o_cpu[:batch.num_cdecs]
             events.pf_time("lnch_m")
             self.events[cur_stage].qkvtr_e.synchronize()
             events.pf_time("cdec_s")
@@ -295,12 +277,12 @@ class LlamaTransformerLayer:
                 batch.cdec_seq_ids_list,
                 batch.cdec_seq_lens_list,
 
-                self.q_cpu[:batch.num_cdecs],
-                self.k_cpu[:batch.num_cdecs],
-                self.v_cpu[:batch.num_cdecs],
-                self.k_swap,
-                self.v_swap,
-                self.cpu_block_table,
+                self.swapper.q_cpu[:batch.num_cdecs],
+                self.swapper.k_cpu[:batch.num_cdecs],
+                self.swapper.v_cpu[:batch.num_cdecs],
+                self.swapper.k_swap,
+                self.swapper.v_swap,
+                self.swapper.cpu_block_manager.block_table,
                 oc
             )
             events.pf_time("cdec_e")
@@ -323,16 +305,18 @@ class LlamaTransformerLayer:
         del up_gate_proj
         return ffn_out
     
-    def forward(self, input: torch.Tensor) -> torch.Tensor:
-        # (fused) Add last layer's residual, and perform RMSNorm
-        # Before: input_embds is the output of the last FFN block, and residual_buf
-        #         is the residual to be added to input_embds
-        # After: input_embds will be RMSNorm(input_embds + residual_buf), and
-        #        residual_buf will be input_embds + residual_buf (which will be
-        #        used as the residual after the attention block)
+    def forward(self, first_embeds: torch.Tensor) -> torch.Tensor:
+        """
+        (fused) Add last layer's residual, and perform RMSNorm
+        Before: input_embds is the output of the last FFN block, and residual_buf
+                is the residual to be added to input_embds
+        After: input_embds will be RMSNorm(input_embds + residual_buf), and
+               residual_buf will be input_embds + residual_buf (which will be
+               used as the residual after the attention block)
+        """
         self.events[0].pf_record("stage_s")
         self.events[0].pf_time("lnch_s")
-        q, k, v = self._preproj(input)
+        q, k, v = self._preproj(first_embeds)
         self.events[0].pf_record("linr_e")
         self._transfer_qkv(q, k, v)
         self._swap_out_blocks()

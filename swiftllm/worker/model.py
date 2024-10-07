@@ -1,8 +1,4 @@
-import itertools
-import math
-import dataclasses
 import json
-import time
 
 import numpy as np
 import torch
@@ -10,12 +6,11 @@ import torch
 from swiftllm.engine_config import EngineConfig
 from swiftllm.model_config import LlamaModelConfig
 from swiftllm.worker.weight import load_weights
-from swiftllm.worker.block_manager import BlockManager, Swapper
-from swiftllm.utils import GB
+from swiftllm.worker.block_manager import Swapper
 from swiftllm.structs import SubBatch
 
 from .layers.pre_layer import LlamaPreLayer
-from .layers.transformer_layer import LlamaTransformerLayer, TransformerEvents
+from .layers.transformer_layer import LlamaTransformerLayer
 from .layers.post_layer import LlamaPostLayer
 
 class ModelEvents:
@@ -136,6 +131,10 @@ class LlamaModel:
         # Swapper
         self.swapper = None
 
+        # Cached cos and sin values for RoPE
+        self.cos_cached = None
+        self.sin_cached = None
+
         if engine_config.library_path:
             torch.ops.load_library(engine_config.library_path)
         
@@ -178,91 +177,15 @@ class LlamaModel:
     
     @torch.inference_mode()
     def init_kvcache_and_swap(self, num_blocks: int):
-        self.num_blocks = num_blocks
-        self.num_buf_blocks = self.engine_config.max_blocks_per_seq
+        """
+        Initialize the key-value cache on both CPU and GPU.
+        """
+        self.engine_config.num_gpu_blocks = num_blocks
 
-        # Initialize KV cache
-        kvcache_shape = (
-            self.model_config.num_layers,
-            self.num_blocks,
-            self.model_config.num_kv_heads,
-            self.engine_config.block_size,
-            self.model_config.head_dim
-        )
-        # Here we use torch.zeros instead of torch.empty, since that torch.empty
-        # has the possibility to contain NaNs, which will cause the model to output NaNs.
-        self.k_cache = torch.zeros(kvcache_shape, dtype=torch.float16, device="cuda")
-        self.v_cache = torch.zeros(kvcache_shape, dtype=torch.float16, device="cuda")
-
-        # Initialize KV buffer, which is used for cprf sequences
-        # kvbuf_shape = (
-        #     self.num_buf_blocks,
-        #     self.model_config.num_kv_heads,
-        #     self.engine_config.block_size,
-        #     self.model_config.head_dim
-        # )
-        # self.k_buf = torch.zeros(kvbuf_shape, dtype=torch.float16, device="cuda")
-        # self.v_buf = torch.zeros(kvbuf_shape, dtype=torch.float16, device="cuda")
-
-        # Initialize KV swap space
-        kvswap_shape = (
-            self.model_config.num_layers,
-            # self.engine_config.num_cpu_blocks,
-            1000,
-            self.model_config.num_kv_heads,
-            self.engine_config.block_size,
-            self.model_config.head_dim
-        )
-        self.k_swap = torch.zeros(kvswap_shape, dtype=torch.float16, device="cpu", pin_memory=True)
-        self.v_swap = torch.zeros(kvswap_shape, dtype=torch.float16, device="cpu", pin_memory=True)
-
-        # Initialize CPU QKV buffer
-        self.q_cpu = torch.zeros((self.engine_config.max_batch_size, self.model_config.num_q_heads, self.model_config.head_dim), dtype=torch.float16, device="cpu", pin_memory=True)
-        self.k_cpu = torch.zeros((self.engine_config.max_batch_size, self.model_config.num_kv_heads, self.model_config.head_dim), dtype=torch.float16, device="cpu", pin_memory=True)
-        self.v_cpu = torch.zeros((self.engine_config.max_batch_size, self.model_config.num_kv_heads, self.model_config.head_dim), dtype=torch.float16, device="cpu", pin_memory=True)
-        # We store float32 tensors for the output, but convert them to float16 when copying back to GPU
-        self.o_cpu = torch.zeros((self.engine_config.max_batch_size, self.model_config.num_q_heads * self.model_config.head_dim), dtype=torch.float32, device="cpu", pin_memory=True)
-
-        # Initialize block manager
-        gpu_block_manager = BlockManager(
-            "cuda",
-            self.num_blocks,
-            self.engine_config.max_seqs_in_block_table,
-            self.engine_config.max_blocks_per_seq,
-            self.engine_config.block_size
-        )
-        cpu_block_manager = BlockManager(
-            "cpu",
-            self.engine_config.num_cpu_blocks,
-            self.engine_config.max_seqs_in_block_table,
-            self.engine_config.max_blocks_per_seq,
-            self.engine_config.block_size
-        )
-
-        self.swapper = Swapper(
-            self.engine_config,
-            self.k_cache,
-            self.v_cache,
-            self.k_swap,
-            self.v_swap,
-            gpu_block_manager,
-            cpu_block_manager
-        )
+        self.swapper = Swapper(self.engine_config, self.model_config)
 
         for layer in self.transformer_layers:
-            layer.set_meta_args(
-                self.k_cache,
-                self.v_cache,
-                self.k_swap,
-                self.v_swap,
-                self.q_cpu,
-                self.k_cpu,
-                self.v_cpu,
-                self.o_cpu,
-                self.swapper.gpu_block_manager.block_table,
-                self.swapper.cpu_block_manager.block_table,
-                self.swapper
-            )
+            layer.set_swapper(self.swapper)
 
     def _init_to_get_rotary(self):
         rope_scaling_factor = self.model_config.rope_scaling
@@ -381,12 +304,12 @@ class LlamaModel:
         self.events.pf_record("frwd_s")
 
         # input_embds would serve as a buffer for all attention outputs
-        input_embeds = self.pre_layer.forward(sum([b.input_token_ids for b in batches], []))
-        residual_buf = torch.zeros_like(input_embeds)
+        input_embedss = self.pre_layer.forward(sum([b.input_token_ids for b in batches], []))
+        residual_bufs = torch.zeros_like(input_embedss)
         s0 = batches[0].metadata.s
         s1 = batches[1].metadata.s
-        input_embedss = torch.split(input_embeds, [s0, s1], dim=0)
-        residual_bufs = torch.split(residual_buf, [s0, s1], dim=0)
+        input_embedss = torch.split(input_embedss, [s0, s1], dim=0)
+        residual_bufs = torch.split(residual_bufs, [s0, s1], dim=0)
 
 
         for layer in self.transformer_layers:
@@ -469,9 +392,15 @@ class LlamaModel:
         self.swapper.cpu_block_manager.free_blocks_for_seqs(cpu_seq_ids)
 
     def turn_on_perf_monitor(self):
+        """
+        Turn on performance monitoring.
+        """
         self.engine_config.monitor_performance = True
 
     def flush_perf_results_and_turn_off_perf_monitor(self):
+        """
+        Flush the performance results and turn off performance monitoring.
+        """
         self.engine_config.monitor_performance = False
         ret = self.perf_results
         self.perf_results = []

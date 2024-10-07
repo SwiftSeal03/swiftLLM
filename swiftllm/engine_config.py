@@ -15,6 +15,7 @@ class EngineConfig:
     block_size: int
     gpu_mem_utilization: float
     num_cpu_blocks: int
+    num_gpu_blocks: int # Could be derived from the profiler
     max_seqs_in_block_table: int
     max_blocks_per_seq: int
 

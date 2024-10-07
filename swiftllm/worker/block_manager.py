@@ -1,6 +1,7 @@
 import torch
 import swiftllm_c
 from swiftllm.engine_config import EngineConfig
+from swiftllm.model_config import LlamaModelConfig
 
 from .kernels.block_mgmt import set_block_table_and_num_seq_alloc_blocks, unset_block_table_and_num_seq_alloc_blocks, gather_allocated_blocks_and_unset
 
@@ -116,23 +117,68 @@ class Swapper:
     def __init__(
         self,
         engine_config: EngineConfig,
-        k_cache: torch.Tensor,
-        v_cache: torch.Tensor,
-        k_swap: torch.Tensor,
-        v_swap: torch.Tensor,
-        gpu_block_manager: BlockManager,
-        cpu_block_manager: BlockManager
+        model_config: LlamaModelConfig
     ):
-        assert gpu_block_manager.device_name == "cuda"
-        assert cpu_block_manager.device_name == "cpu"
         self.engine_config = engine_config
-        self.k_cache = k_cache
-        self.v_cache = v_cache
-        self.k_swap = k_swap
-        self.v_swap = v_swap
-        self.gpu_block_manager = gpu_block_manager
-        self.cpu_block_manager = cpu_block_manager
-        self.num_layers = k_cache.size(0)
+        self.model_config = model_config
+
+        # Initialize KV cache
+        kvcache_shape = (
+            model_config.num_layers,
+            engine_config.num_gpu_blocks,
+            model_config.num_kv_heads,
+            engine_config.block_size,
+            model_config.head_dim
+        )
+        # Here we use torch.zeros instead of torch.empty, since that torch.empty
+        # has the possibility to contain NaNs, which will cause the model to output NaNs.
+        self.k_cache = torch.zeros(kvcache_shape, dtype=torch.float16, device="cuda")
+        self.v_cache = torch.zeros(kvcache_shape, dtype=torch.float16, device="cuda")
+
+        # Initialize KV swap space
+        kvswap_shape = (
+            model_config.num_layers,
+            # engine_config.num_cpu_blocks,
+            1000,
+            model_config.num_kv_heads,
+            engine_config.block_size,
+            model_config.head_dim
+        )
+        self.k_swap = torch.zeros(kvswap_shape, dtype=torch.float16, device="cpu", pin_memory=True)
+        self.v_swap = torch.zeros(kvswap_shape, dtype=torch.float16, device="cpu", pin_memory=True)
+
+        # Initialize KV buffer, which is used for cprf sequences
+        # kvbuf_shape = (
+        #     self.num_buf_blocks,
+        #     model_config.num_kv_heads,
+        #     engine_config.block_size,
+        #     model_config.head_dim
+        # )
+        # self.k_buf = torch.zeros(kvbuf_shape, dtype=torch.float16, device="cuda")
+        # self.v_buf = torch.zeros(kvbuf_shape, dtype=torch.float16, device="cuda")
+
+        # Initialize CPU QKV buffer
+        self.q_cpu = torch.zeros((engine_config.max_batch_size, model_config.num_q_heads, model_config.head_dim), dtype=torch.float16, device="cpu", pin_memory=True)
+        self.k_cpu = torch.zeros((engine_config.max_batch_size, model_config.num_kv_heads, model_config.head_dim), dtype=torch.float16, device="cpu", pin_memory=True)
+        self.v_cpu = torch.zeros((engine_config.max_batch_size, model_config.num_kv_heads, model_config.head_dim), dtype=torch.float16, device="cpu", pin_memory=True)
+        # We store float32 tensors for the output, but convert them to float16 when copying back to GPU
+        self.o_cpu = torch.zeros((engine_config.max_batch_size, model_config.num_q_heads * model_config.head_dim), dtype=torch.float32, device="cpu", pin_memory=True)
+
+        # Initialize block manager
+        self.gpu_block_manager = BlockManager(
+            "cuda",
+            engine_config.num_gpu_blocks,
+            engine_config.max_seqs_in_block_table,
+            engine_config.max_blocks_per_seq,
+            engine_config.block_size
+        )
+        self.cpu_block_manager = BlockManager(
+            "cpu",
+            engine_config.num_cpu_blocks,
+            engine_config.max_seqs_in_block_table,
+            engine_config.max_blocks_per_seq,
+            engine_config.block_size
+        )
 
     def _initiate_swap(
         self,

@@ -2,9 +2,6 @@ import time
 import asyncio
 import functools
 from typing import AsyncGenerator
-from pprint import pprint
-
-import torch
 
 from swiftllm.engine_config import EngineConfig
 from swiftllm.model_config import LlamaModelConfig
@@ -13,10 +10,14 @@ from swiftllm.worker.profiler import ModelProfiler
 from swiftllm.utils import GB
 from swiftllm.structs import Request, RawRequest, StepOutput
 
-from .tokenization_engine import TokenizationEngine
-from .scheduler import Scheduler
+from swiftllm.server.tokenization_engine import TokenizationEngine
+from swiftllm.server.scheduler import Scheduler
 
 class Engine:
+    """
+    The main engine of the server
+    """
+
     def __init__(self, engine_config: EngineConfig):
         self.engine_config = engine_config
         self.model_config = LlamaModelConfig.load_from_model_path(engine_config.model_path)
@@ -25,6 +26,7 @@ class Engine:
         # The following fields will be created on `init_model()`
         self.model = None
         self.event_loop = None
+        self.profiler = None
         self.scheduler = None
         self.tokenization_engine = None
 
@@ -40,6 +42,9 @@ class Engine:
         return await self.event_loop.run_in_executor(None, func_partial)
 
     async def initialize(self):
+        """
+        Initialize the engine
+        """
         self.event_loop = asyncio.get_event_loop()
 
         print("[Engine] Initializing model...")
@@ -70,7 +75,7 @@ class Engine:
 
         print("[Engine] Model initialized")
         self.initialized = True
-    
+
     async def add_request_and_stream(self, raw_request: RawRequest) -> AsyncGenerator[StepOutput, None]:
         """
         Add a raw request to the engine and stream the output of the request (streaming mode)

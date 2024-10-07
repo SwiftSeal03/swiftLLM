@@ -1,6 +1,4 @@
 from collections import deque
-import dataclasses
-import numpy as np
 
 from swiftllm.worker.model import LlamaModel
 from swiftllm.utils import cdiv
@@ -165,7 +163,7 @@ class Scheduler:
         # Step 4: reduce the number of prefilled sequences in the first batch if CPU is idle for too long
         while batches[0].get_num_prefs():
             req, is_gpu = batches[0].pop_pref()
-            if batches[0].metadata.s < self.profiler.linr_S_threshold or min(self._get_remains(batches)) < 0:
+            if batches[0].metadata.s < self.predictor.linr_S_threshold or min(self._get_remains(batches)) < 0:
                 batches[0].add_pref(req, is_gpu)
                 break
 
@@ -234,8 +232,7 @@ class Scheduler:
 
         # Step 4: Launch prefilling requests, just to know the uplimit
         cpu_block_needed = sum(self._get_block_needed(req) for req in self.cpu_decoding_q) # for bounding new prefillings
-        for i in range(len(self.waiting_q)):
-            candidate = self.waiting_q[i]
+        for i, candidate in enumerate(self.waiting_q):
             cur_block_needed = self._get_block_needed(candidate)
             if gpu_block_needed + cur_block_needed > self.max_gpu_blocks or \
                (self.cpu_decoding_q and cpu_block_needed + cur_block_needed > cpu_threshold) or \
@@ -334,7 +331,7 @@ Pr2gs: {len(pref_to_gpu)}, Pr2cs: {len(pref_to_cpu)}, Waiting: {len(self.waiting
                 else:
                     break
         
-        cur_batch = SubBatch(self.profiler)
+        cur_batch = SubBatch(self.predictor)
         for req in self.gpu_decoding_q:
             cur_batch.add_gdec(req)
         return [cur_batch] if cur_batch else [], newly_swapped_out, newly_swapped_in
