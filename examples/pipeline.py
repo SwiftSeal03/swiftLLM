@@ -59,7 +59,7 @@ if __name__ == '__main__':
     model = swiftllm.LlamaModel(engine_config)
     model.load_weights()
     num_blocks = 1700
-    # num_blocks = model.profile_num_blocks()
+    # num_blocks = swiftllm.ModelProfiler(model).profile_num_blocks()
     print("Number of blocks:", num_blocks)
     model.init_kvcache_and_swap(num_blocks)
 
@@ -81,23 +81,20 @@ if __name__ == '__main__':
     reqs = [None] * nprompts
     if cpu_seq_ids:
         batch = swiftllm.SubBatch()
-        for i in range(0, ncpu_prompts // 2):
-            seq_id = cpu_seq_ids[i]
-            reqs[seq_id] = swiftllm.create_request(input_ids, seq_id)
-            batch.add_pref(reqs[seq_id], is_gpu=False)
+        for i in range(ngpu_prompts // 2, nprompts // 2):
+            reqs[i] = swiftllm.create_request(input_ids, i)
+            batch.add_pref(reqs[i], is_gpu=False)
         model.forward(batch)
         batch = swiftllm.SubBatch()
-        for i in range(ncpu_prompts // 2, ncpu_prompts):
-            seq_id = cpu_seq_ids[i]
-            reqs[seq_id] = swiftllm.create_request(input_ids, seq_id)
-            batch.add_pref(reqs[seq_id], is_gpu=False)
+        for i in range(nprompts // 2 + ngpu_prompts // 2, nprompts):
+            reqs[i] = swiftllm.create_request(input_ids, i)
+            batch.add_pref(reqs[i], is_gpu=False)
         model.forward(batch)
     if gpu_seq_ids:
         batch = swiftllm.SubBatch()
-        for i in range(0, ngpu_prompts):
-            seq_id = gpu_seq_ids[i]
-            reqs[seq_id] = swiftllm.create_request(input_ids, seq_id)
-            batch.add_pref(reqs[seq_id], is_gpu=True)
+        for i in list(range(ngpu_prompts // 2)) + list(range(nprompts // 2, nprompts // 2 + ngpu_prompts // 2)):
+            reqs[i] = swiftllm.create_request(input_ids, i)
+            batch.add_pref(reqs[i], is_gpu=True)
         model.forward(batch)
 
     # model.turn_on_perf_monitor()

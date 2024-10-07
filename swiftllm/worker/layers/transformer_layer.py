@@ -87,6 +87,8 @@ class LlamaTransformerLayer:
 
         self.events = [TransformerEvents(engine_config) for _ in range(2)]
 
+        self.swapper = None
+
     def set_meta_args(
         self,
         k_cache: torch.Tensor,
@@ -199,7 +201,7 @@ class LlamaTransformerLayer:
         )
 
         # Here we only store k, v for prefilling, the kernel won't store decoding KVs
-        if batch.num_prefs > 0 and not self.engine_config.ignore_kvcache:
+        if batch.num_prefs > 0 and self.swapper is not None:
             store_kvcache(
                 k,
                 v,

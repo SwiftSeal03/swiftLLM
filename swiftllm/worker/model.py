@@ -175,48 +175,6 @@ class LlamaModel:
             for layer_id in range(self.model_config.num_layers)
         ]
         self.post_layer = LlamaPostLayer(self.model_config, self.weight)
-
-    @torch.inference_mode()
-    def profile_num_blocks(self) -> int:
-        """
-        Profiler the number of GPU blocks
-
-        We run a forged prefill batch with the maximum number of tokens and
-        sequences, record the peak memory usage, and infer the number of blocks
-        that can be allocated.
-        """
-        torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats()
-
-        # Synthesis a prefill batch
-        num_tokens = self.engine_config.max_tokens_in_batch
-        batch_size = self.engine_config.max_batch_size
-        input_lens = [num_tokens // batch_size] * batch_size
-        input_lens[-1] += num_tokens % batch_size
-        input_ids = [
-            [0 for _ in range(input_len)]
-            for input_len in input_lens
-        ]
-        seq_ids = list(range(batch_size))
-        self.k_cache = self.v_cache = None # pylint: disable=attribute-defined-outside-init
-        self.engine_config.ignore_kvcache = True
-        _ = self.forward(ModelForwardArgs(input_ids, seq_ids, [], []))
-        self.engine_config.ignore_kvcache = False
-        torch.cuda.synchronize()
-
-        # peak_memory = torch.cuda.max_memory_allocated()
-        # total_memory = torch.cuda.get_device_properties(0).total_memory
-        free_memory, total_memory = torch.cuda.mem_get_info()
-        peak_memory = total_memory - free_memory
-        useable_memory = total_memory*self.engine_config.gpu_mem_utilization
-        print(f"[Model.profile] GPU total memory: {total_memory/GB:.2f} GB, runtime peak memory: {peak_memory/GB:.2f} GB")
-        if useable_memory < peak_memory:
-            raise RuntimeError(f"Peak memory {peak_memory/GB:.2f} GB exceeds usable memory {useable_memory/GB:.2f} GB ({total_memory/GB:.2f} GB * {self.engine_config.gpu_mem_utilization})")
-        block_size_bytes = self.engine_config.block_size * self.model_config.get_kvslot_size()
-        num_gpu_blocks = math.floor((useable_memory - peak_memory) / block_size_bytes)
-
-        torch.cuda.empty_cache()
-        return num_gpu_blocks
     
     @torch.inference_mode()
     def init_kvcache_and_swap(self, num_blocks: int):

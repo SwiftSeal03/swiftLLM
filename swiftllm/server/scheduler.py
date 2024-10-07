@@ -3,9 +3,9 @@ import dataclasses
 import numpy as np
 
 from swiftllm.worker.model import LlamaModel
-from swiftllm.worker.profiler import ModelProfiler
 from swiftllm.utils import cdiv
 from swiftllm.structs import Request, SubBatch
+from swiftllm.perfpredictor import PerfPredictor
 
 class RequestIdManager:
     """
@@ -61,7 +61,7 @@ class Scheduler:
     as well as swapping in/out
     """
 
-    def __init__(self, model: LlamaModel):
+    def __init__(self, model: LlamaModel, predictor: PerfPredictor):
         self.engine_config = model.engine_config
         self.model_config = model.model_config
         self.max_gpu_blocks = model.swapper.gpu_block_manager.num_blocks
@@ -69,7 +69,7 @@ class Scheduler:
         self.max_gpu_tokens = self.max_gpu_blocks * self.engine_config.block_size
         self.max_cpu_tokens = self.max_cpu_blocks * self.engine_config.block_size
 
-        self.profiler = ModelProfiler(model)
+        self.predictor = predictor
 
         # Request in the following three deques are sorted by their arrival time
         self.waiting_q: deque[Request] = deque()
@@ -114,7 +114,7 @@ class Scheduler:
             (batch0, batch1) if using pipelined mode
         """
         assert not self.engine_config.always_use_gpu, "This function is not designed for GPU-only mode"
-        batches = [SubBatch(self.profiler.pp) for _ in range(2)]
+        batches = [SubBatch(self.predictor) for _ in range(2)]
         gpu_only_batch = SubBatch()
 
         # Step 1: put all pref and gdec sequences into the first batch.
@@ -136,7 +136,7 @@ class Scheduler:
         # Step 2: adjust the number of prefilled sequences in gpu_only_batch
         while gpu_only_batch.get_num_prefs():
             req, is_gpu = gpu_only_batch.pop_pref()
-            if gpu_only_batch.metadata.s < self.profiler.pp.linr_S_threshold:
+            if gpu_only_batch.metadata.s < self.predictor.linr_S_threshold:
                 gpu_only_batch.add_pref(req, is_gpu)
                 break
         if not self.cpu_decoding_q:

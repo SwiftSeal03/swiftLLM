@@ -65,13 +65,19 @@ class Request:
     def is_finished(self) -> bool:
         return self.cur_output_len == self.output_len
 
-    def is_prefill_stage(self) -> bool:
-        return not self.output_token_ids
 
-def create_request(prompt_token_ids: list[int], req_id: int, output_len: int=1e9) -> Request:
+def create_request(
+    prompt_token_ids: list[int], 
+    req_id: int, 
+    output_len: int=1e9, 
+    output_token_ids: list[int] | None = None
+) -> Request:
     ret = Request(RawRequest("", output_len))
     ret.prompt_token_ids = prompt_token_ids
+    if output_token_ids is not None:
+        ret.output_token_ids = output_token_ids
     ret.prompt_len = len(prompt_token_ids)
+    ret.cur_output_len = len(ret.output_token_ids)
     ret.request_id = req_id
     return ret
 
