@@ -284,8 +284,7 @@ class LlamaModel:
         residual_buf = torch.zeros_like(input_embds)
         ffn_out = input_embds
         for layer in self.transformer_layers:
-            layer.set_batches([batch])
-            layer.set_buffers([input_embds], [residual_buf])
+            layer.set_batches_and_buffers([batch], [input_embds], [residual_buf])
             ffn_out = layer.forward(ffn_out)
 
         self.events.pf_record("mnbd_e")
@@ -326,10 +325,8 @@ class LlamaModel:
         input_embedss = torch.split(input_embedss, [s0, s1], dim=0)
         residual_bufs = torch.split(residual_bufs, [s0, s1], dim=0)
 
-
         for layer in self.transformer_layers:
-            layer.set_batches(batches)
-            layer.set_buffers(input_embedss, residual_bufs)
+            layer.set_batches_and_buffers(batches, input_embedss, residual_bufs)
             
         self.events.pf_record("fstg_s")
 

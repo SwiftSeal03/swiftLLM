@@ -137,32 +137,23 @@ class Engine:
         """
         while True:
             # Get the next batch from the scheduler
-            
             start = time.perf_counter()
-            batches, cur_swap_out, cur_swap_in = self.scheduler.get_next_batch()
 
+            batches, cur_swap_out, cur_swap_in = self.scheduler.get_next_batch()
             assert all(batches), "Batch shouldn't be empty"
             assert not (cur_swap_out and cur_swap_in), "Swap out and swap in should be mutually exclusive"
             assert len(batches) <= 2, "The number of batches should be at most 2"
-
             if not (batches or cur_swap_in or cur_swap_out):
                 # Nothing to do, sleep for a bit
                 await asyncio.sleep(0.005)
                 continue
-
             scheduler_end = time.perf_counter()
 
             # Perform swap in/out
             if cur_swap_out:
-                await self._run_on_model_async(
-                    self.model.swap_out_seqs,
-                    [req.request_id for req in cur_swap_out]
-                )
+                await self._run_on_model_async(self.model.swap_out_seqs, [req.request_id for req in cur_swap_out])
             if cur_swap_in:
-                await self._run_on_model_async(
-                    self.model.swap_in_seqs,
-                    [req.request_id for req in cur_swap_in]
-                )
+                await self._run_on_model_async(self.model.swap_in_seqs, [req.request_id for req in cur_swap_in])
             swp_finish = time.perf_counter()
             
             # Forward the model
@@ -173,25 +164,23 @@ class Engine:
             else:
                 # Pipelined mode
                 print(f"Using pipelined mode (batch_size = {len(batches[0]) + len(batches[1])})")
-                self.engine_config.monitor_performance = True
                 await self._run_on_model_async(self.model.forward_pipeline, batches)
 
             # Deal with output tokens
-            reqs = sum([b.all_reqs for b in batches], [])
             finished_req_ids = []
-            for req in reqs:
-                if req.is_finished():
-                    finished_req_ids.append(req.request_id)
-                    req.finished_event.set()
+            for batch in batches:
+                for req in batch.all_reqs:
+                    if req.is_finished():
+                        req.finished_event.set()
+                        finished_req_ids.append(req.request_id)
+                        self.scheduler.request_id_manager.free_id(req.request_id)
             if finished_req_ids:
                 await self._run_on_model_async(
                     self.model.free_seqs_resources,
                     finished_req_ids
                 )
-            
+            self.scheduler.remove_finished_requests()
             iter_end = time.perf_counter()
-            # Inform the scheduler, swap out newly prefilled requests if necessary
-            self.scheduler.on_batch_finish(reqs)
 
             print(
                 f"Time: {iter_end-start:.3f}s, scheduler: {scheduler_end-start:.3f}s, "

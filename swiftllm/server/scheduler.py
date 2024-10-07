@@ -382,18 +382,10 @@ Pr2gs: {len(pref_to_gpu)}, Pr2cs: {len(pref_to_cpu)}, Waiting: {len(self.waiting
         else:
             return self._get_next_batch_new()
     
-    def on_batch_finish(self, reqs: list[Request]):
+    def remove_finished_requests(self):
         """
-        Called when a batch finishes
-
-        free the request ids and remove the finished requests from the decoding queues
+        Remove the finished requests from the decoding queues
         """
-        self.request_id_manager.free_ids([
-            req.request_id
-            for req in reqs
-            if req.is_finished()
-        ])
-
         def not_finished_func(req: Request) -> bool:
             return not req.is_finished()
         self.gpu_decoding_q = list(filter(not_finished_func, self.gpu_decoding_q))
