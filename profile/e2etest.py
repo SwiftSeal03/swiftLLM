@@ -1,9 +1,12 @@
+"""
+This script runs a series of tests to measure the performance of the model on a given test case.
+"""
+
 import asyncio
 import argparse
 import logging
 import json
 import time
-import os
 from transformers import AutoTokenizer
 
 import swiftllm
@@ -79,7 +82,6 @@ async def run_throughput_test(
     logger.info(f"Throughput: {throughput:.3f} reqs/s")
 
 
-
 async def warm_up(
     prompt: str,
     engine: swiftllm.Engine, 
@@ -108,7 +110,7 @@ async def main():
     )
     args = parser.parse_args()
     model_path = args.model_path
-    is_streaming_mode = args.streaming
+    # is_streaming_mode = args.streaming
 
     engine_config = swiftllm.EngineConfig(
         model_path = model_path,
@@ -116,6 +118,7 @@ async def main():
         
         block_size = 16,
         gpu_mem_utilization = 0.995,
+        num_gpu_blocks = 1700,
         num_cpu_blocks = 15000,
         max_seqs_in_block_table = 2048,
         max_blocks_per_seq = 1024,

@@ -1,3 +1,7 @@
+"""
+The main engine of the server
+"""
+
 import time
 import asyncio
 import functools
@@ -55,14 +59,15 @@ class Engine:
 
         print("[Engine] Profiling kv blocks...")
         self.profiler = ModelProfiler(self.model)
-        num_gpu_blocks = 1700 # self.profiler.profile_num_blocks()
+        # self.profiler.profile_num_blocks()
+        num_gpu_blocks = self.engine_config.num_gpu_blocks
         num_cpu_blocks = self.engine_config.num_cpu_blocks
         block_size_bytes = self.engine_config.block_size*self.model_config.get_kvslot_size()
         print(f"[Engine] Number of GPU blocks: {num_gpu_blocks} ({num_gpu_blocks*block_size_bytes/GB:.2f} GB)")
         print(f"[Engine] Number of CPU blocks: {num_cpu_blocks} ({num_cpu_blocks*block_size_bytes/GB:.2f} GB)")
 
         print("[Engine] Allocating kv cache and swap...")
-        self.model.init_kvcache_and_swap(num_gpu_blocks)
+        self.model.init_kvcache_and_swap()
 
         print("[Engine] Initializing performance table...")
         self.profiler.init_profile_tables()
@@ -188,7 +193,10 @@ class Engine:
             # Inform the scheduler, swap out newly prefilled requests if necessary
             self.scheduler.on_batch_finish(reqs)
 
-            print(f"Time: {iter_end-start:.3f}s, scheduler: {scheduler_end-start:.3f}s, swap: {swp_finish-scheduler_end:.3f}s, forward: {iter_end-swp_finish:.3f}s")
+            print(
+                f"Time: {iter_end-start:.3f}s, scheduler: {scheduler_end-start:.3f}s, "
+                f"swap: {swp_finish-scheduler_end:.3f}s, forward: {iter_end-swp_finish:.3f}s"
+            )
             self.itr_end_times.append(iter_end)
             self.ntoken_of_itr.append(sum([b.metadata.x for b in batches]))
     

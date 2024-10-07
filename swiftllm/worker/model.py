@@ -1,3 +1,9 @@
+"""
+LlamaModel - A Llama model that can be used for inference.
+
+If performance monitoring is enabled, the model will record performance results.
+"""
+
 import json
 
 import numpy as np
@@ -14,6 +20,10 @@ from .layers.transformer_layer import LlamaTransformerLayer
 from .layers.post_layer import LlamaPostLayer
 
 class ModelEvents:
+    """
+    ModelEvents - A class that represents the GPU events of a forward pass of a model.
+    """
+
     def __init__(self, engine_config: EngineConfig):
         self.engine_config = engine_config
         self.frwd_s = torch.cuda.Event(enable_timing=True)
@@ -24,11 +34,18 @@ class ModelEvents:
         self.frwd_e = torch.cuda.Event(enable_timing=True)
 
     def pf_record(self, name:str):
+        """
+        Record the event with the given name if performance monitoring is enabled.
+        """
         if self.engine_config.monitor_performance:
             getattr(self, name).record()
 
 
 class ModelPerfResult:
+    """
+    ModelPerfResult - A class that represents the performance results of a forward pass of a model.
+    """
+
     fields_to_dump = [
         "avg_linr_time",
         "avg_pref_time",
@@ -176,12 +193,10 @@ class LlamaModel:
         self.post_layer = LlamaPostLayer(self.model_config, self.weight)
     
     @torch.inference_mode()
-    def init_kvcache_and_swap(self, num_blocks: int):
+    def init_kvcache_and_swap(self):
         """
         Initialize the key-value cache on both CPU and GPU.
         """
-        self.engine_config.num_gpu_blocks = num_blocks
-
         self.swapper = Swapper(self.engine_config, self.model_config)
 
         for layer in self.transformer_layers:

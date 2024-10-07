@@ -1,3 +1,9 @@
+"""
+Offline example of using the swiftllm model executor directly for inferencing without using the engine.
+
+Explicity uses pipeline mode.
+"""
+
 import time
 import argparse
 from transformers import AutoTokenizer
@@ -59,10 +65,8 @@ if __name__ == '__main__':
     # For instructions on how to initialize the model, see comments in swiftllm/worker/model.py
     model = swiftllm.LlamaModel(engine_config)
     model.load_weights()
-    num_blocks = 1700
     # num_blocks = swiftllm.ModelProfiler(model).profile_num_blocks()
-    print("Number of blocks:", num_blocks)
-    model.init_kvcache_and_swap(num_blocks)
+    model.init_kvcache_and_swap()
 
     model_creation_time = time.perf_counter() - start_time
     print(f"Model creation time: {model_creation_time:.2f} seconds")

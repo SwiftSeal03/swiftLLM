@@ -1,3 +1,7 @@
+"""
+Configuration for the SwiftLLM engine.
+"""
+
 import dataclasses
 import argparse
 
@@ -35,10 +39,23 @@ class EngineConfig:
 
     @property
     def max_seq_len(self) -> int:
+        """
+        Maximum sequence length in tokens
+        """
         return self.block_size * self.max_blocks_per_seq
     
     @property
-    def max_tokens_on_cpu(self) -> int:
+    def max_gpu_tokens(self) -> int:
+        """
+        Maximum number of tokens that can be stored in the GPU
+        """
+        return self.block_size * self.num_gpu_blocks
+    
+    @property
+    def max_cpu_tokens(self) -> int:
+        """
+        Maximum number of tokens that can be stored in the CPU
+        """
         return self.block_size * self.num_cpu_blocks
 
     @staticmethod

@@ -1,3 +1,7 @@
+"""
+Transformer layer utilities in the Llama model
+"""
+
 import time
 import torch
 import vllm_flash_attn_2_cuda as flash_attn_cuda
@@ -40,33 +44,57 @@ class TransformerEvents:
     
     @property
     def linr_time(self) -> float:
+        """
+        Time for linear operations + other small operations other than attention
+        """
         return self.stage_s.elapsed_time(self.linr_e)
 
     @property
     def pref_time(self) -> float:
+        """
+        Time for prefilling
+        """
         return self.linr_e.elapsed_time(self.pref_e)
 
     @property
     def gdec_time(self) -> float:
+        """
+        Time for GPU decoding
+        """
         return self.pref_e.elapsed_time(self.gdec_e)
 
     @property
-    def lnch_time(self) -> float:
-        return self.lnch_e - self.cdec_e + self.lnch_m - self.lnch_s
-
-    @property
     def cdec_time(self) -> float:
+        """
+        Time for CPU decoding
+        """
         return self.cdec_e - self.cdec_s
 
+    @property
+    def lnch_time(self) -> float:
+        """
+        Time for kernel launch & other Python overheads other than CPU decoding
+        """
+        return self.lnch_e - self.cdec_e + self.lnch_m - self.lnch_s
+
     def pf_record(self, name: str):
+        """
+        Record the event if performance monitoring is enabled
+        """
         if self.engine_config.monitor_performance:
             getattr(self, name).record()
 
     def pf_time(self, name: str):
+        """
+        Record the time if performance monitoring is enabled
+        """
         if self.engine_config.monitor_performance:
             setattr(self, name, time.perf_counter() * 1e3) # ms
 
     def pf_time_nocpu(self):
+        """
+        If performance monitoring is enabled but there is no CPU decoding sequences, set CPU time stamps to the current time
+        """
         if self.engine_config.monitor_performance:
             self.lnch_m = self.cdec_s = self.cdec_e = time.perf_counter()
 
@@ -92,19 +120,30 @@ class LlamaTransformerLayer:
 
         self.events = [TransformerEvents(engine_config) for _ in range(2)]
 
+        # Set after KV cache initialization
         self.swapper = None
 
+        # Set before forward
+        self.batches = None
+        self.input_embedss = None
+        self.residual_bufs = None
+
     def set_swapper(self, swapper: Swapper):
+        """
+        Set the swapper for the layer
+        """
         self.swapper = swapper
 
-    def set_batches(self, batches: list[SubBatch]):
-        self.batches = batches
-
-    def set_buffers(
-        self,
+    def set_batches_and_buffers(
+        self, 
+        batches: list[SubBatch],
         input_embedss: list[torch.Tensor],
         residual_bufs: list[torch.Tensor]
     ):
+        """
+        Set the batches and buffers for the forward pass
+        """
+        self.batches = batches
         self.input_embedss = input_embedss
         self.residual_bufs = residual_bufs
 
@@ -301,7 +340,7 @@ class LlamaTransformerLayer:
         up_gate_proj = linear(o, self.weight.up_gate_proj)
         del o
         silu_and_mul_inplace(up_gate_proj)
-        ffn_out = torch.nn.functional.linear(up_gate_proj[:, :self.model_config.ffn_inter_dim], self.weight.down_proj)
+        ffn_out = linear(up_gate_proj[:, :self.model_config.ffn_inter_dim], self.weight.down_proj)
         del up_gate_proj
         return ffn_out
     

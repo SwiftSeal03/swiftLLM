@@ -1,3 +1,7 @@
+"""
+A smart scheduler for the SwiftLLM engine that does batch picking and mode selection.
+"""
+
 from collections import deque
 
 from swiftllm.worker.model import LlamaModel
@@ -15,20 +19,35 @@ class RequestIdManager:
         self.available_ids = deque(range(max_id))
     
     def get_id(self) -> int:
+        """
+        Get an available request id
+        """
         if not self.available_ids:
             raise RuntimeError("No more available request ids. Please try to increase `max_seqs_in_block_table`")
         return self.available_ids.popleft()
 
     def get_num_available_ids(self) -> int:
+        """
+        Get the number of available request ids
+        """
         return len(self.available_ids)
     
     def free_id(self, req_id: int):
+        """
+        Free a request id
+        """
         self.available_ids.append(req_id)
     
     def free_ids(self, req_ids: list[int]):
+        """
+        Free a list of request ids
+        """
         self.available_ids.extend(req_ids)
 
 class ScheduleBudget:
+    """
+    A class that maintains the budget for scheduling
+    """
     def __init__(self, max_batch_size: int, max_prefill_tokens: int, max_tokens_in_batch: int):
         self.remaining_batch_size = max_batch_size
         self.remaining_prefill_tokens = max_prefill_tokens
@@ -36,9 +55,17 @@ class ScheduleBudget:
     
     @property
     def overspent(self) -> bool:
+        """
+        Check if the budget is overspent
+        """
         return self.remaining_batch_size < 0 or self.remaining_tokens_in_batch < 0
 
     def check_and_substract(self, num_tokens, is_prefill = False) -> bool:
+        """
+        Check if the budget is enough. 
+        
+        If so, substract the tokens from the budget and return True. Otherwise, return False.
+        """
         if self.remaining_batch_size >= 1 and \
             self.remaining_tokens_in_batch >= num_tokens and \
             self.remaining_prefill_tokens >= (num_tokens if is_prefill else 0):
@@ -49,6 +76,9 @@ class ScheduleBudget:
         return False
 
     def add(self, num_tokens, is_prefill = False) -> bool:
+        """
+        Add tokens to the budget
+        """
         self.remaining_batch_size += 1
         self.remaining_tokens_in_batch += num_tokens
         self.remaining_prefill_tokens += num_tokens if is_prefill else 0
@@ -94,7 +124,13 @@ class Scheduler:
 
     def _get_remains(self, batches: list[SubBatch]) -> float:
         assert len(batches) == 2
-        return [batches[j^1].metadata.linr_T + batches[j].metadata.pref_T + batches[j].metadata.gdec_T - batches[j].metadata.cpu_time for j in range(2)]
+        return [
+            batches[j^1].metadata.linr_T + 
+            batches[j].metadata.pref_T + 
+            batches[j].metadata.gdec_T - 
+            batches[j].metadata.cpu_time 
+            for j in range(2)
+        ]
 
     def _decide_mode_and_gen_batch(
         self, 
@@ -180,7 +216,7 @@ class Scheduler:
             return [gpu_only_batch]
         # return [gpu_only_batch]
 
-    def get_next_batch_new(self) -> tuple[list[SubBatch], list[Request], list[Request]]:
+    def _get_next_batch_new(self) -> tuple[list[SubBatch], list[Request], list[Request]]:
         """
         Called when the engine wants a new batch to be forwarded
         Returns (new_batch, newly_swapped_in, newly_swapped_out)
@@ -271,7 +307,7 @@ Pr2gs: {len(pref_to_gpu)}, Pr2cs: {len(pref_to_cpu)}, Waiting: {len(self.waiting
 
         return batches, swpout_reqs, swpin_reqs
 
-    def get_next_batch_old(self) -> tuple[list[SubBatch], list[Request], list[Request]]:
+    def _get_next_batch_old(self) -> tuple[list[SubBatch], list[Request], list[Request]]:
         print(f"Waiting: {len(self.waiting_q)}, Gdecs: {len(self.gpu_decoding_q)}, Cdecs: {len(self.cpu_decoding_q)}")
         if not self.cpu_decoding_q:
             # Try to launch a new prefill batch
@@ -303,11 +339,10 @@ Pr2gs: {len(pref_to_gpu)}, Pr2cs: {len(pref_to_cpu)}, Waiting: {len(self.waiting
                 return [cur_batch], [], []
         
         # Try to launch a decoding batch
-        # TODO Optimize this `sum` if possible
         self.num_decoding_gpu_blocks = sum(self._get_block_needed(req) for req in self.gpu_decoding_q)
         newly_swapped_out = []
         while len(self.gpu_decoding_q) > self.engine_config.max_batch_size or \
-              self.num_decoding_gpu_blocks > self.max_gpu_blocks:
+            self.num_decoding_gpu_blocks > self.max_gpu_blocks:
             # Preempt the last running seq
             victim = self.gpu_decoding_q.pop()
             self.num_decoding_gpu_blocks -= self._get_block_needed(victim)
@@ -337,20 +372,29 @@ Pr2gs: {len(pref_to_gpu)}, Pr2cs: {len(pref_to_cpu)}, Waiting: {len(self.waiting
         return [cur_batch] if cur_batch else [], newly_swapped_out, newly_swapped_in
 
     def get_next_batch(self) -> tuple[list[SubBatch], list[Request], list[Request]]:
+        """
+        Get the next batch(es) to be forwarded.
+
+        Returns a tuple: (new_batch(es), newly_swapped_out_reqs, newly_swapped_in_reqs)
+        """
         if self.engine_config.always_use_gpu:
-            return self.get_next_batch_old()
+            return self._get_next_batch_old()
         else:
-            return self.get_next_batch_new()
+            return self._get_next_batch_new()
     
-    def on_batch_finish(self, batch: list[Request]):
+    def on_batch_finish(self, reqs: list[Request]):
         """
         Called when a batch finishes
+
+        free the request ids and remove the finished requests from the decoding queues
         """
-        not_finished_func = lambda req: not req.is_finished()
         self.request_id_manager.free_ids([
             req.request_id
-            for req in batch
+            for req in reqs
             if req.is_finished()
         ])
+
+        def not_finished_func(req: Request) -> bool:
+            return not req.is_finished()
         self.gpu_decoding_q = list(filter(not_finished_func, self.gpu_decoding_q))
         self.cpu_decoding_q = deque(filter(not_finished_func, self.cpu_decoding_q))

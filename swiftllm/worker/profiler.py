@@ -1,3 +1,7 @@
+"""
+This module provides a profiler for the Llama model.
+"""
+
 import time
 import os
 import json
@@ -32,8 +36,6 @@ class ModelProfiler:
         """
         # Validate necessary constraints
         engine_config = self.model.engine_config
-        max_gpu_tokens = self.model.swapper.gpu_block_manager.num_blocks * engine_config.block_size
-        max_cpu_tokens = self.model.swapper.cpu_block_manager.num_blocks * engine_config.block_size
 
         assert engine_config.max_prefill_tokens <= engine_config.max_tokens_in_batch, \
             f"max_prefill_tokens {engine_config.max_prefill_tokens} exceeds max_tokens_in_batch {engine_config.max_tokens_in_batch}"
@@ -42,7 +44,7 @@ class ModelProfiler:
         assert engine_config.max_batch_size <= engine_config.max_seqs_in_block_table, \
             f"max_batch_size {engine_config.max_batch_size} exceeds max_seqs_in_block_table {engine_config.max_seqs_in_block_table}"
 
-        self.pp = TablePerfPredictor(engine_config, max_gpu_tokens, max_cpu_tokens)
+        self.pp = TablePerfPredictor(engine_config)
 
         self.pp.linr_T_list = self._profile_linr(self.pp.linr_S_list)
         self.pp.pref_T_list = self._profile_pref(self.pp.pref_S_list)
@@ -443,13 +445,15 @@ class ModelProfiler:
         return T_mean
 
     @torch.inference_mode()
-    def profile_num_blocks(self) -> int:
+    def profile_num_blocks(self):
         """
-        Profiler the number of GPU blocks
+        Profile the number of GPU blocks
 
         We run a forged prefill batch with the maximum number of tokens and
         sequences, record the peak memory usage, and infer the number of blocks
         that can be allocated.
+
+        Finally, we set the number of GPU blocks in the engine configuration.
         """
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
@@ -475,9 +479,12 @@ class ModelProfiler:
         useable_memory = total_memory * engine_config.gpu_mem_utilization
         print(f"[Model.profile] GPU total memory: {total_memory/GB:.2f} GB, runtime peak memory: {peak_memory/GB:.2f} GB")
         if useable_memory < peak_memory:
-            raise RuntimeError(f"Peak memory {peak_memory/GB:.2f} GB exceeds usable memory {useable_memory/GB:.2f} GB ({total_memory/GB:.2f} GB * {engine_config.gpu_mem_utilization})")
+            raise RuntimeError(
+                f"Peak memory {peak_memory/GB:.2f} GB exceeds usable memory {useable_memory/GB:.2f} GB "
+                f"({total_memory/GB:.2f} GB * {engine_config.gpu_mem_utilization})"
+            )
         block_size_bytes = engine_config.block_size * model_config.get_kvslot_size()
         num_gpu_blocks = math.floor((useable_memory - peak_memory) / block_size_bytes)
 
         torch.cuda.empty_cache()
-        return num_gpu_blocks
+        self.model.engine_config.num_gpu_blocks = num_gpu_blocks

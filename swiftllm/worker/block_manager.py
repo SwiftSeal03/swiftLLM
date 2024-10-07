@@ -1,9 +1,18 @@
+"""
+BlockManager and Swapper
+
+Contains initalization and transition logics for the KV cache.
+"""
+
 import torch
 import swiftllm_c
 from swiftllm.engine_config import EngineConfig
 from swiftllm.model_config import LlamaModelConfig
 
-from .kernels.block_mgmt import set_block_table_and_num_seq_alloc_blocks, unset_block_table_and_num_seq_alloc_blocks, gather_allocated_blocks_and_unset
+from .kernels.block_mgmt import \
+    set_block_table_and_num_seq_alloc_blocks, \
+    unset_block_table_and_num_seq_alloc_blocks, \
+    gather_allocated_blocks_and_unset
 
 class BlockManager:
     """
@@ -49,7 +58,10 @@ class BlockManager:
         return the block IDs.
         """
         if num_blocks > self.num_free_blocks:
-            raise RuntimeError(f"No enough free blocks available on {self.device_name} ({self.num_blocks} in total, {self.num_free_blocks} free, {num_blocks} requested)")
+            raise RuntimeError(
+                f"No enough free blocks available on {self.device_name} ({self.num_blocks} in total,"
+                f"{self.num_free_blocks} free, {num_blocks} requested)"
+            )
         selected_blocks = torch.nonzero(self.is_block_free)[:num_blocks].view(-1)
         self.num_free_blocks -= num_blocks
         self.is_block_free[selected_blocks] = False
@@ -158,11 +170,14 @@ class Swapper:
         # self.v_buf = torch.zeros(kvbuf_shape, dtype=torch.float16, device="cuda")
 
         # Initialize CPU QKV buffer
-        self.q_cpu = torch.zeros((engine_config.max_batch_size, model_config.num_q_heads, model_config.head_dim), dtype=torch.float16, device="cpu", pin_memory=True)
-        self.k_cpu = torch.zeros((engine_config.max_batch_size, model_config.num_kv_heads, model_config.head_dim), dtype=torch.float16, device="cpu", pin_memory=True)
-        self.v_cpu = torch.zeros((engine_config.max_batch_size, model_config.num_kv_heads, model_config.head_dim), dtype=torch.float16, device="cpu", pin_memory=True)
-        # We store float32 tensors for the output, but convert them to float16 when copying back to GPU
-        self.o_cpu = torch.zeros((engine_config.max_batch_size, model_config.num_q_heads * model_config.head_dim), dtype=torch.float32, device="cpu", pin_memory=True)
+        q_cpu_shape = (engine_config.max_batch_size, model_config.num_q_heads, model_config.head_dim)
+        o_cpu_shape = (engine_config.max_batch_size, model_config.num_q_heads * model_config.head_dim)
+        kv_cpu_shape = (engine_config.max_batch_size, model_config.num_kv_heads, model_config.head_dim)
+        self.q_cpu = torch.zeros(q_cpu_shape, dtype=torch.float16, device="cpu", pin_memory=True)
+        self.k_cpu = torch.zeros(kv_cpu_shape, dtype=torch.float16, device="cpu", pin_memory=True)
+        self.v_cpu = torch.zeros(kv_cpu_shape, dtype=torch.float16, device="cpu", pin_memory=True)
+        # We store float32 tensors for the output, but convert them to float16 after copying back to GPU
+        self.o_cpu = torch.zeros(o_cpu_shape, dtype=torch.float32, device="cpu", pin_memory=True)
 
         # Initialize block manager
         self.gpu_block_manager = BlockManager(

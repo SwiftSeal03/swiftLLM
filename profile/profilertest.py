@@ -1,3 +1,7 @@
+"""
+This script is used to test the performance of the model on a given test case.
+"""
+
 import time
 import json
 
@@ -35,9 +39,7 @@ def init_model():
     model = LlamaModel(engine_config)
     model.load_weights()
     profiler = ModelProfiler(model)
-    num_blocks = 1700
-    print("Number of blocks:", num_blocks)
-    model.init_kvcache_and_swap(num_blocks)
+    model.init_kvcache_and_swap()
 
     model_creation_time = time.perf_counter() - start_time
     print(f"Model creation time: {model_creation_time:.2f} seconds")
