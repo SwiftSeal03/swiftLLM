@@ -65,6 +65,14 @@ class Request:
     def is_finished(self) -> bool:
         return self.cur_output_len == self.output_len
 
+    @staticmethod
+    def get_ids(reqs: list["Request"]) -> list[int]:
+        return [req.request_id for req in reqs]
+
+    @staticmethod
+    def get_lens(reqs: list["Request"]) -> list[int]:
+        return [req.seq_len for req in reqs]
+
 
 def create_request(
     prompt_token_ids: list[int], 
@@ -178,22 +186,23 @@ class SubBatch:
         return len(self.gprf_reqs) + len(self.cprf_reqs)
 
     def set_model_forward_args(self):
-        self.pref_reqs = self.gprf_reqs + self.cprf_reqs
+        self.pref_reqs = self.cprf_reqs + self.gprf_reqs
         self.deco_reqs = self.gdec_reqs + self.cdec_reqs
         self.all_reqs = self.pref_reqs + self.deco_reqs
+        assert all(req.request_id != -1 for req in self.all_reqs), "Request ID not set"
 
         self.num_prefs = len(self.pref_reqs)
         self.num_cprfs = len(self.cprf_reqs)
         self.num_gdecs = len(self.gdec_reqs)
         self.num_cdecs = len(self.cdec_reqs)
 
-        self.pref_seq_ids_list = [req.request_id for req in self.pref_reqs]
-        self.gdec_seq_ids_list = [req.request_id for req in self.gdec_reqs]
-        self.cdec_seq_ids_list = [req.request_id for req in self.cdec_reqs]
+        self.pref_seq_ids_list = Request.get_ids(self.pref_reqs)
+        self.gdec_seq_ids_list = Request.get_ids(self.gdec_reqs)
+        self.cdec_seq_ids_list = Request.get_ids(self.cdec_reqs)
 
-        self.pref_seq_lens_list = [req.seq_len for req in self.pref_reqs]
-        self.gdec_seq_lens_list = [req.seq_len for req in self.gdec_reqs]
-        self.cdec_seq_lens_list = [req.seq_len for req in self.cdec_reqs]
+        self.pref_seq_lens_list = Request.get_lens(self.pref_reqs)
+        self.gdec_seq_lens_list = Request.get_lens(self.gdec_reqs)
+        self.cdec_seq_lens_list = Request.get_lens(self.cdec_reqs)
 
         self.prgd_seq_ids = torch.tensor(self.pref_seq_ids_list + self.gdec_seq_ids_list, dtype=torch.int32, device='cuda')
         self.cdec_seq_ids = torch.tensor(self.cdec_seq_ids_list, dtype=torch.int32, device='cpu')
@@ -223,6 +232,6 @@ class SubBatch:
 
 
     def print_profile(self):
-        print(f"gprf lens: {[req.prompt_len for req in self.gprf_reqs]}, cprf lens: {[req.prompt_len for req in self.cprf_reqs]}, \
+        print(f"cprf lens: {[req.prompt_len for req in self.cprf_reqs]}, gprf lens: {[req.prompt_len for req in self.gprf_reqs]}, \
 gdec lens: {[req.seq_len for req in self.gdec_reqs]}, cdec lens: {[req.seq_len for req in self.cdec_reqs]}")
     

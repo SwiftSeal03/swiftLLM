@@ -220,7 +220,9 @@ class LlamaModel:
         batch: SubBatch
     ):
         """
-        Prepare the inputs for the forward pass.
+        Prepare the batch for the forward pass. Mainly do 2 things:
+            1. Compute metadata of the batch for more convenient kernel calling.
+            2. Allocate blocks for the sequences in the batch.
         """
         batch.set_model_forward_args()
 
@@ -246,18 +248,25 @@ class LlamaModel:
 
         if self.swapper is not None:
             self.swapper.gpu_block_manager.allocate_blocks_for_seqs(
-                batch.prgd_seq_ids, batch.prgd_seq_lens
+                batch.prgd_seq_ids, batch.prgd_seq_lens, batch.num_cprfs if self.engine_config.extra_layer_for_cprf else 0
             )
             self.swapper.cpu_block_manager.allocate_blocks_for_seqs(
                 batch.cdec_seq_ids, batch.cdec_seq_lens
             )
-        
-            if batch.cprf_reqs:
-                batch.src_blk_ids, batch.dst_blk_ids = self.swapper.initiate_swap_out(
-                    [req.request_id for req in batch.cprf_reqs]
-                )
         else:
+            # This is profiling number of GPU blocks, only gprf could exist
             assert not batch.cprf_reqs and not batch.gdec_reqs and not batch.cdec_reqs
+
+    def _prepare_swaps(
+        self,
+        batch: SubBatch
+    ):
+        if batch.cprf_reqs:
+            assert self.swapper is not None
+            batch.src_blk_ids, batch.dst_blk_ids = self.swapper.initiate_swap_out(
+                batch.pref_seq_ids_list[:batch.num_cprfs],
+                use_itm = self.engine_config.extra_layer_for_cprf
+            )
 
     @torch.inference_mode()
     def forward(
@@ -268,6 +277,7 @@ class LlamaModel:
         Run a forward pass of the LlamaModel.
         """
         self._prepare_inputs(batch)
+        self._prepare_swaps(batch)
 
         self.events.pf_record("frwd_s")
 
@@ -311,9 +321,16 @@ class LlamaModel:
         """
         Run a forward pass of the LlamaModel in a pipelined manner.
         """
+        assert len(batches) == 2, "Pipelined mode only supports 2 batches"
 
         for batch in batches:
             self._prepare_inputs(batch)
+        print("Prepared inputs")
+
+        # Swaps should be initated later to avoid sharing blocks between batches
+        for batch in batches:
+            self._prepare_swaps(batch)
+        print("Prepared swaps")
 
         self.events.pf_record("frwd_s")
 
@@ -389,7 +406,7 @@ class LlamaModel:
         src_block_ids, dst_block_ids = self.swapper.initiate_swap_out(seq_ids_list)
         with torch.cuda.stream(self.cpu_communication_stream):
             for layer_id in range(len(self.transformer_layers)):
-                self.swapper.swap_out_blocks(layer_id, src_block_ids, dst_block_ids)
+                self.swapper.swap_out_blocks(layer_id, layer_id, src_block_ids, dst_block_ids)
 
     @torch.inference_mode()
     def free_seqs_resources(self, seq_ids_list: list[int]):

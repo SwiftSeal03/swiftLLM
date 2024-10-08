@@ -149,7 +149,7 @@ class Scheduler:
         """
         assert not self.engine_config.always_use_gpu, "This function is not designed for GPU-only mode"
         batches = [SubBatch(self.predictor) for _ in range(2)]
-        gpu_only_batch = SubBatch()
+        gpu_only_batch = SubBatch(self.predictor)
 
         # Step 1: put all pref and gdec sequences into the first batch.
         for req in gpu_prefill_reqs:
@@ -173,6 +173,7 @@ class Scheduler:
             if gpu_only_batch.metadata.s < self.predictor.linr_S_threshold:
                 gpu_only_batch.add_pref(req, is_gpu)
                 break
+
         if not self.cpu_decoding_q:
             return [gpu_only_batch] # This is to prevent division by zero
 
@@ -204,6 +205,7 @@ class Scheduler:
                 break
 
         # Step 5: check if pipelined mode is better
+        
         seqential_time = gpu_only_batch.metadata.gpu_time * self.model_config.num_layers
         pipelined_time = (batches[0].metadata.gpu_time + batches[1].metadata.gpu_time) * self.model_config.num_layers
         seqential_rate = len(gpu_only_batch) / seqential_time
@@ -233,10 +235,10 @@ class Scheduler:
         swpin_reqs = []
 
         # Policy may change, should recompute these thresholds on every iteration
-        swap_out_threshold = self.max_gpu_blocks * 0.95
+        swap_out_threshold = self.max_gpu_blocks
         # swap_in_threshold = round(swap_out_threshold * 0.95)
         # swap_out_threshold = self.max_gpu_blocks
-        swap_in_threshold = swap_out_threshold
+        swap_in_threshold = swap_out_threshold * 0.95
         cpu_threshold = self.max_cpu_blocks - self.max_gpu_blocks
         
         # Step 1: Try to launch as many GPU decoding requests as possible
@@ -267,24 +269,25 @@ class Scheduler:
         assert not swpout_reqs or not swpin_reqs
 
         # Step 4: Launch prefilling requests, just to know the uplimit
+        itm_block_needed = 0
         cpu_block_needed = sum(self._get_block_needed(req) for req in self.cpu_decoding_q) # for bounding new prefillings
         for i, candidate in enumerate(self.waiting_q):
             cur_block_needed = self._get_block_needed(candidate)
-            if gpu_block_needed + cur_block_needed > self.max_gpu_blocks or \
-               (self.cpu_decoding_q and cpu_block_needed + cur_block_needed > cpu_threshold) or \
-               self.request_id_manager.get_num_available_ids() < i or \
-               not budget.check_and_substract(candidate.prompt_len, True):
+            if  itm_block_needed + cur_block_needed > self.max_gpu_blocks or \
+                cpu_block_needed + cur_block_needed > cpu_threshold or \
+                self.request_id_manager.get_num_available_ids() < i or \
+                not budget.check_and_substract(candidate.prompt_len, True):
                 break
-            gpu_block_needed += cur_block_needed
-            cpu_block_needed += cur_block_needed
-            # self.waiting_q.popleft()
             # The newly prefilled sequences are the major part of swapping out. Here we use a simple heuristic.
-            # Note that this might not be necessary since some sequences might finish in this iteration. However, this will not hurt
-            #   because the next group of prefilled sequences won't need to be swapped out.
-            # Also note that in GPU-only mode, there will never be any pre-swapped-out requests.
-            if gpu_block_needed <= swap_out_threshold:
+            # 1. We prefer to put a sequence into GPU.
+            # 2. If the GPU is full, we put the sequence into CPU.
+            # 3. For fairness, if some earlier sequences are in CPU, we should put the later sequences into CPU.
+            if not pref_to_cpu and gpu_block_needed + cur_block_needed <= self.max_gpu_blocks:
+                gpu_block_needed += cur_block_needed
                 pref_to_gpu.append(candidate)
             else:
+                cpu_block_needed += cur_block_needed
+                itm_block_needed += cur_block_needed
                 pref_to_cpu.append(candidate)
 
         # Step 5: Launch CPU decoding requests and form batches
@@ -299,8 +302,10 @@ class Scheduler:
             candidate.request_id = self.request_id_manager.get_id()
 
         if self.gpu_decoding_q or self.cpu_decoding_q or pref_to_gpu or pref_to_cpu or self.waiting_q:
-            print(f"Gdecs: {len(self.gpu_decoding_q)}, Cdecs: {len(self.cpu_decoding_q)}, \
-Pr2gs: {len(pref_to_gpu)}, Pr2cs: {len(pref_to_cpu)}, Waiting: {len(self.waiting_q)}")     
+            print(
+                f"Gdecs: {len(self.gpu_decoding_q)}, Cdecs: {len(self.cpu_decoding_q)}, "
+                f"Pr2gs: {len(pref_to_gpu)}, Pr2cs: {len(pref_to_cpu)}, Waiting: {len(self.waiting_q)}"
+            )     
 
         self.gpu_decoding_q.extend(pref_to_gpu)
         self.cpu_decoding_q.extend(pref_to_cpu)

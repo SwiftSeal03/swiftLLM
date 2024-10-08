@@ -69,15 +69,15 @@ class ModelProfiler:
 
         self.model.swapper.gpu_block_manager.allocate_blocks_for_seqs(seq_ids, seq_lens)
 
-        block_size = self.model.engine_config.block_size
-        nblocks = [(seq_len - 1) // block_size + 1 for seq_len in seq_lens]
+        # block_size = self.model.engine_config.block_size
+        # nblocks = [(seq_len - 1) // block_size + 1 for seq_len in seq_lens]
 
-        for i, seq_id in enumerate(seq_ids):
-            nblock = nblocks[i]
-            block_ids = self.model.swapper.gpu_block_manager.block_table[seq_id][:nblock]
-            for layer_id in range(self.model.model_config.num_layers):
-                self.model.k_cache[layer_id, block_ids].random_().normal_()
-                self.model.v_cache[layer_id, block_ids].random_().normal_()
+        # for i, seq_id in enumerate(seq_ids):
+        #     nblock = nblocks[i]
+        #     block_ids = self.model.swapper.gpu_block_manager.block_table[seq_id][:nblock]
+        #     for layer_id in range(self.model.model_config.num_layers):
+        #         self.model.swapper.k_cache[layer_id, block_ids].random_().normal_()
+        #         self.model.swapper.v_cache[layer_id, block_ids].random_().normal_()
 
     def _cpu_fake_prefill(
       self,
@@ -85,22 +85,27 @@ class ModelProfiler:
     ):
         # We should segregate it into parts in order not to exceed the maximum number of blocks
         # Note that this is just heuristic based
-        num_gpu_free_blocks = self.model.swapper.gpu_block_manager.num_free_blocks
-        i = 0
+        # num_gpu_free_blocks = self.model.swapper.gpu_block_manager.num_free_blocks[0]
+        # i = 0
         # Since seq_lens may exceed GPU KV cache size, we need to divide it into parts
-        while i < len(reqs):
-            j = i
-            block_needed = 0
-            while j < len(reqs):
-                seq_len = reqs[j].seq_len
-                nblocks = (seq_len - 1) // self.model.engine_config.block_size + 1
-                if block_needed + nblocks > num_gpu_free_blocks:
-                    break
-                block_needed += nblocks
-                j += 1
-            self._gpu_fake_prefill(reqs[i:j])
-            self.model.swap_out_seqs([req.request_id for req in reqs[i:j]])
-            i = j
+        # while i < len(reqs):
+        #     j = i
+        #     block_needed = 0
+        #     while j < len(reqs):
+        #         seq_len = reqs[j].seq_len
+        #         nblocks = (seq_len - 1) // self.model.engine_config.block_size + 1
+        #         if block_needed + nblocks > num_gpu_free_blocks:
+        #             break
+        #         block_needed += nblocks
+        #         j += 1
+        #     self._gpu_fake_prefill(reqs[i:j])
+        #     self.model.swap_out_seqs([req.request_id for req in reqs[i:j]])
+        #     i = j
+        seq_ids = torch.tensor([req.request_id for req in reqs], dtype=torch.int32, device="cpu")
+        seq_lens = torch.tensor([req.seq_len for req in reqs], dtype=torch.int32, device="cpu")
+
+        self.model.swapper.cpu_block_manager.allocate_blocks_for_seqs(seq_ids, seq_lens)
+
 
     def _run_test_case_seq(
         self,
@@ -150,25 +155,28 @@ class ModelProfiler:
             ngdec = len(gdec_lens[i])
             ncdec = len(cdec_lens[i])
 
-        for j in range(npref):
-            batch.add_pref(create_request([10] * pref_lens[i][j], offs + j), is_gpu=True)
+            for j in range(npref):
+                batch.add_pref(create_request([10] * pref_lens[i][j], offs + j), is_gpu=True)
 
-        for j in range(ngdec):
-            batch.add_gdec(create_request([10] * (gdec_lens[i][j] - 1), offs + npref + j, output_token_ids=[10]))
+            for j in range(ngdec):
+                batch.add_gdec(create_request([10] * (gdec_lens[i][j] - 1), offs + npref + j, output_token_ids=[10]))
 
-        for j in range(ncdec):
-            batch.add_cdec(create_request([10] * (cdec_lens[i][j] - 1), offs + npref + ngdec + j, output_token_ids=[10]))
+            for j in range(ncdec):
+                batch.add_cdec(create_request([10] * (cdec_lens[i][j] - 1), offs + npref + ngdec + j, output_token_ids=[10]))
 
-        offs += npref + ngdec + ncdec
+            offs += npref + ngdec + ncdec
 
-        if ncdec > 0:
-            self._cpu_fake_prefill(batch.cdec_reqs)
-        if ngdec > 0:
-            self._gpu_fake_prefill(batch.gdec_reqs)
+            if ncdec > 0:
+                self._cpu_fake_prefill(batch.cdec_reqs)
+            if ngdec > 0:
+                self._gpu_fake_prefill(batch.gdec_reqs)
 
-        batches.append(batch)
+            batches.append(batch)
+            all_pref_ids.extend(Request.get_ids(batch.gprf_reqs + batch.cprf_reqs))
+            all_deco_ids.extend(Request.get_ids(batch.gdec_reqs + batch.cdec_reqs))
           
 
+        print("Running test case...")
         for i in range(-nwarmup, nrepeat):
             if i == 0:
                 start = time.perf_counter()
@@ -213,7 +221,7 @@ class ModelProfiler:
         print(f"Profiling linear part with S_list={S_list} ...")
 
         T_list = []
-        for S in tqdm(S_list):
+        for S in tqdm(reversed(S_list)):
             if S in table["S_list"]:
                 T_list.append(table["T_list"][table["S_list"].index(S)])
                 continue
@@ -223,6 +231,7 @@ class ModelProfiler:
                 cdec_lens=[]
             )
             T_list.append(ModelPerfResult.mean(res, "avg_linr_time"))
+        T_list = list(reversed(T_list))
 
         plt.figure(figsize=(16, 12))
         plt.plot(S_list, T_list)
@@ -260,17 +269,12 @@ class ModelProfiler:
 
         T_list = []
         for S in tqdm(S_list):
-            res1 = self._run_test_case_seq(
+            res = self._run_test_case_seq(
                 pref_lens=[S],
                 gdec_lens=[],
                 cdec_lens=[]
             )
-            res2 = self._run_test_case_seq(
-                pref_lens=[S] * 2,
-                gdec_lens=[],
-                cdec_lens=[]
-            )
-            T_list.append(ModelPerfResult.mean(res2, "avg_pref_time") - ModelPerfResult.mean(res1, "avg_pref_time"))
+            T_list.append(ModelPerfResult.mean(res, "avg_pref_time"))
 
         plt.figure(figsize=(16, 12))
         plt.plot(S_list, T_list)

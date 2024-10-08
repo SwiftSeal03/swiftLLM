@@ -140,6 +140,7 @@ class Engine:
             start = time.perf_counter()
 
             batches, cur_swap_out, cur_swap_in = self.scheduler.get_next_batch()
+            # print(f"Got {len(batches)} batches, {len(cur_swap_out)} swap out, {len(cur_swap_in)} swap in")
             assert all(batches), "Batch shouldn't be empty"
             assert not (cur_swap_out and cur_swap_in), "Swap out and swap in should be mutually exclusive"
             assert len(batches) <= 2, "The number of batches should be at most 2"
@@ -187,7 +188,7 @@ class Engine:
                 f"swap: {swp_finish-scheduler_end:.3f}s, forward: {iter_end-swp_finish:.3f}s"
             )
             self.itr_end_times.append(iter_end)
-            self.ntoken_of_itr.append(sum([b.metadata.x for b in batches]))
+            self.ntoken_of_itr.append(sum(b.metadata.x for b in batches))
     
     async def start_all_event_loops(self):
         """

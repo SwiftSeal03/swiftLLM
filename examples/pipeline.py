@@ -43,8 +43,8 @@ if __name__ == '__main__':
 
         block_size = 16,
         gpu_mem_utilization = 0.995,
-        num_cpu_blocks = 4000,
         num_gpu_blocks = 1700,
+        num_cpu_blocks = 4000,
         max_seqs_in_block_table = 1024,
         max_blocks_per_seq = 512,
 
@@ -56,7 +56,7 @@ if __name__ == '__main__':
         library_path=library_path,
         profile_result_path=profile_result_path,
 
-        monitor_performance=False,
+        extra_layer_for_cprf=True
     )
 
     start_time = time.perf_counter()

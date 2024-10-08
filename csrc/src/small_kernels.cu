@@ -200,7 +200,9 @@ __global__ void prefill_store_kvcache_Kernel(
 	const int32_t* __restrict__ seq_ids,
 	const int32_t* __restrict__ seq_start_locs,
 	const int32_t* __restrict__ seq_lens,
-	const int64_t cur_layer,
+	const int64_t itm_layer,
+	const int64_t gpu_layer,
+	const int64_t num_cprfs,
 	const int64_t block_size,
 	const int64_t block_table_width,
 	const int64_t num_blocks,
@@ -213,6 +215,7 @@ __global__ void prefill_store_kvcache_Kernel(
 		return;
 	}
 
+	const int64_t cur_layer = batch_pos < num_cprfs ? itm_layer : gpu_layer;
 	const int32_t seq_id = seq_ids[batch_pos];
 	const int32_t seq_start_loc = seq_start_locs[batch_pos];
 	const int32_t block_idx = block_table[seq_id * block_table_width + block_pos];
@@ -221,7 +224,7 @@ __global__ void prefill_store_kvcache_Kernel(
 	for (int i = 0; i < max_i; i++) {
 		int64_t src_off = 
 			(seq_start_loc + block_pos * block_size + i) * NUM_KV_HEADS * head_dim + threadIdx.x;
-		int64_t dst_off = 
+		int64_t dst_off =
 			((cur_layer * num_blocks + block_idx) * NUM_KV_HEADS * block_size + i) * head_dim + threadIdx.x;
 		#pragma unroll
 		for (int j = 0; j < NUM_KV_HEADS; j++) {
@@ -237,7 +240,8 @@ __global__ void prefill_store_kvcache_Kernel(
 	prefill_store_kvcache_Kernel<kvh><<<grid, block_dim_x>>>( \
 		k_p, v_p, k_cache_p, v_cache_p, \
 		block_table_p, seq_ids_p, seq_start_locs_p, seq_lens_p, \
-		cur_layer, block_size, block_table_width, num_blocks, head_dim \
+		itm_layer, gpu_layer, num_cprfs, \
+		block_size, block_table_width, num_blocks, head_dim \
 	);
 
 void store_kvcache(
@@ -245,12 +249,14 @@ void store_kvcache(
   torch::Tensor v,
   torch::Tensor k_cache,
   torch::Tensor v_cache,
-  torch::Tensor block_table,
+	torch::Tensor block_table,
   torch::Tensor seq_ids,
   torch::Tensor seq_start_locs,
   torch::Tensor seq_lens,
-  const int64_t cur_layer,
-  const int64_t max_prefill_len
+	const int64_t itm_layer,
+  const int64_t gpu_layer,
+	const int64_t num_cprfs,
+  const int64_t max_pref_len
 ) {
 	const int64_t num_blocks = k_cache.size(1);
 	const int64_t num_kv_heads = k_cache.size(2);
@@ -259,7 +265,7 @@ void store_kvcache(
 	const int64_t block_table_width = block_table.size(1);
 	const int64_t num_seqs = seq_ids.size(0);
 
-	const dim3 grid(num_seqs, (max_prefill_len - 1) / block_size + 1);
+	const dim3 grid(num_seqs, (max_pref_len - 1) / block_size + 1);
 	const int64_t block_dim_x = head_dim;
 
 	half* k_p = (half*)k.data_ptr();

@@ -33,9 +33,9 @@ class EngineConfig:
     profile_result_path: str = None
 
     # Switches
-    ignore_kvcache: bool = False      # Should be turned off when profiling blocks
-    monitor_performance: bool = False # Can be altered while running
-    always_use_gpu: bool = False      # Can be altered while running
+    extra_layer_for_cprf: bool = False # Fixed after initialization
+    monitor_performance: bool = False  # Can be altered while running
+    always_use_gpu: bool = False       # Can be altered while running
 
     @property
     def max_seq_len(self) -> int:

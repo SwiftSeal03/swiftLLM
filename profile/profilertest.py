@@ -18,14 +18,14 @@ def init_model():
         
         block_size = 16,
         gpu_mem_utilization = 0.995,
-        num_gpu_blocks = 1700,
+        num_gpu_blocks = 1500,
         num_cpu_blocks = 15000,
         max_seqs_in_block_table = 2048,
         max_blocks_per_seq = 1024,
 
         # The following are not used in the offline example
         max_batch_size = 512,
-        max_prefill_tokens = 10000,
+        max_prefill_tokens = 20000,
         max_tokens_in_batch = 20000,
 
         library_path="/home/ubuntu/pacpu/build/libpacpu.so",
@@ -64,6 +64,7 @@ def run_test_case(
         for l in cdec_lens[i]:
             batchmds[i].add_cdec(l)
 
+    print("Start real test...")
     real_res = ModelPerfResult.mean_all(profiler._run_test_case(
         pref_lens, gdec_lens, cdec_lens
     ))
@@ -94,7 +95,7 @@ if __name__ == "__main__":
     #   ]
     # )
     run_test_case(
-        pref_lens=[[128]],
-        gdec_lens=[[128] * 10],
-        cdec_lens=[[128] * 10]
+        pref_lens=[[1342], []],
+        gdec_lens=[[7585, 11688, 3337], []],
+        cdec_lens=[[], [4851, 6284, 4805, 3885, 6708, 6425, 11418, 4065, 8531]]
     )

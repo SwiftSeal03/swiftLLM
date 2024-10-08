@@ -8,18 +8,29 @@ import logging
 import json
 import time
 from transformers import AutoTokenizer
+import numpy as np
 
 import swiftllm
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(filename="e2e.log", level=logging.INFO)
 
-async def send_request_and_wait_non_streaming_mode(engine: swiftllm.Engine, tokenizer: AutoTokenizer, prompt: str, output_len: int):
+data_prefix = "../data/d1008"
+engine = None
+tokenizer = None
+
+
+last_output_token_ids = None
+async def send_request_and_wait_non_streaming_mode(prompt: str, output_len: int):
     raw_request = swiftllm.RawRequest(prompt, output_len)
     start = time.perf_counter()
     (_, output_token_ids) = await engine.add_request_and_wait(raw_request)
     end = time.perf_counter()
-    print(f"Output: {tokenizer.decode(output_token_ids)}")
+    # print(f"Output: {tokenizer.decode(output_token_ids)}")
+    # global last_output_token_ids
+    # if last_output_token_ids and last_output_token_ids != output_token_ids:
+    #     raise ValueError("Output token ids mismatch")
+    # last_output_token_ids = output_token_ids
     return start, end
 
 async def run_latency_test(
@@ -28,44 +39,37 @@ async def run_latency_test(
     output_len: int,
     req_rate: float,
     gpu_only: bool,
-    engine: swiftllm.Engine,
-    tokenizer: AutoTokenizer
 ):
     promptlen = len(tokenizer.encode(prompt))
-    logger.info(f"Latency test: input_len={promptlen}, output_len={output_len}, nrequests={nrequests}, req_rate={req_rate}, gpu_only={gpu_only}")
+    logger.info("Latency test: input_len=%d, output_len=%d, nrequests=%d, req_rate=%.2f, gpu_only=%s", promptlen, output_len, nrequests, req_rate, gpu_only)
     engine.engine_config.always_use_gpu = gpu_only
     tasks = []
     for i in range(nrequests):
-        task = asyncio.create_task(send_request_and_wait_non_streaming_mode(engine, tokenizer, prompt, output_len))
+        task = asyncio.create_task(send_request_and_wait_non_streaming_mode(prompt, output_len))
         tasks.append(task)
         await asyncio.sleep(1/req_rate)
     times = await asyncio.gather(*tasks)
     times = [end - start for start, end in times]
     average_completion_time = sum(times) / len(times)
-    logger.info(f"Average completion time: {average_completion_time:.3f}s")
+    logger.info("Average completion time: %.3f s", average_completion_time)
 
 async def run_throughput_test(
-    nrequests: int,
-    prompt: str,
-    output_len: int,
+    prompts: list[str],
+    output_lens: list[int],
     gpu_only: bool,
-    engine: swiftllm.Engine,
-    tokenizer: AutoTokenizer
+    data_file: str
 ):
-    promptlen = len(tokenizer.encode(prompt))
-    data_file = f"../data/d1006/{nrequests}-{promptlen}-{output_len}-{gpu_only}.json"
-    
-    logger.info(f"Throughput test: input_len={promptlen}, output_len={output_len}, nrequests={nrequests}, gpu_only={gpu_only}")
     engine.engine_config.always_use_gpu = gpu_only
+    
     tasks = []
     start = time.perf_counter()
+    n = len(prompts)
     engine.itr_end_times = []
     engine.ntoken_of_itr = []
-    for i in range(nrequests):
-        task = asyncio.create_task(send_request_and_wait_non_streaming_mode(engine, tokenizer, prompt, output_len))
+    for i, prompt, output_len in zip(range(n), prompts, output_lens):
+        task = asyncio.create_task(send_request_and_wait_non_streaming_mode(prompt, output_len))
         tasks.append(task)
     req_times = await asyncio.gather(*tasks)
-    end = time.perf_counter()
     req_end_times = sorted([end for _, end in req_times])
     itr_end_times = [time - start for time in engine.itr_end_times]
     with open(data_file, "w") as f:
@@ -76,20 +80,35 @@ async def run_throughput_test(
             "ntoken_of_itr": engine.ntoken_of_itr
         }, f, indent=4)
     # Omit first 10% and last 30% of requests to leave out warm-up and cool-down periods
-    req_end_times = req_end_times[nrequests//10: -nrequests//10*3]
+    req_end_times = req_end_times[n // 10: - n // 10 * 3]
     throughput = (len(req_end_times) - 1) / (req_end_times[-1] - req_end_times[0])
+    logger.info("Throughput: %.3f req/s", throughput)
 
-    logger.info(f"Throughput: {throughput:.3f} reqs/s")
-
-
-async def warm_up(
+async def run_mock_throughput_test(
+    nrequests: int,
     prompt: str,
-    engine: swiftllm.Engine, 
-    tokenizer: AutoTokenizer
+    output_len: int,
+    gpu_only: bool
 ):
-    logger.info("Warming up...")
-    await run_throughput_test(10, prompt, 200, False, engine, tokenizer)
-    logger.info("Warm up complete")
+    promptlen = len(tokenizer.encode(prompt))
+    data_file = f"{data_prefix}/{nrequests}-{promptlen}-{output_len}-{gpu_only}.json"
+    logger.info("Mock throughput test: input_len=%d, output_len=%d, nrequests=%d, gpu_only=%s", promptlen, output_len, nrequests, gpu_only)
+    await run_throughput_test([prompt] * nrequests, [output_len] * nrequests, gpu_only, data_file)
+
+async def run_real_throughput_test(
+    dataset_name: str,
+    input_str_file: str,
+    output_len_file: str,
+    gpu_only: bool
+):
+    with open(input_str_file, "r") as f:
+        prompts = f.readlines()
+    output_lens = np.load(output_len_file).tolist()
+
+    assert len(prompts) == len(output_lens), "Length mismatch between input_str_file and output_len_file"
+    data_file = f"{data_prefix}/{dataset_name}-{gpu_only}.json"
+    logger.info("Real throughput test: dataset_name=%s, gpu_only=%s", dataset_name, gpu_only)
+    await run_throughput_test(prompts, output_lens, gpu_only, data_file)
 
 
 async def main():
@@ -118,21 +137,23 @@ async def main():
         
         block_size = 16,
         gpu_mem_utilization = 0.995,
-        num_gpu_blocks = 1700,
+        num_gpu_blocks = 1500,
         num_cpu_blocks = 15000,
         max_seqs_in_block_table = 2048,
-        max_blocks_per_seq = 1024,
+        max_blocks_per_seq = 2048,
 
         max_batch_size = 512,
-        max_prefill_tokens = 10000,
+        max_prefill_tokens = 20000,
         max_tokens_in_batch = 20000,
 
         library_path="/home/ubuntu/pacpu/build/libpacpu.so",
         profile_result_path="/home/ubuntu/swiftLLM/profile_results/",
 
         # always_use_gpu=True
+        extra_layer_for_cprf=True
     )
 
+    global engine, tokenizer
     engine = swiftllm.Engine(engine_config)
     tokenizer = AutoTokenizer.from_pretrained(model_path)
 
@@ -145,13 +166,22 @@ async def main():
     
     print([len(tokenizer.encode(prompt)) for prompt in prompts])
 
-    await warm_up(prompts[9], engine, tokenizer)
+    logger.info("Warming up...")
+    await run_mock_throughput_test(300, prompts[9], 200, False)
 
-    for prompt in prompts:
-        if len(tokenizer.encode(prompt)) == 521:
-            for outlen in range(100, 1000, 200):
-                await run_throughput_test(1200, prompt, outlen, False, engine, tokenizer)
-                await run_throughput_test(1200, prompt, outlen, True, engine, tokenizer)
+    for gpu_only in [False, True]:
+        await run_real_throughput_test(
+            "arxiv-summarization-test", 
+            "/home/ubuntu/arxiv-dataset/test_input_prompts.txt", 
+            "/home/ubuntu/arxiv-dataset/test_output_tokens.npy", 
+            gpu_only
+        )
+
+    # for prompt in prompts:
+    #     if len(tokenizer.encode(prompt)) == 521:
+    #         for outlen in range(100, 1000, 200):
+    #             await run_mock_throughput_test(2000, prompt, outlen, False)
+    #             await run_mock_throughput_test(2000, prompt, outlen, True)
     # for prompt in prompts:
     #     if len(tokenizer.encode(prompt)) == 99:
     #         for rate in [0.8 + i * 0.2 for i in range(6)]:

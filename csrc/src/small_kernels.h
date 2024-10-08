@@ -31,6 +31,8 @@ void store_kvcache(
   torch::Tensor seq_ids,
   torch::Tensor seq_start_locs,
   torch::Tensor seq_lens,
-  const int64_t cur_layer,
-  const int64_t max_prefill_len
+  const int64_t itm_layer,
+  const int64_t gpu_layer,
+  const int64_t num_cprfs,
+  const int64_t max_pref_len
 );

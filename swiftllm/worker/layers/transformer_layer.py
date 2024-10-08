@@ -147,6 +147,18 @@ class LlamaTransformerLayer:
         self.input_embedss = input_embedss
         self.residual_bufs = residual_bufs
 
+    def _comm_wait_compute(self):
+        """
+        Do communication after necessary computation
+        """
+        self.cpu_communication_stream.wait_stream(torch.cuda.default_stream())
+
+    def _compute_wait_comm(self):
+        """
+        Do computation after necessary communication
+        """
+        torch.cuda.default_stream().wait_stream(self.cpu_communication_stream)
+
     def _transfer_qkv(
         self,
         q: torch.Tensor,
@@ -161,8 +173,6 @@ class LlamaTransformerLayer:
         batch = self.batches[batch_id]
         if batch.num_cdecs > 0:
             with torch.cuda.stream(self.cpu_communication_stream):
-                # Wait until QKV is ready
-                torch.cuda.current_stream().wait_stream(torch.cuda.default_stream())
                 qc = self.swapper.q_cpu[:batch.num_cdecs]
                 kc = self.swapper.k_cpu[:batch.num_cdecs]
                 vc = self.swapper.v_cpu[:batch.num_cdecs]
@@ -181,10 +191,8 @@ class LlamaTransformerLayer:
         batch = self.batches[batch_id]
         if batch.num_cprfs > 0:
             with torch.cuda.stream(self.cpu_communication_stream):
-                # If there are no decoding sequences, we need to wait for the last stage to finish; otherwise, we already waited
-                if not batch.cdec_reqs:
-                    torch.cuda.current_stream().wait_stream(torch.cuda.default_stream())
-                self.swapper.swap_out_blocks(self.layer_id, batch.src_blk_ids, batch.dst_blk_ids)
+                itm_layer = self.model_config.num_layers if self.engine_config.extra_layer_for_cprf else self.layer_id
+                self.swapper.swap_out_blocks(itm_layer, self.layer_id, batch.src_blk_ids, batch.dst_blk_ids)
 
     def _preproj(
         self,
@@ -223,15 +231,20 @@ class LlamaTransformerLayer:
 
         # Here we only store k, v for prefilling, the kernel won't store decoding KVs
         if batch.num_prefs > 0 and self.swapper is not None:
+            gpu_layer = (self.layer_id + layer_off) % self.model_config.num_layers
+            itm_layer = self.model_config.num_layers if self.engine_config.extra_layer_for_cprf else gpu_layer
             store_kvcache(
                 k,
                 v,
-                self.swapper.k_cache, self.swapper.v_cache,
+                self.swapper.k_cache, 
+                self.swapper.v_cache,
                 self.swapper.gpu_block_manager.block_table,
                 batch.prgd_seq_ids[:batch.num_prefs],
                 batch.pref_st_locs_we,
                 batch.prgd_seq_lens[:batch.num_prefs],
-                (self.layer_id + layer_off) % self.model_config.num_layers,
+                itm_layer,
+                gpu_layer,
+                batch.num_cprfs,
                 batch.max_pref_toks
             )
 
@@ -327,7 +340,6 @@ class LlamaTransformerLayer:
             events.pf_time("cdec_e")
             with torch.cuda.stream(self.cpu_communication_stream):
                 og.copy_(oc, non_blocking=True)
-            torch.cuda.default_stream().wait_stream(self.cpu_communication_stream)
         else:
             events.pf_time_nocpu()
 
@@ -355,13 +367,16 @@ class LlamaTransformerLayer:
         """
         self.events[0].pf_record("stage_s")
         self.events[0].pf_time("lnch_s")
+        self._compute_wait_comm() # Wait for swaps to finish before overwriting intermediate KV
         q, k, v = self._preproj(first_embeds)
         self.events[0].pf_record("linr_e")
+        self._comm_wait_compute() # Wait for qkv to be computed & stored
         self._transfer_qkv(q, k, v)
-        self._swap_out_blocks()
         self._attention(q, k, v)
         del q, k, v
+        self._compute_wait_comm() # Wait for CPU decoding to finish
         self.events[1].pf_record("stage_s")
+        self._swap_out_blocks()
         ffn_out = self._postproj()
         self.events[0].pf_time("lnch_e")
         self.events[1].pf_record("linr_e")
@@ -387,6 +402,7 @@ class LlamaTransformerLayer:
         """
         self.events[cur_stage].pf_record("stage_s")
         self.events[cur_stage].pf_time("lnch_s")
+        self._comm_wait_compute() # Wait for qkv to be computed & stored
         self._transfer_qkv(q1, k1, v1, batch_id=cur_stage^1, cur_stage=cur_stage)
         self._swap_out_blocks(batch_id=cur_stage)
         f0 = self._postproj(batch_id=cur_stage)
@@ -394,6 +410,7 @@ class LlamaTransformerLayer:
         del f0
         self.events[cur_stage].pf_record("linr_e")
         self._attention(q1, k1, v1, batch_id=cur_stage^1, cur_stage=cur_stage)
+        self._compute_wait_comm() # Wait for CPU decoding & swap of last layer to finish
         self.events[cur_stage].pf_time("lnch_e")
 
         return q0, k0, v0
@@ -427,14 +444,16 @@ class LlamaTransformerLayer:
         batch1 : input_embeds1 |=>                  pre-projection   |=> q1, k1, v1
         """
         q0, k0, v0 = self._preproj(self.input_embedss[0], batch_id=0, layer_off=1)
-        torch.cuda.current_stream().wait_stream(self.cpu_communication_stream) # Wait for swappings to finish
+        self._compute_wait_comm() # Here we must make sure all swaps are done before the first attention
 
         self.events[1].pf_record("stage_s")
         self.events[1].pf_time("lnch_s")
+        self._comm_wait_compute() # Wait for qkv to be computed & stored
         self._transfer_qkv(q0, k0, v0, batch_id=0, cur_stage=1)
         q1, k1, v1 = self._preproj(self.input_embedss[1], batch_id=1, layer_off=1)
         self.events[1].pf_record("linr_e")
         self._attention(q0, k0, v0, batch_id=0, cur_stage=1)
+        self._compute_wait_comm() # Wait for CPU decoding & swap of last layer to finish
         self.events[1].pf_time("lnch_e")
 
         return q1, k1, v1
@@ -453,11 +472,13 @@ class LlamaTransformerLayer:
         """
         self.events[0].pf_record("stage_s")
         self.events[0].pf_time("lnch_s")
+        self._comm_wait_compute()
         self._transfer_qkv(q1, k1, v1, batch_id=1, cur_stage=0)
         self._swap_out_blocks(batch_id=0)
         f0 = self._postproj(batch_id=0)
         self.events[0].pf_record("linr_e")
         self._attention(q1, k1, v1, batch_id=1, cur_stage=0)
+        self._compute_wait_comm()
         self.events[0].pf_time("lnch_e")
 
         f1 = self._postproj(batch_id=1)

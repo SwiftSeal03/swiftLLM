@@ -23,7 +23,8 @@ void swap_blocks(
 	const std::vector<int64_t> &source_block_ids,
 	const std::vector<int64_t> &target_block_ids,
 	const bool is_swap_in,
-	const int cur_layer,
+	const int gpu_layer,
+	const int cpu_layer,
 
 	torch::Tensor k_cache,
 	torch::Tensor v_cache,
@@ -34,10 +35,11 @@ void swap_blocks(
 	size_t gpu_layer_size_in_bytes = getTensorSizeInBytes(k_cache) / k_cache.size(0);
 	size_t cpu_layer_size_in_bytes = getTensorSizeInBytes(k_swap) / k_swap.size(0);
 	size_t block_layer_size_in_bytes = gpu_layer_size_in_bytes / k_cache.size(1); // same for gpu and cpu
-	char* k_cache_ptr = (char*)k_cache.data_ptr() + cur_layer * gpu_layer_size_in_bytes;
-	char* v_cache_ptr = (char*)v_cache.data_ptr() + cur_layer * gpu_layer_size_in_bytes;
-	char* k_swap_ptr = (char*)k_swap.data_ptr() + cur_layer * cpu_layer_size_in_bytes;
-	char* v_swap_ptr = (char*)v_swap.data_ptr() + cur_layer * cpu_layer_size_in_bytes;
+
+	char* k_cache_ptr = (char*)k_cache.data_ptr() + gpu_layer * gpu_layer_size_in_bytes;
+	char* v_cache_ptr = (char*)v_cache.data_ptr() + gpu_layer * gpu_layer_size_in_bytes;
+	char* k_swap_ptr = (char*)k_swap.data_ptr() + cpu_layer * cpu_layer_size_in_bytes;
+	char* v_swap_ptr = (char*)v_swap.data_ptr() + cpu_layer * cpu_layer_size_in_bytes;
 	int num_blocks_to_swap = source_block_ids.size();
 	int next_index = 0;
 	while (next_index < num_blocks_to_swap) {
