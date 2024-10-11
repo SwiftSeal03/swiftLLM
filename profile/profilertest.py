@@ -8,7 +8,7 @@ import json
 from swiftllm.worker.model import LlamaModel, ModelPerfResult
 from swiftllm.worker.profiler import ModelProfiler
 from swiftllm.engine_config import EngineConfig
-from swiftllm.structs import BatchMetaData
+from swiftllm.structs import BatchPerfData
 
 def init_model():
     global model, profiler
@@ -52,7 +52,7 @@ def run_test_case(
     cdec_lens: list[list[int]]
 ):
     nbatches = len(pref_lens)
-    batchmds = [BatchMetaData(profiler.pp) for _ in range(nbatches)]
+    batchmds = [BatchPerfData(profiler.pp) for _ in range(nbatches)]
 
     for i in range(nbatches):
         for l in pref_lens[i]:

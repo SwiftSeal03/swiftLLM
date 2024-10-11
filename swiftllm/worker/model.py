@@ -336,8 +336,8 @@ class LlamaModel:
         # input_embds would serve as a buffer for all attention outputs
         input_embedss = self.pre_layer.forward(sum([b.input_token_ids for b in batches], []))
         residual_bufs = torch.zeros_like(input_embedss)
-        s0 = batches[0].metadata.s
-        s1 = batches[1].metadata.s
+        s0 = batches[0].iter_width
+        s1 = batches[1].iter_width
         input_embedss = torch.split(input_embedss, [s0, s1], dim=0)
         residual_bufs = torch.split(residual_bufs, [s0, s1], dim=0)
 
@@ -370,7 +370,7 @@ class LlamaModel:
 
         self.events.pf_record("frwd_e")
 
-        x0 = batches[0].metadata.x
+        x0 = batches[0].batch_size
         batches[0].update_output(output_tokens[:x0])
         batches[1].update_output(output_tokens[x0:])
 

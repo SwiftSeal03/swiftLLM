@@ -89,7 +89,7 @@ def create_request(
     ret.request_id = req_id
     return ret
 
-class BatchMetaData:
+class BatchPerfData:
     def __init__(self, predictor: PerfPredictor):
         self.x = 0
         self.s = 0
@@ -152,35 +152,35 @@ class SubBatch:
         self.cprf_reqs = []
         self.gdec_reqs = []
         self.cdec_reqs = []
-        self.metadata = BatchMetaData(predictor)  
+        self.perfdata = BatchPerfData(predictor)  
     
     def __len__(self):
-        return self.metadata.x
+        return self.perfdata.x
 
     def add_pref(self, req: Request, is_gpu: bool):
         if is_gpu:
             self.gprf_reqs.append(req)
         else:
             self.cprf_reqs.append(req)
-        self.metadata.add_pref(req.prompt_len)
+        self.perfdata.add_pref(req.prompt_len)
 
     def pop_pref(self) -> Request:
         is_gpu = not self.cprf_reqs
         req = self.gprf_reqs.pop() if is_gpu else self.cprf_reqs.pop()
-        self.metadata.pop_pref(req.prompt_len)
+        self.perfdata.pop_pref(req.prompt_len)
         return req, is_gpu
         
     def add_gdec(self, req: Request):
         self.gdec_reqs.append(req)
-        self.metadata.add_gdec(req.seq_len)
+        self.perfdata.add_gdec(req.seq_len)
 
     def add_cdec(self, req: Request):
         self.cdec_reqs.append(req)
-        self.metadata.add_cdec(req.seq_len)
+        self.perfdata.add_cdec(req.seq_len)
 
     def pop_cdec(self):
         req = self.cdec_reqs.pop()
-        self.metadata.pop_cdec(req.seq_len)
+        self.perfdata.pop_cdec(req.seq_len)
 
     def get_num_prefs(self) -> int:
         return len(self.gprf_reqs) + len(self.cprf_reqs)
@@ -192,8 +192,8 @@ class SubBatch:
         The comments indicate each attribute's usage in the model forward pass
         """
         # pylint: disable=attribute-defined-outside-init
-        self.batch_size = self.metadata.x # post-layer
-        self.iter_width = self.metadata.s # post-layer
+        self.batch_size = self.perfdata.x # post-layer
+        self.iter_width = self.perfdata.s # post-layer
 
         self.num_cprfs = len(self.cprf_reqs)
         self.num_gprfs = len(self.gprf_reqs)

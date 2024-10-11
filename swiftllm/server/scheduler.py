@@ -125,10 +125,10 @@ class Scheduler:
     def _get_remains(self, batches: list[SubBatch]) -> float:
         assert len(batches) == 2
         return [
-            batches[j^1].metadata.linr_T + 
-            batches[j].metadata.pref_T + 
-            batches[j].metadata.gdec_T - 
-            batches[j].metadata.cpu_time 
+            batches[j^1].perfdata.linr_T + 
+            batches[j].perfdata.pref_T + 
+            batches[j].perfdata.gdec_T - 
+            batches[j].perfdata.cpu_time 
             for j in range(2)
         ]
 
@@ -170,7 +170,7 @@ class Scheduler:
         # Step 2: adjust the number of prefilled sequences in gpu_only_batch
         while gpu_only_batch.get_num_prefs():
             req, is_gpu = gpu_only_batch.pop_pref()
-            if gpu_only_batch.metadata.s < self.predictor.linr_S_threshold:
+            if gpu_only_batch.perfdata.s < self.predictor.linr_S_threshold:
                 gpu_only_batch.add_pref(req, is_gpu)
                 break
 
@@ -200,14 +200,14 @@ class Scheduler:
         # Step 4: reduce the number of prefilled sequences in the first batch if CPU is idle for too long
         while batches[0].get_num_prefs():
             req, is_gpu = batches[0].pop_pref()
-            if batches[0].metadata.s < self.predictor.linr_S_threshold or min(self._get_remains(batches)) < 0:
+            if batches[0].perfdata.s < self.predictor.linr_S_threshold or min(self._get_remains(batches)) < 0:
                 batches[0].add_pref(req, is_gpu)
                 break
 
         # Step 5: check if pipelined mode is better
         
-        seqential_time = gpu_only_batch.metadata.gpu_time * self.model_config.num_layers
-        pipelined_time = (batches[0].metadata.gpu_time + batches[1].metadata.gpu_time) * self.model_config.num_layers
+        seqential_time = gpu_only_batch.perfdata.gpu_time * self.model_config.num_layers
+        pipelined_time = (batches[0].perfdata.gpu_time + batches[1].perfdata.gpu_time) * self.model_config.num_layers
         seqential_rate = len(gpu_only_batch) / seqential_time
         pipelined_rate = sum(len(batches[i]) for i in range(2)) / pipelined_time
         print(f"Sequential time: {seqential_time}, Pipelined time: {pipelined_time}")

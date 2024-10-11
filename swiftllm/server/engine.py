@@ -76,6 +76,7 @@ class Engine:
         self.scheduler = Scheduler(self.model, self.profiler.pp)
 
         print("[Engine] Initializing tokenization engine...")
+        # pylint: disable=no-member
         self.tokenization_engine = TokenizationEngine.remote(self.engine_config)
 
         print("[Engine] Model initialized")
@@ -188,7 +189,7 @@ class Engine:
                 f"swap: {swp_finish-scheduler_end:.3f}s, forward: {iter_end-swp_finish:.3f}s"
             )
             self.itr_end_times.append(iter_end)
-            self.ntoken_of_itr.append(sum(b.metadata.x for b in batches))
+            self.ntoken_of_itr.append(sum(b.perfdata.x for b in batches))
     
     async def start_all_event_loops(self):
         """
