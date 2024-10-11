@@ -214,10 +214,7 @@ class SubBatch:
         self.max_pref_toks = max(self.seq_lens_list[:self.num_prefs], default=0) # store-pref-KV, pref
 
         self.prgd_seq_ids = torch.tensor(self.seq_ids_list[:self.num_prgds], dtype=torch.int32, device='cuda')
-        self.cdec_seq_ids = torch.tensor(self.seq_ids_list[self.num_prgds:], dtype=torch.int32, device='cpu')
-        
         self.prgd_seq_lens = torch.tensor(self.seq_lens_list[:self.num_prgds], dtype=torch.int32, device='cuda')
-        self.cdec_seq_lens = torch.tensor(self.seq_lens_list[self.num_prgds:], dtype=torch.int32, device='cpu')
         self.pref_st_locs_we = torch.tensor(
             [0] + list(itertools.accumulate(self.seq_lens_list[:self.num_prefs])), 
             dtype=torch.int32, device='cuda'

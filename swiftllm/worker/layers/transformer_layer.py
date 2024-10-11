@@ -341,8 +341,8 @@ class LlamaTransformerLayer:
             torch.ops.pacpu.paged_attention_cpu(
                 cur_layer_id,
                 batch.softmax_scale,
-                batch.cdec_seq_ids_list,
-                batch.cdec_seq_lens_list,
+                batch.seq_ids_list[batch.num_prgds:],
+                batch.seq_lens_list[batch.num_prgds:],
 
                 self.swapper.q_cpu[:batch.num_cdecs],
                 self.swapper.k_cpu[:batch.num_cdecs],

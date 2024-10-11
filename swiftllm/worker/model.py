@@ -13,7 +13,7 @@ from swiftllm.engine_config import EngineConfig
 from swiftllm.model_config import LlamaModelConfig
 from swiftllm.worker.weight import load_weights
 from swiftllm.worker.block_manager import Swapper
-from swiftllm.structs import SubBatch
+from swiftllm.structs import Request, SubBatch
 
 from .layers.pre_layer import LlamaPreLayer
 from .layers.transformer_layer import LlamaTransformerLayer
@@ -248,15 +248,15 @@ class LlamaModel:
         batch.num_seq_blocks = (max_gdec_toks + seq_block_size - 1) // seq_block_size
 
         if self.swapper is not None:
-            self.swapper.gpu_block_manager.allocate_blocks_for_seqs(
-                batch.prgd_seq_ids, batch.prgd_seq_lens, batch.num_cprfs if self.engine_config.extra_layer_for_cprf else 0
+            self.swapper.gpu_block_manager.alloc(
+                batch.all_reqs[:batch.num_prgds], batch.num_cprfs * self.engine_config.extra_layer_for_cprf
             )
-            self.swapper.cpu_block_manager.allocate_blocks_for_seqs(
-                batch.cdec_seq_ids, batch.cdec_seq_lens
+            self.swapper.cpu_block_manager.alloc(
+                batch.all_reqs[batch.num_prgds:]
             )
         else:
             # This is profiling number of GPU blocks, only gprf could exist
-            assert not batch.cprf_reqs and not batch.gdec_reqs and not batch.cdec_reqs
+            assert batch.batch_size == batch.num_gprfs
 
     def _prepare_swaps(
         self,
@@ -265,7 +265,7 @@ class LlamaModel:
         if batch.cprf_reqs:
             assert self.swapper is not None
             batch.src_blk_ids, batch.dst_blk_ids = self.swapper.initiate_swap_out(
-                batch.seq_ids_list[:batch.num_cprfs],
+                batch.cprf_reqs,
                 use_itm = self.engine_config.extra_layer_for_cprf
             )
 
@@ -378,46 +378,38 @@ class LlamaModel:
             self.perf_results.append(ModelPerfResult(self.transformer_layers, self.events, True))
         
     @torch.inference_mode()
-    def swap_in_seqs(
-        self,
-        seq_ids_list: list[int]
-    ):
+    def swap_in_seqs(self, reqs: list[Request]):
         """
         Swap in (move blocks from CPU to GPU) the specified sequences.
         """
-        if not seq_ids_list:
+        if not reqs:
             return
-        src_block_ids, dst_block_ids = self.swapper.initiate_swap_in(seq_ids_list)
+        src_blk_ids, dst_blk_ids = self.swapper.initiate_swap_in(reqs)
         with torch.cuda.stream(self.cpu_communication_stream):
             for layer_id in range(len(self.transformer_layers)):
-                self.swapper.swap_in_blocks(layer_id, src_block_ids, dst_block_ids)
+                self.swapper.swap_in_blocks(layer_id, src_blk_ids, dst_blk_ids)
     
     @torch.inference_mode()
-    def swap_out_seqs(
-        self,
-        seq_ids_list: list[int]
-    ):
+    def swap_out_seqs(self, reqs: list[Request]):
         """
         Swap out (move blocks from GPU to CPU) the specified sequences.
         """
-        if not seq_ids_list:
+        if not reqs:
             return
-        src_block_ids, dst_block_ids = self.swapper.initiate_swap_out(seq_ids_list)
+        src_blk_ids, dst_blk_ids = self.swapper.initiate_swap_out(reqs)
         with torch.cuda.stream(self.cpu_communication_stream):
             for layer_id in range(len(self.transformer_layers)):
-                self.swapper.swap_out_blocks(layer_id, layer_id, src_block_ids, dst_block_ids)
+                self.swapper.swap_out_blocks(layer_id, layer_id, src_blk_ids, dst_blk_ids)
 
     @torch.inference_mode()
-    def free_seqs_resources(self, seq_ids_list: list[int]):
+    def free_seqs_resources(self, reqs: list[Request]):
         """
         Free the resources of the specified sequences.
         """
-        if not seq_ids_list:
+        if not reqs:
             return
-        gpu_seq_ids = torch.tensor(seq_ids_list, dtype=torch.int32, device="cuda")
-        cpu_seq_ids = gpu_seq_ids.to("cpu")
-        self.swapper.gpu_block_manager.free_blocks_for_seqs(gpu_seq_ids)
-        self.swapper.cpu_block_manager.free_blocks_for_seqs(cpu_seq_ids)
+        self.swapper.gpu_block_manager.free(reqs)
+        self.swapper.cpu_block_manager.free(reqs)
 
     def turn_on_perf_monitor(self):
         """

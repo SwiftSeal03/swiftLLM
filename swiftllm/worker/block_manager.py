@@ -8,11 +8,7 @@ import torch
 import swiftllm_c
 from swiftllm.engine_config import EngineConfig
 from swiftllm.model_config import LlamaModelConfig
-
-from .kernels.block_mgmt import \
-    set_block_table_and_num_seq_alloc_blocks, \
-    unset_block_table_and_num_seq_alloc_blocks, \
-    gather_allocated_blocks_and_unset
+from swiftllm.structs import Request
 
 class BlockManager:
     """
@@ -22,13 +18,13 @@ class BlockManager:
     ID (which we call `block_table`), and provides methods to allocate and free
     blocks.
 
-    All tables (the block table, the `num_seq_allocated_blocks`, and the free block
+    All tables (the block table, the `seq_num_blks`, and the free block
     list) are all maintained on the GPU, so that we can leverage custom Triton
     kernels for fast operations.
 
     We may split KV cache along layer dimension, so there may be multi sets of free blocks.
     However, the sequences share same namespace of sequence IDs, so we only need one set of
-    block table and `num_seq_allocated_blocks`.
+    block table and `seq_num_blks`.
     """
 
     def __init__(
@@ -41,15 +37,15 @@ class BlockManager:
         nsplits: int=1
     ):
         self.device_name = device_name
-        self.num_free_blocks = [num_blocks] * nsplits
         self.num_blocks = num_blocks
         self.block_size = block_size
+        self.block_table_width = max_blocks_per_seq
 
         # seq_id |-> number of blocks allocated for this sequence
-        self.num_seq_allocated_blocks = torch.zeros(
+        self.seq_num_blks = torch.zeros(
             (max_seqs_in_block_table,),
             dtype=torch.int32,
-            device=device_name
+            device='cpu'
         )
         # (seq_id, block_index) |-> block_id
         self.block_table = torch.empty(
@@ -58,36 +54,33 @@ class BlockManager:
             device=device_name
         )
         # block_id |-> whether this block is free or not
+        self.num_free_blocks = [num_blocks] * nsplits
         self.is_block_free = [torch.ones(
             (num_blocks,),
             dtype=torch.bool,
-            device=device_name
+            device='cpu'
         ) for _ in range(nsplits)]
     
-    def _allocate_blocks(self, num_blocks: int, split_id: int=0) -> torch.Tensor:
+    def _get_new_blk_ids(self, num_blocks: int, split_id: int=0) -> torch.Tensor:
         """
-        Allocate the requested number of blocks, update relevant status, and
-        return the block IDs.
+        Check the free block table and return the block IDs of the newly allocated blocks
         """
+        if num_blocks == 0:
+            return torch.empty(0, dtype=torch.int32)
+
         is_block_free = self.is_block_free[split_id]
         if num_blocks > self.num_free_blocks[split_id]:
             raise RuntimeError(
-                f"No enough free blocks available on {self.device_name} ({self.num_blocks} in total,"
+                f"No enough free blocks available on {self.device_name} ({self.num_blocks} in total, "
                 f"{self.num_free_blocks[split_id]} free, {num_blocks} requested)"
             )
-        selected_blocks = torch.nonzero(is_block_free)[:num_blocks].view(-1)
+            
+        selected_blocks = torch.nonzero(is_block_free)[:num_blocks].view(-1).to(dtype=torch.int32)
         self.num_free_blocks[split_id] -= num_blocks
         is_block_free[selected_blocks] = False
         return selected_blocks
     
-    def _free_blocks(self, block_ids: torch.Tensor, split_id: int=0):
-        """
-        Free the specified blocks, and update relevant status.
-        """
-        self.num_free_blocks[split_id] += len(block_ids)
-        self.is_block_free[split_id][block_ids] = True
-    
-    def allocate_blocks_for_seqs(self, seq_ids: torch.Tensor, target_lens: torch.Tensor, split_point: int=0) -> torch.Tensor | None:
+    def alloc(self, reqs: list[Request], split_point: int=0) -> list[int]:
         """
         Allocate blocks for sequences, making sure that seq #i has at least 
         ceil(target_lengths[i] / block_size) blocks allocated.
@@ -96,48 +89,47 @@ class BlockManager:
 
         Return new blocks allocated for the sequences. (useful for swapping)
         """
-        if not seq_ids.size(0):
-            return None
+        if not reqs:
+            return []
 
-        target_num_blocks = (target_lens + (self.block_size-1)) // self.block_size
-        assert (self.num_seq_allocated_blocks[seq_ids] <= target_num_blocks).all(), \
+        seq_ids = Request.get_ids(reqs)
+        seq_lens = torch.tensor(Request.get_lens(reqs), dtype=torch.int32)
+        tgt_num_blks = (seq_lens - 1) // self.block_size + 1
+        seq_num_blks = self.seq_num_blks[seq_ids]
+
+        assert all(seq_num_blks <= tgt_num_blks), \
             f"""(On {self.device_name}) Logic error: Some sequences have more blocks already allocated than needed.
-                seq_ids: {seq_ids}, target_lens: {target_lens}, target_num_blocks: {target_num_blocks},
-                self.num_seq_allocated_blocks[seq_ids]: {self.num_seq_allocated_blocks[seq_ids]}"""
-        block_needed = target_num_blocks - self.num_seq_allocated_blocks[seq_ids]
-        new_blocks_0 = self._allocate_blocks(torch.sum(block_needed[split_point:]), 0)
-        if split_point:
-            new_blocks_1 = self._allocate_blocks(torch.sum(block_needed[:split_point]), 1)
-            new_blocks = torch.cat([new_blocks_1, new_blocks_0])
-        else:
-            new_blocks = new_blocks_0
-
-        set_block_table_and_num_seq_alloc_blocks(self.num_seq_allocated_blocks, self.block_table, new_blocks, seq_ids, block_needed)
-        return new_blocks
+                seq_ids: {seq_ids}, target_lens: {seq_lens}, target_num_blocks: {tgt_num_blks},
+                seq_num_blks: {seq_num_blks}"""
         
-    def free_blocks_for_seqs(self, seq_ids: torch.Tensor, split_id: int=0):
-        """
-        Free blocks for sequences.
-        """
-        self.num_free_blocks[split_id] += torch.sum(self.num_seq_allocated_blocks[seq_ids])
-        unset_block_table_and_num_seq_alloc_blocks(self.num_seq_allocated_blocks, self.block_table, seq_ids, self.is_block_free[split_id])
+        new_num_blks = tgt_num_blks - seq_num_blks
+        new_blk_ids0 = self._get_new_blk_ids(torch.sum(new_num_blks[split_point:]), 0)
+        new_blk_ids1 = self._get_new_blk_ids(torch.sum(new_num_blks[:split_point]), 1)
+        new_blk_ids = torch.cat([new_blk_ids1, new_blk_ids0])
 
-    def gather_allocated_blocks_and_free(self, seq_ids: torch.Tensor, split_id: int=0) -> torch.Tensor:
+        seq_num_blks_list = seq_num_blks.tolist()
+        new_num_blks_list = new_num_blks.tolist()
+        blk_poss = [seq_ids[i] * self.block_table_width + j + seq_num_blks_list[i] for i, n in enumerate(new_num_blks_list) for j in range(n)]
+        self.block_table.view(-1)[blk_poss] = new_blk_ids.to(device=self.device_name) # possibly on GPU
+        self.seq_num_blks[seq_ids] += new_num_blks
+        return new_blk_ids.tolist()
+
+    def free(self, reqs: list[Request], split_id: int=0) -> list[int]:
         """
         Gather the block IDs allocated for the specified sequences and mark them as free
 
         Useful fow swapping in/out
         """
-        gathered_block_ids = gather_allocated_blocks_and_unset(self.num_seq_allocated_blocks, self.block_table, seq_ids, self.is_block_free[split_id])
-        self.num_free_blocks[split_id] += len(gathered_block_ids)
-        return gathered_block_ids
-
-    def get_num_allocated_blocks(self, seq_ids: torch.Tensor) -> torch.Tensor:
-        """
-        Get the number of blocks allocated for the specified sequences
-        Useful for swapping
-        """
-        return self.num_seq_allocated_blocks[seq_ids]
+        if not reqs:
+            return []
+        
+        seq_ids = Request.get_ids(reqs)
+        seq_num_blks_list = self.seq_num_blks[seq_ids].tolist()
+        blk_poss = [seq_ids[i] * self.block_table_width + j for i, n in enumerate(seq_num_blks_list) for j in range(n)]
+        blk_ids = self.block_table.view(-1)[blk_poss] # possibly on GPU
+        self.num_free_blocks[split_id] += len(blk_ids)
+        self.is_block_free[split_id][blk_ids] = True
+        return blk_ids.tolist()
 
 class Swapper:
     """
@@ -210,7 +202,7 @@ class Swapper:
 
     def _initiate_swap(
         self,
-        seq_ids_list: list[int],
+        reqs: list[Request],
         is_swap_in: bool,
         use_itm: bool = False # Only true when swapping out from intermediate cache to CPU
     ) -> tuple[list[int], list[int]]:
@@ -218,17 +210,13 @@ class Swapper:
         Do all the set-up work for swapping in/out sequences.
         Returns src and dst block ids.
         """
-        if not seq_ids_list:
+        if not reqs:
             return [], []
         src_block_manager = self.cpu_block_manager if is_swap_in else self.gpu_block_manager
         dst_block_manager = self.gpu_block_manager if is_swap_in else self.cpu_block_manager
-        src_seq_ids = torch.tensor(seq_ids_list, dtype=torch.int32, device=src_block_manager.device_name)
-        dst_seq_ids = src_seq_ids.to(dst_block_manager.device_name)
-        src_seq_lengths = src_block_manager.get_num_allocated_blocks(src_seq_ids) * self.engine_config.block_size
-        dst_seq_lengths = src_seq_lengths.to(dst_block_manager.device_name)
-        src_block_ids = src_block_manager.gather_allocated_blocks_and_free(src_seq_ids, 1 if use_itm else 0)
-        dst_block_ids = dst_block_manager.allocate_blocks_for_seqs(dst_seq_ids, dst_seq_lengths)
-        return src_block_ids.tolist(), dst_block_ids.tolist()
+        src_blk_ids = src_block_manager.free(reqs, 1 if use_itm else 0)
+        dst_blk_ids = dst_block_manager.alloc(reqs)
+        return src_blk_ids, dst_blk_ids
     
     def _swap(
         self,
@@ -250,27 +238,20 @@ class Swapper:
         )
         
     @torch.inference_mode()
-    def initiate_swap_in(
-        self,
-        seq_ids_list: list[int]
-    ):
+    def initiate_swap_in(self, reqs: list[Request]):
         """
         Do all the set-up work for swapping in sequences.
         Returns src and dst block ids.
         """
-        return self._initiate_swap(seq_ids_list, True)
+        return self._initiate_swap(reqs, True)
 
     @torch.inference_mode()
-    def initiate_swap_out(
-        self,
-        seq_ids_list: list[int],
-        use_itm: bool = False
-    ):
+    def initiate_swap_out(self, reqs: list[Request], use_itm: bool = False):
         """
         Do all the set-up work for swapping out sequences.
         Returns src and dst block ids.
         """
-        return self._initiate_swap(seq_ids_list, False, use_itm)
+        return self._initiate_swap(reqs, False, use_itm)
 
     @torch.inference_mode()
     def swap_in_blocks(
