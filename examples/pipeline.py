@@ -3,7 +3,7 @@ Offline example of using the swiftllm model executor directly for inferencing wi
 
 Explicity uses pipeline mode.
 """
-
+import os
 import time
 import argparse
 from transformers import AutoTokenizer
@@ -11,6 +11,7 @@ from transformers import AutoTokenizer
 import swiftllm
 
 if __name__ == '__main__':
+    home = os.path.expanduser("~")
     parser = argparse.ArgumentParser()
     parser.description = """
         An example script to demonstrate how to use the swiftllm model executor directly for inferencing without using the engine
@@ -19,19 +20,19 @@ if __name__ == '__main__':
         "--model-path",
         help="Path to the model. Note: please download the model weights from HuggingFace in advance and specify the path here.",
         type=str,
-        default="/home/ubuntu/weights/Llama-3-8B-Instruct-Gradient-1048k"
+        default=f"{home}/weights/Llama-2-7b-hf"
     )
     parser.add_argument(
         "--library-path",
         help="Path to the shared library",
         type=str,
-        default="/home/ubuntu/pacpu/build/libpacpu.so"
+        default=f"{home}/pacpu/build/libpacpu.so"
     )
     parser.add_argument(
         "--profile-result-path",
         help="Path to folder of profiling results",
         type=str,
-        default="/home/ubuntu/swiftLLM/profile_results/"
+        default=f"{home}/swiftLLM/profile_results/"
     )
     model_path = parser.parse_args().model_path
     library_path = parser.parse_args().library_path
@@ -53,7 +54,7 @@ if __name__ == '__main__':
         max_prefill_tokens = 2048*16,
         max_tokens_in_batch = 2048*16,
 
-        library_path=library_path,
+        library_path=None,
         profile_result_path=profile_result_path,
 
         extra_layer_for_cprf=True
@@ -72,9 +73,9 @@ if __name__ == '__main__':
     print(f"Model creation time: {model_creation_time:.2f} seconds")
 
     ngpu_prompts = 40
-    ncpu_prompts = 40
+    ncpu_prompts = 0
     nprompts = ncpu_prompts + ngpu_prompts
-    with open("/home/ubuntu/swiftLLM/examples/example.txt", "r") as f:
+    with open(f"{home}/swiftLLM/examples/example.txt", "r") as f:
         prompt = ' '.join(f.readlines())
     tokenizer = AutoTokenizer.from_pretrained(model_path)
     outputs = []

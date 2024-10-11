@@ -325,12 +325,10 @@ class LlamaModel:
 
         for batch in batches:
             self._prepare_inputs(batch)
-        print("Prepared inputs")
 
         # Swaps should be initated later to avoid sharing blocks between batches
         for batch in batches:
             self._prepare_swaps(batch)
-        print("Prepared swaps")
 
         self.events.pf_record("frwd_s")
 

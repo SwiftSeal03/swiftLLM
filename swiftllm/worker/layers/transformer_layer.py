@@ -5,6 +5,8 @@ Transformer layer utilities in the Llama model
 import time
 import torch
 import vllm_flash_attn_2_cuda as flash_attn_cuda
+# import vllm_flash_attn
+
 from swiftllm_c import \
     fused_add_rmsnorm_inplace, \
     silu_and_mul_inplace, \
@@ -264,7 +266,7 @@ class LlamaTransformerLayer:
 
         batch = self.batches[batch_id]
         events = self.events[cur_stage]
-        o = self.input_embedss[batch_id]
+        o = self.input_embedss[batch_id].view(-1, self.model_config.num_q_heads, self.model_config.head_dim)
         cur_layer_id = (self.layer_id + cur_stage) % self.model_config.num_layers
 
         if batch.num_prefs > 0:
@@ -272,27 +274,39 @@ class LlamaTransformerLayer:
                 # torch.cuda.current_stream().wait_event(self.events[cur_stage].stage_s)
                 # Here the performance of vLLM's flash attention is better than us,
                 # so use vllm_flash_attn
-            o[:batch.sum_pref_toks, :] = flash_attn_cuda.varlen_fwd(
-                q[:batch.sum_pref_toks, :, :],
-                k[:batch.sum_pref_toks, :, :],
-                v[:batch.sum_pref_toks, :, :],
-                None,
+            flash_attn_cuda.varlen_fwd(
+                q[:batch.sum_pref_toks],
+                k[:batch.sum_pref_toks],
+                v[:batch.sum_pref_toks],
+                o[:batch.sum_pref_toks],
                 batch.pref_st_locs_we,
                 batch.pref_st_locs_we,
                 None,
-                None,
-                None,
+                None,  # block table
+                None,  # alibi slopes
                 batch.max_pref_toks,
                 batch.max_pref_toks,
                 0.0,
                 batch.softmax_scale,
                 False,
-                True,
-                -1, 
-                -1,
-                False,
+                True,  # causal
+                -1,    # window size 0
+                -1,    # window size 1
+                0.0,   # softcap
+                False, # return softmax
                 None
-            )[0].view(-1, self.model_config.hidden_size)
+            )
+            # o[:batch.sum_pref_toks, :] = vllm_flash_attn.flash_attn_varlen_func(
+            #     q[:batch.sum_pref_toks],
+            #     k[:batch.sum_pref_toks],
+            #     v[:batch.sum_pref_toks],
+            #     batch.pref_st_locs_we,
+            #     batch.pref_st_locs_we,
+            #     batch.max_pref_toks,
+            #     batch.max_pref_toks,
+            #     softmax_scale=batch.softmax_scale,
+            #     causal=True
+            # ).reshape(-1, self.model_config.hidden_size)
         events.pf_record("pref_e")
 
         # Actually we can further separate KV-cache storing for prefilling and decoding,
@@ -302,11 +316,12 @@ class LlamaTransformerLayer:
             #     torch.cuda.current_stream().wait_event(self.events[cur_stage].stage_s)
             gpu_token_end = batch.metadata.s - batch.num_cdecs
             paged_attention(
-                q[batch.sum_pref_toks:gpu_token_end, :, :],
-                k[batch.sum_pref_toks:gpu_token_end, :, :],
-                v[batch.sum_pref_toks:gpu_token_end, :, :],
-                o[batch.sum_pref_toks:gpu_token_end, :],
-                self.swapper.k_cache, self.swapper.v_cache,
+                q[batch.sum_pref_toks:gpu_token_end],
+                k[batch.sum_pref_toks:gpu_token_end],
+                v[batch.sum_pref_toks:gpu_token_end],
+                o[batch.sum_pref_toks:gpu_token_end],
+                self.swapper.k_cache, 
+                self.swapper.v_cache,
                 batch.softmax_scale,
                 self.swapper.gpu_block_manager.block_table,
                 batch.prgd_seq_ids[batch.num_prefs:],
