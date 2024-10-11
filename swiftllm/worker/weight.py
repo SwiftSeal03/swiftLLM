@@ -125,7 +125,7 @@ class LlamaTransformerLayerWeight(WeightBase):
         ))
 
     def _post_process_after_load(self, getter: callable):
-        # pylint: disable=no-member
+        # pylint: disable=no-member, attribute-defined-outside-init
         # self.qkv_proj = torch.cat((self.q_proj, self.k_proj, self.v_proj), dim=0).contiguous()
         # del self.q_proj, self.k_proj, self.v_proj
         self.up_gate_proj = torch.cat((self.up_proj, self.gate_proj), dim=0).contiguous()

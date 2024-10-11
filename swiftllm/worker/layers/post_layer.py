@@ -24,10 +24,10 @@ class LlamaPostLayer:
         last_token_indices = torch.cat(
             (
                 batch.pref_st_locs_we[1:] - 1,
-                torch.arange(batch.sum_pref_toks, batch.metadata.s, device=input_embds.device, dtype=torch.int32)
+                torch.arange(batch.sum_pref_toks, batch.iter_width, device=input_embds.device, dtype=torch.int32)
             ), dim=0
         )
-        last_input = torch.empty((batch.metadata.x, self.model_config.hidden_size), device=input_embds.device, dtype=input_embds.dtype)
+        last_input = torch.empty((batch.batch_size, self.model_config.hidden_size), device=input_embds.device, dtype=input_embds.dtype)
         last_input[:, :] = input_embds[last_token_indices, :]
         return last_input
     

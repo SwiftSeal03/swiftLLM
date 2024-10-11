@@ -229,15 +229,16 @@ class LlamaModel:
         batch.softmax_scale = self.model_config.head_dim ** -0.5
 
         position_indices = torch.tensor(
-            sum([list(range(req.prompt_len)) for req in batch.pref_reqs], []) + \
-                [req.seq_len - 1 for req in batch.deco_reqs],
+            sum([list(range(req.prompt_len)) for req in batch.all_reqs[:batch.num_prefs]], []) + \
+                [req.seq_len - 1 for req in batch.all_reqs[batch.num_prefs:]],
             dtype=torch.int32, device='cuda'
         )
+
         batch.position_cos = self.cos_cached[position_indices]
         batch.position_sin = self.sin_cached[position_indices]
 
-        sum_gdec_toks = sum(batch.gdec_seq_lens_list)
-        max_gdec_toks = max(batch.gdec_seq_lens_list, default=0)
+        sum_gdec_toks = sum(batch.seq_lens_list[batch.num_prefs:batch.num_prgds])
+        max_gdec_toks = max(batch.seq_lens_list[batch.num_prefs:batch.num_prgds], default=0)
         seq_block_size = 2048
         num_kv_heads = self.model_config.num_kv_heads
         while num_kv_heads*(sum_gdec_toks/seq_block_size) < 1024 and seq_block_size//2 >= 64 and \
@@ -264,7 +265,7 @@ class LlamaModel:
         if batch.cprf_reqs:
             assert self.swapper is not None
             batch.src_blk_ids, batch.dst_blk_ids = self.swapper.initiate_swap_out(
-                batch.pref_seq_ids_list[:batch.num_cprfs],
+                batch.seq_ids_list[:batch.num_cprfs],
                 use_itm = self.engine_config.extra_layer_for_cprf
             )
 

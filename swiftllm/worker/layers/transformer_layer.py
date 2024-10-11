@@ -7,6 +7,7 @@ import torch
 import vllm_flash_attn_2_cuda as flash_attn_cuda
 # import vllm_flash_attn
 
+# pylint: disable=no-name-in-module
 from swiftllm_c import \
     fused_add_rmsnorm_inplace, \
     silu_and_mul_inplace, \
@@ -314,12 +315,11 @@ class LlamaTransformerLayer:
         if batch.num_gdecs > 0:
             # with torch.cuda.stream(self.decoding_piggyback_stream):
             #     torch.cuda.current_stream().wait_event(self.events[cur_stage].stage_s)
-            gpu_token_end = batch.metadata.s - batch.num_cdecs
             paged_attention(
-                q[batch.sum_pref_toks:gpu_token_end],
-                k[batch.sum_pref_toks:gpu_token_end],
-                v[batch.sum_pref_toks:gpu_token_end],
-                o[batch.sum_pref_toks:gpu_token_end],
+                q[batch.sum_pref_toks:batch.sum_prgd_toks],
+                k[batch.sum_pref_toks:batch.sum_prgd_toks],
+                v[batch.sum_pref_toks:batch.sum_prgd_toks],
+                o[batch.sum_pref_toks:batch.sum_prgd_toks],
                 self.swapper.k_cache, 
                 self.swapper.v_cache,
                 batch.softmax_scale,

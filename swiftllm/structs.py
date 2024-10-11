@@ -186,38 +186,45 @@ class SubBatch:
         return len(self.gprf_reqs) + len(self.cprf_reqs)
 
     def set_model_forward_args(self):
-        self.pref_reqs = self.cprf_reqs + self.gprf_reqs
-        self.deco_reqs = self.gdec_reqs + self.cdec_reqs
-        self.all_reqs = self.pref_reqs + self.deco_reqs
-        assert all(req.request_id != -1 for req in self.all_reqs), "Request ID not set"
+        """
+        Set useful attributes for the model forward pass
 
-        self.num_prefs = len(self.pref_reqs)
+        The comments indicate each attribute's usage in the model forward pass
+        """
+        # pylint: disable=attribute-defined-outside-init
+        self.batch_size = self.metadata.x # post-layer
+        self.iter_width = self.metadata.s # post-layer
+
         self.num_cprfs = len(self.cprf_reqs)
+        self.num_gprfs = len(self.gprf_reqs)
         self.num_gdecs = len(self.gdec_reqs)
         self.num_cdecs = len(self.cdec_reqs)
+        self.num_prefs = self.num_cprfs + self.num_gprfs
+        self.num_prgds = self.num_prefs + self.num_gdecs
 
-        self.pref_seq_ids_list = Request.get_ids(self.pref_reqs)
-        self.gdec_seq_ids_list = Request.get_ids(self.gdec_reqs)
-        self.cdec_seq_ids_list = Request.get_ids(self.cdec_reqs)
+        self.all_reqs = self.cprf_reqs + self.gprf_reqs + self.gdec_reqs + self.cdec_reqs
+        assert all(req.request_id >= 0 for req in self.all_reqs), "Request ID not set"
 
-        self.pref_seq_lens_list = Request.get_lens(self.pref_reqs)
-        self.gdec_seq_lens_list = Request.get_lens(self.gdec_reqs)
-        self.cdec_seq_lens_list = Request.get_lens(self.cdec_reqs)
+        self.seq_ids_list = Request.get_ids(self.all_reqs)
+        self.seq_lens_list = Request.get_lens(self.all_reqs)
 
-        self.prgd_seq_ids = torch.tensor(self.pref_seq_ids_list + self.gdec_seq_ids_list, dtype=torch.int32, device='cuda')
-        self.cdec_seq_ids = torch.tensor(self.cdec_seq_ids_list, dtype=torch.int32, device='cpu')
+        # Useful for attn kernels
+        self.sum_pref_toks = sum(self.seq_lens_list[:self.num_prefs]) # store-pref-KV, pref, gdec
+        self.sum_prgd_toks = self.sum_pref_toks + self.num_gdecs # gdec
+        self.max_pref_toks = max(self.seq_lens_list[:self.num_prefs], default=0) # store-pref-KV, pref
+
+        self.prgd_seq_ids = torch.tensor(self.seq_ids_list[:self.num_prgds], dtype=torch.int32, device='cuda')
+        self.cdec_seq_ids = torch.tensor(self.seq_ids_list[self.num_prgds:], dtype=torch.int32, device='cpu')
         
-        self.prgd_seq_lens = torch.tensor(self.pref_seq_lens_list + self.gdec_seq_lens_list, dtype=torch.int32, device='cuda')
-        self.cdec_seq_lens = torch.tensor(self.cdec_seq_lens_list, dtype=torch.int32, device='cpu')
+        self.prgd_seq_lens = torch.tensor(self.seq_lens_list[:self.num_prgds], dtype=torch.int32, device='cuda')
+        self.cdec_seq_lens = torch.tensor(self.seq_lens_list[self.num_prgds:], dtype=torch.int32, device='cpu')
+        self.pref_st_locs_we = torch.tensor(
+            [0] + list(itertools.accumulate(self.seq_lens_list[:self.num_prefs])), 
+            dtype=torch.int32, device='cuda'
+        )
 
-        self.sum_pref_toks = sum(self.pref_seq_lens_list)
-        self.max_pref_toks = max(self.pref_seq_lens_list, default=0)
-
-        pref_st_locs_we = [0] + list(itertools.accumulate(self.pref_seq_lens_list))
-        self.pref_st_locs_we = torch.tensor(pref_st_locs_we, dtype=torch.int32, device='cuda')
-
-        self.input_token_ids = sum([req.prompt_token_ids for req in self.pref_reqs], []) + \
-            [req.output_token_ids[-1] for req in self.deco_reqs]
+        self.input_token_ids = sum([req.prompt_token_ids for req in self.all_reqs[:self.num_prefs]], []) + \
+            [req.output_token_ids[-1] for req in self.all_reqs[self.num_prefs:]]
 
         # To be set by the model
 
