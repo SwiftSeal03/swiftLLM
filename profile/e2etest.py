@@ -2,6 +2,7 @@
 This script runs a series of tests to measure the performance of the model on a given test case.
 """
 
+import os
 import asyncio
 import argparse
 import logging
@@ -15,7 +16,10 @@ import swiftllm
 logger = logging.getLogger(__name__)
 logging.basicConfig(filename="e2e.log", level=logging.INFO)
 
-data_prefix = "../data/d1008"
+home = os.path.expanduser("~")
+data_prefix = f"{home}/swiftLLM/data/d1008"
+os.makedirs(data_prefix, exist_ok=True)
+
 engine = None
 tokenizer = None
 
@@ -26,7 +30,7 @@ async def send_request_and_wait_non_streaming_mode(prompt: str, output_len: int)
     start = time.perf_counter()
     (_, output_token_ids) = await engine.add_request_and_wait(raw_request)
     end = time.perf_counter()
-    # print(f"Output: {tokenizer.decode(output_token_ids)}")
+    print(f"Output: {tokenizer.decode(output_token_ids)}")
     # global last_output_token_ids
     # if last_output_token_ids and last_output_token_ids != output_token_ids:
     #     raise ValueError("Output token ids mismatch")
@@ -120,7 +124,7 @@ async def main():
         "--model-path",
         help="Path to the model. Note: please download the model weights from HuggingFace in advance and specify the path here.",
         type=str,
-        default="/home/ubuntu/weights/Llama-3-8B-Instruct-Gradient-1048k"
+        default=f"{home}/weights/Llama-2-7b-hf"
     )
     parser.add_argument(
         "--streaming",
@@ -137,45 +141,45 @@ async def main():
         
         block_size = 16,
         gpu_mem_utilization = 0.995,
-        num_gpu_blocks = 1500,
-        num_cpu_blocks = 15000,
-        max_seqs_in_block_table = 2048,
-        max_blocks_per_seq = 2048,
+        num_gpu_blocks = 500,
+        num_cpu_blocks = 500,
+        max_seqs_in_block_table = 512,
+        max_blocks_per_seq = 256,
 
-        max_batch_size = 512,
-        max_prefill_tokens = 20000,
-        max_tokens_in_batch = 20000,
+        max_batch_size = 256,
+        max_prefill_tokens = 1000,
+        max_tokens_in_batch = 1000,
 
-        library_path="/home/ubuntu/pacpu/build/libpacpu.so",
-        profile_result_path="/home/ubuntu/swiftLLM/profile_results/",
+        library_path=f"{home}/pacpu/build/libpacpu.so",
+        profile_result_path=f"{home}/swiftLLM/profile_results/",
 
         # always_use_gpu=True
         extra_layer_for_cprf=True
     )
 
     global engine, tokenizer
-    engine = swiftllm.Engine(engine_config)
+    engine = swiftllm.AsyncEngine(engine_config)
     tokenizer = AutoTokenizer.from_pretrained(model_path)
 
-    await engine.initialize()
+    await engine.initialize_async()
     asyncio.create_task(engine.start_all_event_loops())
 
-    with open("example.txt", "r") as f:
+    with open(f"{home}/swiftLLM/profile/example.txt", "r") as f:
         text = f.readlines()
         prompts = [' '.join(text[:i]) for i in range(1, len(text)+1, 2)]
     
     print([len(tokenizer.encode(prompt)) for prompt in prompts])
 
     logger.info("Warming up...")
-    await run_mock_throughput_test(300, prompts[9], 200, False)
+    await run_mock_throughput_test(10, prompts[4], 20, False)
 
-    for gpu_only in [False, True]:
-        await run_real_throughput_test(
-            "arxiv-summarization-test", 
-            "/home/ubuntu/arxiv-dataset/test_input_prompts.txt", 
-            "/home/ubuntu/arxiv-dataset/test_output_tokens.npy", 
-            gpu_only
-        )
+    # for gpu_only in [False, True]:
+    #     await run_real_throughput_test(
+    #         "arxiv-summarization-test", 
+    #         f"{home}/arxiv-dataset/test_input_prompts.txt", 
+    #         f"{home}/arxiv-dataset/test_output_tokens.npy", 
+    #         gpu_only
+    #     )
 
     # for prompt in prompts:
     #     if len(tokenizer.encode(prompt)) == 521:

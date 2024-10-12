@@ -16,34 +16,27 @@ from swiftllm.structs import create_request, Request, SubBatch
 from swiftllm.utils import GB
 
 from swiftllm.worker.model import LlamaModel, ModelPerfResult
+from swiftllm.server.block_manager import BlockManager
 
 class ModelProfiler:
     """
     A profiler for the Llama model.
     """
     @torch.inference_mode()
-    def __init__(
-        self, 
-        model: LlamaModel
-    ):
+    def __init__(self, model: LlamaModel):
         self.model = model
         self.pp = None
+        self.bm = None
         os.makedirs(model.engine_config.profile_result_path, exist_ok=True)
 
-    def init_profile_tables(self):
+    def init_profile_tables(self, block_manager: BlockManager):
         """
         Initialize the profile tables
         """
         # Validate necessary constraints
         engine_config = self.model.engine_config
 
-        assert engine_config.max_prefill_tokens <= engine_config.max_tokens_in_batch, \
-            f"max_prefill_tokens {engine_config.max_prefill_tokens} exceeds max_tokens_in_batch {engine_config.max_tokens_in_batch}"
-        assert engine_config.max_batch_size <= engine_config.max_tokens_in_batch, \
-            f"max_batch_size {engine_config.max_batch_size} exceeds max_tokens_in_batch {engine_config.max_tokens_in_batch}"
-        assert engine_config.max_batch_size <= engine_config.max_seqs_in_block_table, \
-            f"max_batch_size {engine_config.max_batch_size} exceeds max_seqs_in_block_table {engine_config.max_seqs_in_block_table}"
-
+        self.bm = block_manager
         self.pp = TablePerfPredictor(engine_config)
 
         self.pp.linr_T_list = self._profile_linr(self.pp.linr_S_list)
@@ -51,61 +44,6 @@ class ModelProfiler:
         self.pp.gdec_T_list = self._profile_gdec(self.pp.gdec_N_list)
         self.pp.cdec_T_lists = self._profile_cdec(self.pp.cdec_S_list, self.pp.cdec_N_lists)
       
-
-    def _gpu_fake_prefill(
-        self,
-        reqs: list[Request]
-    ):
-        """
-        Prefill the model with the given sequence ids and sequence lengths.
-
-        All sequences are prefixes of the base tokens.
-
-        We simple allocate and copy corresponding KV entries.
-        """
-
-        seq_ids = torch.tensor([req.request_id for req in reqs], dtype=torch.int32, device="cuda")
-        seq_lens = torch.tensor([req.seq_len for req in reqs], dtype=torch.int32, device="cuda")
-
-        self.model.swapper.gpu_block_manager.allocate_blocks_for_seqs(seq_ids, seq_lens)
-
-        # block_size = self.model.engine_config.block_size
-        # nblocks = [(seq_len - 1) // block_size + 1 for seq_len in seq_lens]
-
-        # for i, seq_id in enumerate(seq_ids):
-        #     nblock = nblocks[i]
-        #     block_ids = self.model.swapper.gpu_block_manager.block_table[seq_id][:nblock]
-        #     for layer_id in range(self.model.model_config.num_layers):
-        #         self.model.swapper.k_cache[layer_id, block_ids].random_().normal_()
-        #         self.model.swapper.v_cache[layer_id, block_ids].random_().normal_()
-
-    def _cpu_fake_prefill(
-      self,
-      reqs: list[Request]
-    ):
-        # We should segregate it into parts in order not to exceed the maximum number of blocks
-        # Note that this is just heuristic based
-        # num_gpu_free_blocks = self.model.swapper.gpu_block_manager.num_free_blocks[0]
-        # i = 0
-        # Since seq_lens may exceed GPU KV cache size, we need to divide it into parts
-        # while i < len(reqs):
-        #     j = i
-        #     block_needed = 0
-        #     while j < len(reqs):
-        #         seq_len = reqs[j].seq_len
-        #         nblocks = (seq_len - 1) // self.model.engine_config.block_size + 1
-        #         if block_needed + nblocks > num_gpu_free_blocks:
-        #             break
-        #         block_needed += nblocks
-        #         j += 1
-        #     self._gpu_fake_prefill(reqs[i:j])
-        #     self.model.swap_out_seqs([req.request_id for req in reqs[i:j]])
-        #     i = j
-        seq_ids = torch.tensor([req.request_id for req in reqs], dtype=torch.int32, device="cpu")
-        seq_lens = torch.tensor([req.seq_len for req in reqs], dtype=torch.int32, device="cpu")
-
-        self.model.swapper.cpu_block_manager.allocate_blocks_for_seqs(seq_ids, seq_lens)
-
 
     def _run_test_case_seq(
         self,
@@ -116,6 +54,7 @@ class ModelProfiler:
         nrepeat = 3
     ):
         return self._run_test_case([pref_lens], [gdec_lens], [cdec_lens], nwarmup, nrepeat)
+    
 
     def _run_test_case_pip_same(
         self,
@@ -126,6 +65,7 @@ class ModelProfiler:
         nrepeat = 3
     ):
         return self._run_test_case([pref_lens] * 2, [gdec_lens] * 2, [cdec_lens] * 2, nwarmup, nrepeat)
+    
 
     @torch.inference_mode()
     def _run_test_case(
@@ -142,12 +82,11 @@ class ModelProfiler:
         # print(f"Running test case with pref_lens={pref_lens}, gdec_lens={gdec_lens}, cdec_lens={cdec_lens}")
 
         nbatches = len(pref_lens)
-        assert nbatches == 1 or nbatches == 2, "Only support 1 or 2 batches"
+        assert nbatches in (1, 2), "Only support 1 or 2 batches"
+        if cdec_lens:
+            print(cdec_lens)
 
         batches = []
-        all_pref_ids = []
-        all_deco_ids = []
-
         offs = 0
         for i in range(nbatches):
             batch = SubBatch()
@@ -166,41 +105,26 @@ class ModelProfiler:
 
             offs += npref + ngdec + ncdec
 
-            if ncdec > 0:
-                self._cpu_fake_prefill(batch.cdec_reqs)
-            if ngdec > 0:
-                self._gpu_fake_prefill(batch.gdec_reqs)
-
+            batch.set_model_forward_args(self.model.model_config)
+            mappings = self.bm.alloc_blocks_for_batch(batch)
+            self.model.swapper.set_block_tables(mappings)
             batches.append(batch)
-            all_pref_ids.extend(Request.get_ids(batch.gprf_reqs + batch.cprf_reqs))
-            all_deco_ids.extend(Request.get_ids(batch.gdec_reqs + batch.cdec_reqs))
-          
-
-        print("Running test case...")
+                  
+        start = 0.0
         for i in range(-nwarmup, nrepeat):
             if i == 0:
                 start = time.perf_counter()
                 self.model.turn_on_perf_monitor()
-            if nbatches == 1:
-                self.model.forward(batches[0])
-            else:
-                self.model.forward_pipeline(batches)
-            # Note that faked prefilling already allocates memory for the "new" token to be fed
-            # into the model, so model.forward won't allocate memory for them and we only need
-            # to free the resources of the prefilled tokens.
-            self.model.free_seqs_resources(all_pref_ids)
-            # Roll back the batch state
-            for batch in batches:
-                for req in batch.all_reqs:
-                    req.output_token_ids.pop()
-                    req.cur_output_len -= 1
+            # Directly call this since we already allocated the blocks
+            self.model.forward_batches(batches)
 
         elapsed = time.perf_counter() - start
         print(f"Elapsed time: {elapsed * 1000 / nrepeat:.3f} ms")
 
+        self.bm.free_blocks_of_requests(sum([batch.all_reqs for batch in batches], []))
+
         assert len(self.model.perf_results) == nrepeat
         res = self.model.flush_perf_results_and_turn_off_perf_monitor()
-        self.model.free_seqs_resources(all_deco_ids)
         return res
     
     def _profile_linr(
@@ -217,11 +141,17 @@ class ModelProfiler:
                 table = json.load(f)
             if table["S_list"] == S_list:
                 return table["T_list"]
+        else:
+            table = {
+                "S_list": [],
+                "T_list": []
+            }
             
         print(f"Profiling linear part with S_list={S_list} ...")
 
         T_list = []
-        for S in tqdm(reversed(S_list)):
+        # Use reversed order to reveal problem earlier
+        for S in tqdm(list(reversed(S_list))):
             if S in table["S_list"]:
                 T_list.append(table["T_list"][table["S_list"].index(S)])
                 continue
@@ -311,10 +241,11 @@ class ModelProfiler:
         print(f"Profiling GPU attention part with N_list={N_list} ...")
 
         T_list = []
+        L = self.model.engine_config.max_seq_len
         for N in tqdm(N_list):
             res = self._run_test_case_seq(
                 pref_lens=[],
-                gdec_lens=[N],
+                gdec_lens=[L] * (N // L) + [N % L],
                 cdec_lens=[]
             )
             T_list.append(ModelPerfResult.mean(res, "avg_gdec_time"))
@@ -356,7 +287,7 @@ class ModelProfiler:
             
         T_lists = []
         block_size = self.model.engine_config.block_size
-        for i, S in tqdm(enumerate(S_list)):
+        for i, S in enumerate(tqdm(S_list)):
             T_lists.append([])
             for N in self.pp.cdec_N_list_agg:
                 if N < N_lists[i][0]:
@@ -491,4 +422,5 @@ class ModelProfiler:
         num_gpu_blocks = math.floor((useable_memory - peak_memory) / block_size_bytes)
 
         torch.cuda.empty_cache()
-        self.model.engine_config.num_gpu_blocks = num_gpu_blocks
+        engine_config.num_gpu_blocks = num_gpu_blocks
+        engine_config.max_prefill_tokens = min(engine_config.max_prefill_tokens, num_gpu_blocks * engine_config.block_size)

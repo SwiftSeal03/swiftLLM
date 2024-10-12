@@ -18,7 +18,7 @@ from swiftllm_c import \
 from swiftllm.model_config import LlamaModelConfig
 from swiftllm.engine_config import EngineConfig
 from swiftllm.worker.weight import LlamaTransformerLayerWeight
-from swiftllm.worker.block_manager import Swapper
+from swiftllm.worker.block_swapper import Swapper
 from swiftllm.structs import SubBatch
 
 from swiftllm.worker.kernels.linear import linear
@@ -194,8 +194,13 @@ class LlamaTransformerLayer:
         batch = self.batches[batch_id]
         if batch.num_cprfs > 0:
             with torch.cuda.stream(self.cpu_communication_stream):
-                itm_layer = self.model_config.num_layers if self.engine_config.extra_layer_for_cprf else self.layer_id
-                self.swapper.swap_out_blocks(itm_layer, self.layer_id, batch.src_blk_ids, batch.dst_blk_ids)
+                self.swapper.swap_blocks(
+                    batch.src_blk_ids, 
+                    batch.dst_blk_ids, 
+                    is_swap_out=True, 
+                    gpu_layer=self.model_config.num_layers if self.engine_config.extra_layer_for_cprf else self.layer_id,
+                    cpu_layer=self.layer_id
+                )
 
     def _preproj(
         self,
@@ -241,7 +246,7 @@ class LlamaTransformerLayer:
                 v,
                 self.swapper.k_cache, 
                 self.swapper.v_cache,
-                self.swapper.gpu_block_manager.block_table,
+                self.swapper.gpu_block_table,
                 batch.prgd_seq_ids[:batch.num_prefs],
                 batch.pref_st_locs_we,
                 batch.prgd_seq_lens[:batch.num_prefs],
@@ -275,6 +280,7 @@ class LlamaTransformerLayer:
                 # torch.cuda.current_stream().wait_event(self.events[cur_stage].stage_s)
                 # Here the performance of vLLM's flash attention is better than us,
                 # so use vllm_flash_attn
+            # pylint: disable=c-extension-no-member
             flash_attn_cuda.varlen_fwd(
                 q[:batch.sum_pref_toks],
                 k[:batch.sum_pref_toks],
@@ -323,7 +329,7 @@ class LlamaTransformerLayer:
                 self.swapper.k_cache, 
                 self.swapper.v_cache,
                 self.model_config.softmax_scale,
-                self.swapper.gpu_block_manager.block_table,
+                self.swapper.gpu_block_table,
                 batch.prgd_seq_ids[batch.num_prefs:],
                 batch.prgd_seq_lens[batch.num_prefs:],
                 cur_layer_id,
@@ -349,7 +355,7 @@ class LlamaTransformerLayer:
                 self.swapper.v_cpu[:batch.num_cdecs],
                 self.swapper.k_swap,
                 self.swapper.v_swap,
-                self.swapper.cpu_block_manager.block_table,
+                self.swapper.cpu_block_table,
                 oc
             )
             events.pf_time("cdec_e")

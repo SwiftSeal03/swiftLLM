@@ -92,10 +92,6 @@ class Scheduler:
     def __init__(self, model: LlamaModel, predictor: PerfPredictor):
         self.engine_config = model.engine_config
         self.model_config = model.model_config
-        self.max_gpu_blocks = model.swapper.gpu_block_manager.num_blocks
-        self.max_cpu_blocks = model.swapper.cpu_block_manager.num_blocks
-        self.max_gpu_tokens = self.max_gpu_blocks * self.engine_config.block_size
-        self.max_cpu_tokens = self.max_cpu_blocks * self.engine_config.block_size
 
         self.predictor = predictor
 
@@ -235,11 +231,11 @@ class Scheduler:
         swpin_reqs = []
 
         # Policy may change, should recompute these thresholds on every iteration
-        swap_out_threshold = self.max_gpu_blocks
+        swap_out_threshold = self.engine_config.num_gpu_blocks
         # swap_in_threshold = round(swap_out_threshold * 0.95)
-        # swap_out_threshold = self.max_gpu_blocks
+        # swap_out_threshold = self.engine_config.num_gpu_blocks
         swap_in_threshold = swap_out_threshold * 0.95
-        cpu_threshold = self.max_cpu_blocks - self.max_gpu_blocks
+        cpu_threshold = self.engine_config.num_cpu_blocks - self.engine_config.num_gpu_blocks
         
         # Step 1: Try to launch as many GPU decoding requests as possible
         gpu_block_needed = sum(self._get_block_needed(req) for req in self.gpu_decoding_q)
@@ -273,7 +269,7 @@ class Scheduler:
         cpu_block_needed = sum(self._get_block_needed(req) for req in self.cpu_decoding_q) # for bounding new prefillings
         for i, candidate in enumerate(self.waiting_q):
             cur_block_needed = self._get_block_needed(candidate)
-            if  itm_block_needed + cur_block_needed > self.max_gpu_blocks or \
+            if  itm_block_needed + cur_block_needed > self.engine_config.num_gpu_blocks or \
                 cpu_block_needed + cur_block_needed > cpu_threshold or \
                 self.request_id_manager.get_num_available_ids() < i or \
                 not budget.check_and_substract(candidate.prompt_len, True):
@@ -282,7 +278,7 @@ class Scheduler:
             # 1. We prefer to put a sequence into GPU.
             # 2. If the GPU is full, we put the sequence into CPU.
             # 3. For fairness, if some earlier sequences are in CPU, we should put the later sequences into CPU.
-            if not pref_to_cpu and gpu_block_needed + cur_block_needed <= self.max_gpu_blocks:
+            if not pref_to_cpu and gpu_block_needed + cur_block_needed <= self.engine_config.num_gpu_blocks:
                 gpu_block_needed += cur_block_needed
                 pref_to_gpu.append(candidate)
             else:
@@ -324,7 +320,7 @@ class Scheduler:
                 cur_seq_block_needed = self._get_block_needed(cur_seq)
                 if  len(cur_batch)+1 <= self.engine_config.max_batch_size and \
                     len(self.gpu_decoding_q)+len(cur_batch)+1 <= self.engine_config.max_batch_size and \
-                    cur_batch_block_needed + cur_seq_block_needed + self.num_decoding_gpu_blocks <= self.max_gpu_blocks and \
+                    cur_batch_block_needed + cur_seq_block_needed + self.num_decoding_gpu_blocks <= self.engine_config.num_gpu_blocks and \
                     cur_num_tokens_sum + cur_seq.prompt_len <= self.engine_config.max_tokens_in_batch:
                     cur_batch.add_pref(cur_seq, True)
                     cur_batch_block_needed += cur_seq_block_needed
@@ -347,7 +343,7 @@ class Scheduler:
         self.num_decoding_gpu_blocks = sum(self._get_block_needed(req) for req in self.gpu_decoding_q)
         newly_swapped_out = []
         while len(self.gpu_decoding_q) > self.engine_config.max_batch_size or \
-            self.num_decoding_gpu_blocks > self.max_gpu_blocks:
+            self.num_decoding_gpu_blocks > self.engine_config.num_gpu_blocks:
             # Preempt the last running seq
             victim = self.gpu_decoding_q.pop()
             self.num_decoding_gpu_blocks -= self._get_block_needed(victim)
@@ -363,7 +359,7 @@ class Scheduler:
                 cur_seq = self.cpu_decoding_q[0]
                 num_cur_seq_blocks = self._get_block_needed(cur_seq)
                 if len(self.gpu_decoding_q) + 1 <= self.engine_config.max_batch_size and \
-                    self.num_decoding_gpu_blocks + num_cur_seq_blocks <= self.max_gpu_blocks:
+                    self.num_decoding_gpu_blocks + num_cur_seq_blocks <= self.engine_config.num_gpu_blocks:
                     self.gpu_decoding_q.append(cur_seq)
                     self.num_decoding_gpu_blocks += num_cur_seq_blocks
                     self.cpu_decoding_q.popleft()
@@ -384,8 +380,8 @@ class Scheduler:
         """
         if self.engine_config.always_use_gpu:
             return self._get_next_batch_old()
-        else:
-            return self._get_next_batch_new()
+    
+        return self._get_next_batch_new()
     
     def remove_finished_requests(self):
         """

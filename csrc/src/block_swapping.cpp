@@ -9,7 +9,7 @@ inline size_t getTensorSizeInBytes(const torch::Tensor &tensor) {
 // swap_blocks - Perform swapping between GPU blocks and CPU blocks
 // The source_block_ids and target_block_ids are the block ids of the blocks to be swapped.
 // source_block_ids[0] will be copied to target_block_ids[0] and so on
-// `is_swap_in` defines whether the swap is a swap-in or swap-out (swap-in means
+// `is_swap_out` defines whether the swap is a swap-in or swap-out (swap-in means
 // to swap from CPU to GPU, swap-out means to swap from GPU to CPU)
 //
 // Here we do not pass a cudaStream to the function. Instead we use the current
@@ -22,7 +22,7 @@ inline size_t getTensorSizeInBytes(const torch::Tensor &tensor) {
 void swap_blocks(
 	const std::vector<int64_t> &source_block_ids,
 	const std::vector<int64_t> &target_block_ids,
-	const bool is_swap_in,
+	const bool is_swap_out,
 	const int gpu_layer,
 	const int cpu_layer,
 
@@ -55,7 +55,7 @@ void swap_blocks(
 		int64_t start_source_block_id = source_block_ids[start_index];
 		int64_t start_target_block_id = target_block_ids[start_index];
 
-		if (is_swap_in) {
+		if (!is_swap_out) {
 			// Copy from CPU to GPU
 			cudaMemcpyAsync(
 				k_cache_ptr + start_target_block_id * block_layer_size_in_bytes,

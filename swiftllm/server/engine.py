@@ -12,14 +12,15 @@ from swiftllm.model_config import LlamaModelConfig
 from swiftllm.worker.model import LlamaModel
 from swiftllm.worker.profiler import ModelProfiler
 from swiftllm.utils import GB
-from swiftllm.structs import Request, RawRequest, StepOutput
+from swiftllm.structs import Request, RawRequest, StepOutput, SubBatch
 
 from swiftllm.server.tokenization_engine import TokenizationEngine
 from swiftllm.server.scheduler import Scheduler
+from swiftllm.server.block_manager import BlockManager
 
 class Engine:
     """
-    The main engine of the server
+    Offline version of the engine, need to tokenize manually
     """
 
     def __init__(self, engine_config: EngineConfig):
@@ -27,30 +28,24 @@ class Engine:
         self.model_config = LlamaModelConfig.load_from_model_path(engine_config.model_path)
         self.initialized = False
 
+        assert engine_config.max_prefill_tokens <= engine_config.max_tokens_in_batch, \
+            f"max_prefill_tokens {engine_config.max_prefill_tokens} exceeds max_tokens_in_batch {engine_config.max_tokens_in_batch}"
+        assert engine_config.max_batch_size <= engine_config.max_tokens_in_batch, \
+            f"max_batch_size {engine_config.max_batch_size} exceeds max_tokens_in_batch {engine_config.max_tokens_in_batch}"
+        assert engine_config.max_batch_size <= engine_config.max_seqs_in_block_table, \
+            f"max_batch_size {engine_config.max_batch_size} exceeds max_seqs_in_block_table {engine_config.max_seqs_in_block_table}"
+
         # The following fields will be created on `init_model()`
         self.model = None
         self.event_loop = None
         self.profiler = None
-        self.scheduler = None
-        self.tokenization_engine = None
+        self.block_manager = None
 
-        self.untokenized_raw_requests: list[tuple[Request, str]] = []
-        self.itr_end_times = []
-        self.ntoken_of_itr = []
-
-    async def _run_on_model_async(self, func, *args, **kwargs):
-        """
-        Run a function on the model asynchronously, and return the result
-        """
-        func_partial = functools.partial(func, *args, **kwargs)
-        return await self.event_loop.run_in_executor(None, func_partial)
-
-    async def initialize(self):
+    
+    def initialize(self):
         """
         Initialize the engine
         """
-        self.event_loop = asyncio.get_event_loop()
-
         print("[Engine] Initializing model...")
         self.model = LlamaModel(self.engine_config)
 
@@ -66,11 +61,120 @@ class Engine:
         print(f"[Engine] Number of GPU blocks: {num_gpu_blocks} ({num_gpu_blocks*block_size_bytes/GB:.2f} GB)")
         print(f"[Engine] Number of CPU blocks: {num_cpu_blocks} ({num_cpu_blocks*block_size_bytes/GB:.2f} GB)")
 
+        print("[Engine] Initializing block manager...")
+        self.block_manager = BlockManager(self.engine_config)
+
         print("[Engine] Allocating kv cache and swap...")
         self.model.init_kvcache_and_swap()
 
+        print("[Engine] Model initialized")
+        self.initialized = True
+
+
+    def prepare_model_forward_args(
+        self,
+        batches: list[SubBatch], 
+        cur_swap_out: list[Request],
+        cur_swap_in: list[Request]
+    ) -> tuple[tuple[tuple[list[int], list[int]], tuple[list[int], list[int]]], tuple[list[int], list[int]], bool]:
+        """
+        Prepare KV cache and swapping related arguments for the model forward pass
+
+        Requires either cur_swap_out or cur_swap_in to be empty
+
+        Return a triple, the first element is yet another tuple of mappings:
+
+            (GPU block VIDs, GPU block PIDs), (CPU block VIDs, CPU block PIDs);
+
+        The second element is a tuple of lists of block IDs:
+
+            (source block PIDs, destination block PIDs);
+
+        The third element is a boolean indicating whether it's a swap out operation
+        """
+        mappings = (([], []), ([], [])) # (GPU, CPU)
+        swappings = ([], []) # (swap in: CPU -> GPU / swap out: GPU -> CPU)
+        for batch in batches:
+            batch.set_model_forward_args(self.model_config)
+            (gv, gp), (cv, cp) = self.block_manager.alloc_blocks_for_batch(batch)
+            mappings[0][0].extend(gv)
+            mappings[0][1].extend(gp)
+            mappings[1][0].extend(cv)
+            mappings[1][1].extend(cp)
+        
+        for batch in batches:
+            sp, dv, dp = self.block_manager.initiate_swap(
+                batch.cprf_reqs, 
+                is_swap_out=True, use_itm=self.engine_config.extra_layer_for_cprf
+            )
+            batch.src_blk_ids = sp
+            batch.dst_blk_ids = dp
+            mappings[1][0].extend(dv)
+            mappings[1][1].extend(dp)
+
+        is_swap_out = bool(cur_swap_out)
+
+        sp, dv, dp = self.block_manager.initiate_swap(cur_swap_out or cur_swap_in, is_swap_out)
+        mappings[is_swap_out][0].extend(dv)
+        mappings[is_swap_out][1].extend(dp)
+        swappings[0].extend(sp)
+        swappings[1].extend(dp)
+
+        return mappings, swappings, is_swap_out
+
+
+    def update_outputs_and_free_finished_reqs(self, batches: list[SubBatch], output_token_ids: list[int]):
+        """
+        Called at the end of each iteration
+        """
+        all_reqs = sum([b.all_reqs for b in batches], [])
+        finished_reqs = Request.update_output(all_reqs, output_token_ids)
+        self.block_manager.free_blocks_of_requests(finished_reqs)
+
+
+    def step(self, batches: list[SubBatch], cur_swap_out: list[Request]=None, cur_swap_in: list[Request]=None):
+        """
+        Perform a step of the engine
+        """
+        forward_args = self.prepare_model_forward_args(batches, cur_swap_out or [], cur_swap_in or [])
+        output_token_ids = self.model.do_one_iteration(batches, *forward_args)
+        self.update_outputs_and_free_finished_reqs(batches, output_token_ids)
+
+
+
+class AsyncEngine(Engine):
+    """
+    The main engine of the server
+    """
+
+    def __init__(self, engine_config: EngineConfig):
+        super().__init__(engine_config)
+
+        # The following fields will be created on `init_model()`
+        self.scheduler = None
+        self.tokenization_engine = None
+
+        self.untokenized_raw_requests: list[tuple[Request, str]] = []
+        self.itr_end_times = []
+        self.ntoken_of_itr = []
+
+    async def _run_on_model_async(self, func, *args, **kwargs):
+        """
+        Run a function on the model asynchronously, and return the result
+        """
+        func_partial = functools.partial(func, *args, **kwargs)
+        return await self.event_loop.run_in_executor(None, func_partial)
+
+    async def initialize_async(self):
+        """
+        Initialize the engine
+        """
+        self.event_loop = asyncio.get_event_loop()
+
+        super().initialize()
+
         print("[Engine] Initializing performance table...")
-        self.profiler.init_profile_tables()
+        self.profiler.init_profile_tables(self.block_manager)
 
         print("[Engine] Initializing scheduler...")
         self.scheduler = Scheduler(self.model, self.profiler.pp)
@@ -131,6 +235,7 @@ class Engine:
 
             self.scheduler.on_requests_arrival(new_requests)
             await asyncio.sleep(0.001)  # yield the event loop
+
     
     async def _main_event_loop(self):
         """
@@ -149,41 +254,22 @@ class Engine:
                 # Nothing to do, sleep for a bit
                 await asyncio.sleep(0.005)
                 continue
-            scheduler_end = time.perf_counter()
 
-            # Perform swap in/out
-            if cur_swap_out:
-                await self._run_on_model_async(self.model.swap_out_seqs, [req.request_id for req in cur_swap_out])
-            if cur_swap_in:
-                await self._run_on_model_async(self.model.swap_in_seqs, [req.request_id for req in cur_swap_in])
-            swp_finish = time.perf_counter()
+            # Prepare model forward arguments
+            forward_args = self.prepare_model_forward_args(batches, cur_swap_out, cur_swap_in)
+            prepare_end = time.perf_counter()
             
             # Forward the model
-            for batch in batches:
-                batch.set_model_forward_args(self.model_config)
-            if len(batches) == 1:
-                # Sequential mode
-                print(f"Using sequential mode (batch_size = {len(batches[0])})")
-                output_token_ids = await self._run_on_model_async(self.model.forward, batches[0])
-            else:
-                # Pipelined mode
-                print(f"Using pipelined mode (batch_size = {len(batches[0]) + len(batches[1])})")
-                output_token_ids = await self._run_on_model_async(self.model.forward_pipeline, batches)
+            output_token_ids = await self._run_on_model_async(self.model.do_one_iteration, batches, *forward_args)
 
             # Deal with output tokens
-            all_reqs = sum([b.all_reqs for b in batches], [])
-            finished_reqs = Request.update_output(all_reqs, output_token_ids)
-            if finished_reqs:
-                await self._run_on_model_async(
-                    self.model.free_seqs_resources,
-                    finished_reqs
-                )
+            self.update_outputs_and_free_finished_reqs(batches, output_token_ids)
             self.scheduler.remove_finished_requests()
             iter_end = time.perf_counter()
 
             print(
-                f"Time: {iter_end-start:.3f}s, scheduler: {scheduler_end-start:.3f}s, "
-                f"swap: {swp_finish-scheduler_end:.3f}s, forward: {iter_end-swp_finish:.3f}s"
+                f"Time: {iter_end-start:.3f}s, scheduler: {prepare_end-start:.3f}s, "
+                f"forward: {iter_end-prepare_end:.3f}s"
             )
             self.itr_end_times.append(iter_end)
             self.ntoken_of_itr.append(sum(b.perfdata.x for b in batches))
