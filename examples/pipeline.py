@@ -9,8 +9,15 @@ import argparse
 from transformers import AutoTokenizer
 
 import swiftllm
+from swiftllm.structs import Request
 
-if __name__ == '__main__':
+# pylint: disable=missing-function-docstring
+def forward_wrapper(model: swiftllm.LlamaModel, batch: swiftllm.SubBatch):
+    batch.set_model_forward_args(model.model_config)
+    output_tokens = model.forward(batch)
+    Request.update_output(batch.all_reqs, output_tokens)
+
+def main():
     home = os.path.expanduser("~")
     parser = argparse.ArgumentParser()
     parser.description = """
@@ -45,7 +52,7 @@ if __name__ == '__main__':
         block_size = 16,
         gpu_mem_utilization = 0.995,
         num_gpu_blocks = 1700,
-        num_cpu_blocks = 4000,
+        num_cpu_blocks = 500,
         max_seqs_in_block_table = 1024,
         max_blocks_per_seq = 512,
 
@@ -54,7 +61,7 @@ if __name__ == '__main__':
         max_prefill_tokens = 2048*16,
         max_tokens_in_batch = 2048*16,
 
-        library_path=None,
+        library_path=library_path,
         profile_result_path=profile_result_path,
 
         extra_layer_for_cprf=True
@@ -72,13 +79,12 @@ if __name__ == '__main__':
     model_creation_time = time.perf_counter() - start_time
     print(f"Model creation time: {model_creation_time:.2f} seconds")
 
-    ngpu_prompts = 40
+    ngpu_prompts = 10
     ncpu_prompts = 0
     nprompts = ncpu_prompts + ngpu_prompts
     with open(f"{home}/swiftLLM/examples/example.txt", "r") as f:
         prompt = ' '.join(f.readlines())
     tokenizer = AutoTokenizer.from_pretrained(model_path)
-    outputs = []
 
     # Prompt phase
     input_ids = tokenizer(prompt)['input_ids']
@@ -88,18 +94,21 @@ if __name__ == '__main__':
         for i in range(ngpu_prompts // 2, nprompts // 2):
             reqs[i] = swiftllm.create_request(input_ids, i)
             batch.add_pref(reqs[i], is_gpu=False)
-        model.forward(batch)
+        forward_wrapper(model, batch)
+
         batch = swiftllm.SubBatch()
         for i in range(nprompts // 2 + ngpu_prompts // 2, nprompts):
             reqs[i] = swiftllm.create_request(input_ids, i)
             batch.add_pref(reqs[i], is_gpu=False)
-        model.forward(batch)
+        forward_wrapper(model, batch)
+
     if ngpu_prompts:
         batch = swiftllm.SubBatch()
         for i in list(range(ngpu_prompts // 2)) + list(range(nprompts // 2, nprompts // 2 + ngpu_prompts // 2)):
             reqs[i] = swiftllm.create_request(input_ids, i)
             batch.add_pref(reqs[i], is_gpu=True)
-        model.forward(batch)
+        forward_wrapper(model, batch)
+    print("Prompt phase done")
 
     # model.turn_on_perf_monitor()
     for _ in range(10):
@@ -113,12 +122,17 @@ if __name__ == '__main__':
         for i in range(nprompts // 2 + ngpu_prompts // 2, nprompts):
             batches[0].add_cdec(reqs[i])
         reqs.append(swiftllm.create_request(input_ids, len(reqs)))
-        batches[0].add_pref(reqs[-1], is_gpu=True)
         reqs.append(swiftllm.create_request(input_ids, len(reqs)))
+        batches[0].add_pref(reqs[-2], is_gpu=True)
         batches[1].add_pref(reqs[-1], is_gpu=True)
+
+        for batch in batches:
+            batch.set_model_forward_args(model.model_config)
         start = time.perf_counter()
-        model.forward_pipeline(batches)
+        output_tokens = model.forward_pipeline(batches)
         end = time.perf_counter()
+        Request.update_output(sum([b.all_reqs for b in batches], []), output_tokens)
+
         print(f"E2E decoding time: {(end - start) * 1000:.4f} ms")
     
     for i in range(nprompts):
@@ -128,3 +142,6 @@ if __name__ == '__main__':
 
     # res = model.flush_perf_results_and_turn_off_perf_monitor()
     # print(res)
+
+if __name__ == '__main__':
+    main()

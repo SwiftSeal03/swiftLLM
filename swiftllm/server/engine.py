@@ -159,27 +159,24 @@ class Engine:
             swp_finish = time.perf_counter()
             
             # Forward the model
+            for batch in batches:
+                batch.set_model_forward_args(self.model_config)
             if len(batches) == 1:
                 # Sequential mode
                 print(f"Using sequential mode (batch_size = {len(batches[0])})")
-                await self._run_on_model_async(self.model.forward, batches[0])
+                output_token_ids = await self._run_on_model_async(self.model.forward, batches[0])
             else:
                 # Pipelined mode
                 print(f"Using pipelined mode (batch_size = {len(batches[0]) + len(batches[1])})")
-                await self._run_on_model_async(self.model.forward_pipeline, batches)
+                output_token_ids = await self._run_on_model_async(self.model.forward_pipeline, batches)
 
             # Deal with output tokens
-            finished_req_ids = []
-            for batch in batches:
-                for req in batch.all_reqs:
-                    if req.is_finished():
-                        req.finished_event.set()
-                        finished_req_ids.append(req.request_id)
-                        self.scheduler.request_id_manager.free_id(req.request_id)
-            if finished_req_ids:
+            all_reqs = sum([b.all_reqs for b in batches], [])
+            finished_reqs = Request.update_output(all_reqs, output_token_ids)
+            if finished_reqs:
                 await self._run_on_model_async(
                     self.model.free_seqs_resources,
-                    finished_req_ids
+                    finished_reqs
                 )
             self.scheduler.remove_finished_requests()
             iter_end = time.perf_counter()

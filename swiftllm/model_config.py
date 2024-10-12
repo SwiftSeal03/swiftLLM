@@ -38,6 +38,13 @@ class LlamaModelConfig:
         Get the size of one kv slot (the kv cache of one token) (in bytes)
         """
         return (2 * self.num_layers * self.num_kv_heads * self.head_dim) * dtype.itemsize
+
+    @property
+    def softmax_scale(self) -> float:
+        """
+        Get the scale of the softmax function
+        """
+        return self.head_dim ** -0.5
     
     @staticmethod
     def load_from_model_path(model_path: str) -> "LlamaModelConfig":

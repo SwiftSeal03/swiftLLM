@@ -111,7 +111,7 @@ class BlockManager:
         new_num_blks_list = new_num_blks.tolist()
         blk_poss = [seq_ids[i] * self.block_table_width + j + seq_num_blks_list[i] for i, n in enumerate(new_num_blks_list) for j in range(n)]
         self.block_table.view(-1)[blk_poss] = new_blk_ids.to(device=self.device_name) # possibly on GPU
-        self.seq_num_blks[seq_ids] += new_num_blks
+        self.seq_num_blks[seq_ids] = tgt_num_blks
         return new_blk_ids.tolist()
 
     def free(self, reqs: list[Request], split_id: int=0) -> list[int]:
@@ -129,6 +129,7 @@ class BlockManager:
         blk_ids = self.block_table.view(-1)[blk_poss] # possibly on GPU
         self.num_free_blocks[split_id] += len(blk_ids)
         self.is_block_free[split_id][blk_ids] = True
+        self.seq_num_blks[seq_ids] = 0
         return blk_ids.tolist()
 
 class Swapper:
@@ -276,4 +277,5 @@ class Swapper:
         """
         Swap out (move blocks from GPU to CPU) the specified sequences.
         """
+        print("Swapping out {} blocks from GPU to CPU".format(len(src_block_ids)))
         self._swap(src_block_ids, dst_block_ids, False, gpu_layer, cpu_layer)

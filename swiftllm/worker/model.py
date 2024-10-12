@@ -5,6 +5,7 @@ If performance monitoring is enabled, the model will record performance results.
 """
 
 import json
+import itertools
 
 import numpy as np
 import torch
@@ -220,13 +221,19 @@ class LlamaModel:
         batch: SubBatch
     ):
         """
-        Prepare the batch for the forward pass. Mainly do 2 things:
-            1. Compute metadata of the batch for more convenient kernel calling.
-            2. Allocate blocks for the sequences in the batch.
+        Prepare the batch for the forward pass. 
+        
+        Most work should be already be done by the control plane. We only need to prepare GPU specific data, including:
+            1. seq_ids and seq_lens
+            2. position_cos and position_sin
+            3. GPU block table
         """
-        batch.set_model_forward_args()
-
-        batch.softmax_scale = self.model_config.head_dim ** -0.5
+        batch.prgd_seq_ids = torch.tensor(batch.seq_ids_list[:batch.num_prgds], dtype=torch.int32, device='cuda')
+        batch.prgd_seq_lens = torch.tensor(batch.seq_lens_list[:batch.num_prgds], dtype=torch.int32, device='cuda')
+        batch.pref_st_locs_we = torch.tensor(
+            [0] + list(itertools.accumulate(batch.seq_lens_list[:batch.num_prefs])), 
+            dtype=torch.int32, device='cuda'
+        )
 
         position_indices = torch.tensor(
             sum([list(range(req.prompt_len)) for req in batch.all_reqs[:batch.num_prefs]], []) + \
@@ -236,16 +243,6 @@ class LlamaModel:
 
         batch.position_cos = self.cos_cached[position_indices]
         batch.position_sin = self.sin_cached[position_indices]
-
-        sum_gdec_toks = sum(batch.seq_lens_list[batch.num_prefs:batch.num_prgds])
-        max_gdec_toks = max(batch.seq_lens_list[batch.num_prefs:batch.num_prgds], default=0)
-        seq_block_size = 2048
-        num_kv_heads = self.model_config.num_kv_heads
-        while num_kv_heads*(sum_gdec_toks/seq_block_size) < 1024 and seq_block_size//2 >= 64 and \
-            max_gdec_toks / (seq_block_size//2) <= 128:
-            seq_block_size //= 2
-        batch.seq_block_size = seq_block_size
-        batch.num_seq_blocks = (max_gdec_toks + seq_block_size - 1) // seq_block_size
 
         if self.swapper is not None:
             self.swapper.gpu_block_manager.alloc(
@@ -273,9 +270,11 @@ class LlamaModel:
     def forward(
         self,
         batch: SubBatch
-    ):
+    ) -> list[int]:
         """
         Run a forward pass of the LlamaModel.
+
+        Returns the output tokens.
         """
         self._prepare_inputs(batch)
         self._prepare_swaps(batch)
@@ -284,7 +283,7 @@ class LlamaModel:
 
         # Main body of the forward pass
         # start = time.perf_counter()
-        input_embds = self.pre_layer.forward(batch.input_token_ids)
+        input_embds = self.pre_layer.forward(Request.get_input_tokens(batch.all_reqs))
 
         # Wait for swappings to finish
         torch.cuda.current_stream().wait_stream(self.cpu_communication_stream)
@@ -308,19 +307,21 @@ class LlamaModel:
         # duration = time.perf_counter() - start
         # print(f"Forward time: {duration*1000:.2f}ms")
 
-        batch.update_output(output_tokens)
-
         if self.engine_config.monitor_performance:
             self.perf_results.append(ModelPerfResult(self.transformer_layers, self.events, False))
+        
+        return output_tokens
 
     
     @torch.inference_mode()
     def forward_pipeline(
         self,
         batches: list[SubBatch]
-    ):
+    ) -> list[int]:
         """
         Run a forward pass of the LlamaModel in a pipelined manner.
+
+        Returns the concatenated output tokens.
         """
         assert len(batches) == 2, "Pipelined mode only supports 2 batches"
 
@@ -334,12 +335,11 @@ class LlamaModel:
         self.events.pf_record("frwd_s")
 
         # input_embds would serve as a buffer for all attention outputs
-        input_embedss = self.pre_layer.forward(sum([b.input_token_ids for b in batches], []))
+        input_embedss = self.pre_layer.forward(sum([Request.get_input_tokens(b.all_reqs) for b in batches], []))
         residual_bufs = torch.zeros_like(input_embedss)
-        s0 = batches[0].iter_width
-        s1 = batches[1].iter_width
-        input_embedss = torch.split(input_embedss, [s0, s1], dim=0)
-        residual_bufs = torch.split(residual_bufs, [s0, s1], dim=0)
+        iter_widths = [b.iter_width for b in batches]
+        input_embedss = torch.split(input_embedss, iter_widths, dim=0)
+        residual_bufs = torch.split(residual_bufs, iter_widths, dim=0)
 
         for layer in self.transformer_layers:
             layer.set_batches_and_buffers(batches, input_embedss, residual_bufs)
@@ -370,12 +370,10 @@ class LlamaModel:
 
         self.events.pf_record("frwd_e")
 
-        x0 = batches[0].batch_size
-        batches[0].update_output(output_tokens[:x0])
-        batches[1].update_output(output_tokens[x0:])
-
         if self.engine_config.monitor_performance:
             self.perf_results.append(ModelPerfResult(self.transformer_layers, self.events, True))
+        
+        return output_tokens
         
     @torch.inference_mode()
     def swap_in_seqs(self, reqs: list[Request]):

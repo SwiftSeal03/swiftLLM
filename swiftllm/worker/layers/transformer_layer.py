@@ -288,7 +288,7 @@ class LlamaTransformerLayer:
                 batch.max_pref_toks,
                 batch.max_pref_toks,
                 0.0,
-                batch.softmax_scale,
+                self.model_config.softmax_scale,
                 False,
                 True,  # causal
                 -1,    # window size 0
@@ -305,7 +305,7 @@ class LlamaTransformerLayer:
             #     batch.pref_st_locs_we,
             #     batch.max_pref_toks,
             #     batch.max_pref_toks,
-            #     softmax_scale=batch.softmax_scale,
+            #     softmax_scale=self.model_config.softmax_scale,
             #     causal=True
             # ).reshape(-1, self.model_config.hidden_size)
         events.pf_record("pref_e")
@@ -322,7 +322,7 @@ class LlamaTransformerLayer:
                 o[batch.sum_pref_toks:batch.sum_prgd_toks],
                 self.swapper.k_cache, 
                 self.swapper.v_cache,
-                batch.softmax_scale,
+                self.model_config.softmax_scale,
                 self.swapper.gpu_block_manager.block_table,
                 batch.prgd_seq_ids[batch.num_prefs:],
                 batch.prgd_seq_lens[batch.num_prefs:],
@@ -333,14 +333,14 @@ class LlamaTransformerLayer:
         events.pf_record("gdec_e")
                 
         if batch.num_cdecs > 0:
-            og = o[-batch.num_cdecs:, :]
+            og = o[-batch.num_cdecs:, :].view(-1, self.model_config.hidden_size)
             oc = self.swapper.o_cpu[:batch.num_cdecs]
             events.pf_time("lnch_m")
             self.events[cur_stage].qkvtr_e.synchronize()
             events.pf_time("cdec_s")
             torch.ops.pacpu.paged_attention_cpu(
                 cur_layer_id,
-                batch.softmax_scale,
+                self.model_config.softmax_scale,
                 batch.seq_ids_list[batch.num_prgds:],
                 batch.seq_lens_list[batch.num_prgds:],
 
