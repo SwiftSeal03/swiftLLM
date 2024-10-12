@@ -5,14 +5,17 @@ This script is used to test the performance of the model on a given test case.
 import time
 import json
 
-from swiftllm.worker.model import LlamaModel, ModelPerfResult
-from swiftllm.worker.profiler import ModelProfiler
-from swiftllm.engine_config import EngineConfig
+import swiftllm
+from swiftllm.worker.model import ModelPerfResult
 from swiftllm.structs import BatchPerfData
 
-def init_model():
-    global model, profiler
-    engine_config = EngineConfig(
+engine = None
+
+# pylint: disable=missing-function-docstring
+def init_engine():
+    # pylint: disable=global-statement
+    global engine
+    engine_config = swiftllm.EngineConfig(
         model_path = "/home/ubuntu/weights/Llama-3-8B-Instruct-Gradient-1048k",
         use_dummy = False,
         
@@ -33,18 +36,9 @@ def init_model():
     )
 
     start_time = time.perf_counter()
+    engine = swiftllm.Engine(engine_config)
+    print(f"Engine creation time: {time.perf_counter() - start_time:.2f} seconds")
 
-    # Initialize the model
-    # For instructions on how to initialize the model, see comments in swiftllm/worker/model.py
-    model = LlamaModel(engine_config)
-    model.load_weights()
-    profiler = ModelProfiler(model)
-    model.init_kvcache_and_swap()
-
-    model_creation_time = time.perf_counter() - start_time
-    print(f"Model creation time: {model_creation_time:.2f} seconds")
-
-    profiler.init_profile_tables()
 
 def run_test_case(
     pref_lens: list[list[int]],
@@ -52,7 +46,7 @@ def run_test_case(
     cdec_lens: list[list[int]]
 ):
     nbatches = len(pref_lens)
-    batchmds = [BatchPerfData(profiler.pp) for _ in range(nbatches)]
+    batchmds = [BatchPerfData(engine.profiler.pp) for _ in range(nbatches)]
 
     for i in range(nbatches):
         for l in pref_lens[i]:
@@ -65,7 +59,7 @@ def run_test_case(
             batchmds[i].add_cdec(l)
 
     print("Start real test...")
-    real_res = ModelPerfResult.mean_all(profiler._run_test_case(
+    real_res = ModelPerfResult.mean_all(engine.profiler._run_test_case(
         pref_lens, gdec_lens, cdec_lens
     ))
 
@@ -85,7 +79,7 @@ def run_test_case(
 
 
 if __name__ == "__main__":
-    init_model()
+    init_engine()
     # run_test_case(
     #   pref_lens=[[526, 526, 526, 526],[]],
     #   gdec_lens=[[694, 693, 692, 691, 690, 689, 688, 687, 686, 685, 684, 683, 682, 681, 680, 679, 678, 677, 676, 675, 674, 673, 672, 671, 670, 669, 668, 667, 666, 665, 664, 663, 662, 661, 660, 659], []],

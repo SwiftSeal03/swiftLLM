@@ -12,7 +12,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 from swiftllm.perfpredictor import TablePerfPredictor
-from swiftllm.structs import create_request, Request, SubBatch
+from swiftllm.structs import create_request, SubBatch
 from swiftllm.utils import GB
 
 from swiftllm.worker.model import LlamaModel, ModelPerfResult

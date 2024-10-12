@@ -23,6 +23,7 @@ os.makedirs(data_prefix, exist_ok=True)
 engine = None
 tokenizer = None
 
+# pylint: disable=missing-function-docstring
 
 last_output_token_ids = None
 async def send_request_and_wait_non_streaming_mode(prompt: str, output_len: int):
@@ -45,10 +46,13 @@ async def run_latency_test(
     gpu_only: bool,
 ):
     promptlen = len(tokenizer.encode(prompt))
-    logger.info("Latency test: input_len=%d, output_len=%d, nrequests=%d, req_rate=%.2f, gpu_only=%s", promptlen, output_len, nrequests, req_rate, gpu_only)
+    logger.info(
+        "Latency test: input_len=%d, output_len=%d, nrequests=%d, req_rate=%.2f, gpu_only=%s", 
+        promptlen, output_len, nrequests, req_rate, gpu_only
+    )
     engine.engine_config.always_use_gpu = gpu_only
     tasks = []
-    for i in range(nrequests):
+    for _ in range(nrequests):
         task = asyncio.create_task(send_request_and_wait_non_streaming_mode(prompt, output_len))
         tasks.append(task)
         await asyncio.sleep(1/req_rate)
@@ -142,7 +146,7 @@ async def main():
         block_size = 16,
         gpu_mem_utilization = 0.995,
         num_gpu_blocks = 500,
-        num_cpu_blocks = 500,
+        num_cpu_blocks = 1000,
         max_seqs_in_block_table = 512,
         max_blocks_per_seq = 256,
 
@@ -157,6 +161,7 @@ async def main():
         extra_layer_for_cprf=True
     )
 
+    # pylint: disable=global-statement
     global engine, tokenizer
     engine = swiftllm.AsyncEngine(engine_config)
     tokenizer = AutoTokenizer.from_pretrained(model_path)
