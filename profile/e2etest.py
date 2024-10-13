@@ -176,7 +176,7 @@ async def main():
     print([len(tokenizer.encode(prompt)) for prompt in prompts])
 
     logger.info("Warming up...")
-    await run_mock_throughput_test(10, prompts[4], 20, False)
+    await run_mock_throughput_test(40, prompts[9], 20, False)
 
     # for gpu_only in [False, True]:
     #     await run_real_throughput_test(

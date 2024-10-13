@@ -4,7 +4,8 @@ A smart scheduler for the SwiftLLM engine that does batch picking and mode selec
 
 from collections import deque
 
-from swiftllm.worker.model import LlamaModel
+from swiftllm.engine_config import EngineConfig
+from swiftllm.model_config import LlamaModelConfig
 from swiftllm.utils import cdiv
 from swiftllm.structs import Request, SubBatch
 from swiftllm.perfpredictor import PerfPredictor
@@ -89,9 +90,14 @@ class Scheduler:
     as well as swapping in/out
     """
 
-    def __init__(self, model: LlamaModel, predictor: PerfPredictor):
-        self.engine_config = model.engine_config
-        self.model_config = model.model_config
+    def __init__(
+        self, 
+        engine_config: EngineConfig,
+        model_config: LlamaModelConfig,
+        predictor: PerfPredictor
+    ):
+        self.engine_config = engine_config
+        self.model_config = model_config
 
         self.predictor = predictor
 
@@ -170,9 +176,6 @@ class Scheduler:
                 gpu_only_batch.add_pref(req, is_gpu)
                 break
 
-        if not self.cpu_decoding_q:
-            return [gpu_only_batch] # This is to prevent division by zero
-
         # Step 3: split CPU decoding requests.
         min_out_cpu_len = 1e9
         next_batch_idx = 1
@@ -193,6 +196,9 @@ class Scheduler:
                 continue
             next_batch_idx = remains[1] > remains[0]
 
+        if not batches[1]:
+            return [gpu_only_batch] # This is to prevent division by zero
+
         # Step 4: reduce the number of prefilled sequences in the first batch if CPU is idle for too long
         while batches[0].get_num_prefs():
             req, is_gpu = batches[0].pop_pref()
@@ -201,7 +207,6 @@ class Scheduler:
                 break
 
         # Step 5: check if pipelined mode is better
-        
         seqential_time = gpu_only_batch.perfdata.gpu_time * self.model_config.num_layers
         pipelined_time = (batches[0].perfdata.gpu_time + batches[1].perfdata.gpu_time) * self.model_config.num_layers
         seqential_rate = len(gpu_only_batch) / seqential_time

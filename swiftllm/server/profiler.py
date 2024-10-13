@@ -15,26 +15,29 @@ from swiftllm.perfpredictor import TablePerfPredictor
 from swiftllm.structs import create_request, SubBatch
 from swiftllm.utils import GB
 
-from swiftllm.worker.model import LlamaModel, ModelPerfResult
+from swiftllm.worker.model import ModelPerfResult
 from swiftllm.server.block_manager import BlockManager
+from swiftllm.server.executor import Executor
 
 class ModelProfiler:
     """
     A profiler for the Llama model.
     """
     @torch.inference_mode()
-    def __init__(self, model: LlamaModel):
-        self.model = model
+    def __init__(self, executor: Executor):
+        self.engine_config = executor.engine_config
+        self.model_config = executor.model_config
+        self.executor = executor
         self.pp = None
         self.bm = None
-        os.makedirs(model.engine_config.profile_result_path, exist_ok=True)
+        os.makedirs(self.engine_config.profile_result_path, exist_ok=True)
 
     def init_profile_tables(self, block_manager: BlockManager):
         """
         Initialize the profile tables
         """
         # Validate necessary constraints
-        engine_config = self.model.engine_config
+        engine_config = self.executor.engine_config
 
         self.bm = block_manager
         self.pp = TablePerfPredictor(engine_config)
@@ -105,26 +108,24 @@ class ModelProfiler:
 
             offs += npref + ngdec + ncdec
 
-            batch.set_model_forward_args(self.model.model_config)
+            batch.set_model_forward_args(self.model_config)
             mappings = self.bm.alloc_blocks_for_batch(batch)
-            self.model.swapper.set_block_tables(mappings)
             batches.append(batch)
                   
         start = 0.0
         for i in range(-nwarmup, nrepeat):
             if i == 0:
                 start = time.perf_counter()
-                self.model.turn_on_perf_monitor()
+                self.executor.turn_on_perf_monitor()
             # Directly call this since we already allocated the blocks
-            self.model.forward_batches(batches)
+            self.executor.do_one_iteration(batches, mappings, ([], []))
 
         elapsed = time.perf_counter() - start
         print(f"Elapsed time: {elapsed * 1000 / nrepeat:.3f} ms")
 
         self.bm.free_blocks_of_requests(sum([batch.all_reqs for batch in batches], []))
 
-        assert len(self.model.perf_results) == nrepeat
-        res = self.model.flush_perf_results_and_turn_off_perf_monitor()
+        res = self.executor.turn_off_perf_monitor_and_flush_results()
         return res
     
     def _profile_linr(
@@ -134,7 +135,7 @@ class ModelProfiler:
         """
         Profile model's linear part performance.
         """
-        result_path = self.model.engine_config.profile_result_path + "linr.json"
+        result_path = self.engine_config.profile_result_path + "linr.json"
 
         if os.path.exists(result_path):
             with open(result_path, "r") as f:
@@ -169,7 +170,7 @@ class ModelProfiler:
         plt.ylim(0)
         plt.xlabel("S")
         plt.ylabel("T_l(ms)")
-        plt.savefig(self.model.engine_config.profile_result_path + "linr.png")
+        plt.savefig(self.engine_config.profile_result_path + "linr.png")
         plt.close()
 
         with open(result_path, "w") as f:
@@ -187,7 +188,7 @@ class ModelProfiler:
         """
         Profile model's GPU prefilling attention part performance.
         """
-        result_path = self.model.engine_config.profile_result_path + "pref.json"
+        result_path = self.engine_config.profile_result_path + "pref.json"
 
         if os.path.exists(result_path):
             with open(result_path, "r") as f:
@@ -212,7 +213,7 @@ class ModelProfiler:
         plt.ylim(0)
         plt.xlabel("S")
         plt.ylabel("T(ms)")
-        plt.savefig(self.model.engine_config.profile_result_path + "pref.png")
+        plt.savefig(self.engine_config.profile_result_path + "pref.png")
         plt.close()
 
         with open(result_path, "w") as f:
@@ -230,7 +231,7 @@ class ModelProfiler:
         """
         Profile model's GPU attention part performance.
         """
-        result_path = self.model.engine_config.profile_result_path + "gdec.json"
+        result_path = self.engine_config.profile_result_path + "gdec.json"
 
         if os.path.exists(result_path):
             with open(result_path, "r") as f:
@@ -241,7 +242,7 @@ class ModelProfiler:
         print(f"Profiling GPU attention part with N_list={N_list} ...")
 
         T_list = []
-        L = self.model.engine_config.max_seq_len
+        L = self.engine_config.max_seq_len
         for N in tqdm(N_list):
             res = self._run_test_case_seq(
                 pref_lens=[],
@@ -256,7 +257,7 @@ class ModelProfiler:
         plt.ylim(0)
         plt.xlabel("N")
         plt.ylabel("T(ms)")
-        plt.savefig(self.model.engine_config.profile_result_path + "gdec.png")
+        plt.savefig(self.engine_config.profile_result_path + "gdec.png")
         plt.close()
 
         with open(result_path, "w") as f:
@@ -275,7 +276,7 @@ class ModelProfiler:
         """
         Profile model's CPU attention part performance.
         """
-        result_path = self.model.engine_config.profile_result_path + "cdec.json"
+        result_path = self.engine_config.profile_result_path + "cdec.json"
 
         if os.path.exists(result_path):
             with open(result_path, "r") as f:
@@ -286,7 +287,7 @@ class ModelProfiler:
         print(f"Profiling CPU attention part with S_list={S_list}, N_lists={N_lists} ...")
             
         T_lists = []
-        block_size = self.model.engine_config.block_size
+        block_size = self.engine_config.block_size
         for i, S in enumerate(tqdm(S_list)):
             T_lists.append([])
             for N in self.pp.cdec_N_list_agg:
@@ -322,7 +323,7 @@ class ModelProfiler:
         ax.set_xlabel("S_c")
         ax.set_ylabel("N_c")
         ax.set_zlabel("T(ms)")
-        plt.savefig(self.model.engine_config.profile_result_path + "cdec.png")
+        plt.savefig(self.engine_config.profile_result_path + "cdec.png")
         plt.close()
 
         with open(result_path, "w") as f:
@@ -341,7 +342,7 @@ class ModelProfiler:
         """
         Profile model's kernel launch time.
         """
-        result_path = self.model.engine_config.profile_result_path + "lnch.json"
+        result_path = self.engine_config.profile_result_path + "lnch.json"
 
         if os.path.exists(result_path):
             with open(result_path, "r") as f:
@@ -366,7 +367,7 @@ class ModelProfiler:
         plt.ylim(0)
         plt.xlabel("S")
         plt.ylabel("T(ms)")
-        plt.savefig(self.model.engine_config.profile_result_path + "lnch.png")
+        plt.savefig(self.engine_config.profile_result_path + "lnch.png")
         plt.close()
 
         with open(result_path, "w") as f:
@@ -393,8 +394,8 @@ class ModelProfiler:
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
 
-        engine_config = self.model.engine_config
-        model_config = self.model.model_config
+        engine_config = self.engine_config
+        model_config = self.model_config
 
         # Synthesis a prefill batch
         N = engine_config.max_tokens_in_batch
@@ -412,7 +413,7 @@ class ModelProfiler:
         free_memory, total_memory = torch.cuda.mem_get_info()
         peak_memory = total_memory - free_memory
         useable_memory = total_memory * engine_config.gpu_mem_utilization
-        print(f"[Model.profile] GPU total memory: {total_memory/GB:.2f} GB, runtime peak memory: {peak_memory/GB:.2f} GB")
+        print(f"[executor.profile] GPU total memory: {total_memory/GB:.2f} GB, runtime peak memory: {peak_memory/GB:.2f} GB")
         if useable_memory < peak_memory:
             raise RuntimeError(
                 f"Peak memory {peak_memory/GB:.2f} GB exceeds usable memory {useable_memory/GB:.2f} GB "

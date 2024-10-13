@@ -69,12 +69,14 @@ if __name__ == '__main__':
     engine.initialize()
     print(f"Engine creation time: {time.perf_counter() - start_time:.2f} seconds")
 
+    os.environ["TOKENIZERS_PARALLELISM"] = "false"
+    tokenizer = AutoTokenizer.from_pretrained(model_path)
+
     ngpu_prompts = 10
-    ncpu_prompts = 10
+    ncpu_prompts = 0
     nprompts = ncpu_prompts + ngpu_prompts
     with open(f"{home}/swiftLLM/examples/example.txt", "r") as f:
         prompt = ' '.join(f.readlines())
-    tokenizer = AutoTokenizer.from_pretrained(model_path)
 
     # Prompt phase
     input_ids = tokenizer(prompt)['input_ids']
@@ -85,7 +87,7 @@ if __name__ == '__main__':
         batch = swiftllm.SubBatch()
         for i in gpu_req_ids:
             reqs[i] = swiftllm.create_request(input_ids, i)
-            batch.add_pref(reqs[i], is_gpu=False)
+            batch.add_pref(reqs[i], is_gpu=True)
         gpu_reqs = [reqs[i] for i in gpu_req_ids]
         engine.step([batch])
 
@@ -93,19 +95,19 @@ if __name__ == '__main__':
         batch = swiftllm.SubBatch()
         for i in range(ngpu_prompts // 2, nprompts // 2):
             reqs[i] = swiftllm.create_request(input_ids, i)
-            batch.add_pref(reqs[i], is_gpu=True)
-        engine.step([batch], cur_swap_in=gpu_reqs)
+            batch.add_pref(reqs[i], is_gpu=False)
+        engine.step([batch])
 
         batch = swiftllm.SubBatch()
         for i in range(nprompts // 2 + ngpu_prompts // 2, nprompts):
             reqs[i] = swiftllm.create_request(input_ids, i)
             batch.add_pref(reqs[i], is_gpu=False)
-        engine.step([batch], cur_swap_out=reqs[ngpu_prompts // 2: nprompts // 2])
+        engine.step([batch])
 
     print("Prompt phase done")
 
     # model.turn_on_perf_monitor()
-    for _ in range(10):
+    for niter in range(16):
         batches = [swiftllm.SubBatch() for _ in range(2)]
         for i in range(ngpu_prompts // 2):
             batches[0].add_gdec(reqs[i])
@@ -123,7 +125,7 @@ if __name__ == '__main__':
         start = time.perf_counter()
         engine.step(batches)
         end = time.perf_counter()
-        print(f"E2E decoding time: {(end - start) * 1000:.4f} ms")
+        print(f"Iteration {niter:3} E2E time: {(end - start) * 1000:.4f} ms")
     
     for i in range(nprompts):
         if i in (0, nprompts // 2 - 1, nprompts - 1):

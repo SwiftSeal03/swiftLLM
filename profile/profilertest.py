@@ -59,6 +59,7 @@ def run_test_case(
             batchmds[i].add_cdec(l)
 
     print("Start real test...")
+    # pylint: disable=protected-access
     real_res = ModelPerfResult.mean_all(engine.profiler._run_test_case(
         pref_lens, gdec_lens, cdec_lens
     ))

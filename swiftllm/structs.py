@@ -78,12 +78,14 @@ class Request:
         """
         return [req.seq_len for req in reqs]
 
+
     @staticmethod
     def get_input_tokens(reqs: list["Request"]) -> list[list[int]]:
         """
         Get the concatenated input tokens for model forward pass
         """
         return sum([req.prompt_token_ids if req.output_len == 0 else req.output_token_ids[-1:] for req in reqs], [])
+
 
     @staticmethod
     def update_output(reqs: list["Request"], output_toks: list[int]) -> list["Request"]:
@@ -104,7 +106,7 @@ class Request:
         return finished_reqs
             
 
-    def __get_state__(self):
+    def __getstate__(self):
         """
         Get the state of the request for serialization, we only pass useful information
         """
@@ -116,7 +118,8 @@ class Request:
             "request_id": self.request_id
         }
     
-    def __set_state__(self, state):
+    
+    def __setstate__(self, state):
         """
         Set the state of the request from the serialized state
         """
@@ -202,6 +205,8 @@ class BatchPerfData:
     def cpu_time(self) -> float:
         return self.cdec_T + self.lnch_T
 
+        
+
 class SubBatch:
     """
     A sub-batch of requests
@@ -213,7 +218,7 @@ class SubBatch:
         self.gdec_reqs = []
         self.cdec_reqs = []
         self.perfdata = BatchPerfData(predictor)  
-    
+   
     def __len__(self):
         return self.perfdata.x
 
@@ -254,6 +259,7 @@ class SubBatch:
         # pylint: disable=attribute-defined-outside-init
         self.batch_size = self.perfdata.x # post-layer
         self.iter_width = self.perfdata.s # post-layer
+        del self.perfdata
 
         self.num_cprfs = len(self.cprf_reqs)
         self.num_gprfs = len(self.gprf_reqs)
@@ -264,6 +270,7 @@ class SubBatch:
 
         self.all_reqs = self.cprf_reqs + self.gprf_reqs + self.gdec_reqs + self.cdec_reqs
         assert all(req.request_id >= 0 for req in self.all_reqs), "Request ID not set"
+        del self.cprf_reqs, self.gprf_reqs, self.gdec_reqs, self.cdec_reqs
 
         self.seq_ids_list = Request.get_ids(self.all_reqs)
         self.seq_lens_list = Request.get_lens(self.all_reqs)
@@ -283,7 +290,7 @@ class SubBatch:
             seq_block_size //= 2
         self.seq_block_size = seq_block_size
         self.num_seq_blocks = (max_gdec_toks + seq_block_size - 1) // seq_block_size
-        
+
 
     def print_profile(self):
         print(f"cprf lens: {[req.prompt_len for req in self.cprf_reqs]}, gprf lens: {[req.prompt_len for req in self.gprf_reqs]}, "

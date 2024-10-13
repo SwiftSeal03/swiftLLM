@@ -28,7 +28,7 @@ class EngineConfig:
     max_prefill_tokens: int
     max_tokens_in_batch: int
 
-    # External library path
+    # External paths
     library_path: str = None
     profile_result_path: str = None
 
@@ -36,6 +36,9 @@ class EngineConfig:
     extra_layer_for_cprf: bool = False # Fixed after initialization
     monitor_performance: bool = False  # Can be altered while running
     always_use_gpu: bool = False       # Can be altered while running
+
+    # Parallel parameter
+    tensor_parallel_degree: int = 1
 
     @property
     def max_seq_len(self) -> int:

@@ -10,4 +10,4 @@ from swiftllm.worker.model import LlamaModel, ModelPerfResult
 from swiftllm.structs import create_request, SubBatch
 
 # The Profiler
-from swiftllm.worker.profiler import ModelProfiler
+from swiftllm.server.profiler import ModelProfiler

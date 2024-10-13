@@ -84,6 +84,7 @@ class Swapper:
         Swap blocks between the GPU and CPU, the physical indexes of the blocks are given.
         """
         # pylint: disable=too-many-arguments, c-extension-no-member
+        assert len(src_block_ids) == len(dst_block_ids), "Length mismatch between src_block_ids and dst_block_ids"
         if not src_block_ids:
             return
         swiftllm_c.swap_blocks(

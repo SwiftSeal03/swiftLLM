@@ -9,6 +9,8 @@ import itertools
 
 import numpy as np
 import torch
+import torch.distributed as dist
+import ray
 
 from swiftllm.engine_config import EngineConfig
 from swiftllm.model_config import LlamaModelConfig
@@ -47,6 +49,7 @@ class ModelPerfResult:
     ModelPerfResult - A class that represents the performance results of a forward pass of a model.
     """
 
+    # pylint: disable=too-many-instance-attributes
     fields_to_dump = [
         "avg_linr_time",
         "avg_pref_time",
@@ -115,59 +118,37 @@ class LlamaModel:
     LlamaModel - A Llama model that can be used for inference.
 
     This class also acts as a "worker" that resides on a particular GPU, waiting
-    for the control plane (the scheduler) to send commands.
+    for the control plane (the executor) to send commands.
 
     To initialize, please:
     - call __init__()
     - call load_weights()
-    - call profile_num_blocks() on one worker
     - call init_kvcache_and_swap()
     """
 
     @torch.inference_mode()
     def __init__(
         self,
-        engine_config: EngineConfig
+        engine_config: EngineConfig,
+        model_config: LlamaModelConfig,
+        rank: int=0
     ):
         """
         Initialize the LlamaModel.
+
+        Loads model weights, inits RoPE cache, and initializes layers.
+
+        The block tables are not initialized here, as num_blocks is not known yet.
         """
         self.engine_config = engine_config
+        self.model_config = model_config
+        self.rank = rank
 
-        # Load model config
-        self.model_config = LlamaModelConfig.load_from_model_path(engine_config.model_path)
-
-        # Weight and RoPE cache
-        self.weight = None
-        self._cos_cached = self._sin_cached = None
-
-        # Layers
-        self.pre_layer = None
-        self.transformer_layers = None
-        self.post_layer = None
-
-        # Swapper
-        self.swapper = None
-
-        # Cached cos and sin values for RoPE
-        self.cos_cached = None
-        self.sin_cached = None
-
+        # CPU kernel library & stream
         if engine_config.library_path:
-            torch.ops.load_library(engine_config.library_path)
-        
+            torch.ops.load_library(engine_config.library_path)        
         self.cpu_communication_stream = torch.cuda.Stream()
 
-        # List of performance results, unused if monitor_performance is False
-        self.perf_results = []
-        self.events = ModelEvents(engine_config)
-
-
-    @torch.inference_mode()
-    def load_weights(self):
-        """
-        Load weights and initialize layers
-        """
         # Load weights
         self.weight = load_weights(
             self.model_config,
@@ -175,9 +156,6 @@ class LlamaModel:
             self.engine_config.model_path,
             self.engine_config.use_dummy
         )
-
-        # Initialize rotary embeddings
-        self._init_to_get_rotary()
 
         # Initialize layers
         self.pre_layer = LlamaPreLayer(self.model_config, self.weight)
@@ -193,6 +171,18 @@ class LlamaModel:
             for layer_id in range(self.model_config.num_layers)
         ]
         self.post_layer = LlamaPostLayer(self.model_config, self.weight)
+
+        # Initialize rotary embeddings
+        self.cos_cached = None
+        self.sin_cached = None
+        self._init_to_get_rotary()
+
+        # Swapper
+        self.swapper = None
+
+        # List of performance results, unused if monitor_performance is False
+        self.perf_results = []
+        self.events = ModelEvents(engine_config)
     
 
     @torch.inference_mode()
@@ -273,7 +263,7 @@ class LlamaModel:
         self.events.pf_record("lstg_e")
 
         ffn_out += residual_buf
-        output_tokens = self.post_layer.forward(ffn_out, batch)
+        output_tokens = self.post_layer.forward(ffn_out, batch).tolist()
 
         self.events.pf_record("frwd_e")
         # duration = time.perf_counter() - start
@@ -325,7 +315,7 @@ class LlamaModel:
 
         f0 += residual_bufs[0]
         f1 += residual_bufs[1]
-        output_tokens = self.post_layer.forward_double(f0, f1, batches)
+        output_tokens = self.post_layer.forward_double(f0, f1, batches).tolist()
 
         self.events.pf_record("frwd_e")
 
@@ -336,7 +326,7 @@ class LlamaModel:
     
     
     @torch.inference_mode()
-    def forward_batches(self, batches: list[SubBatch]) -> list[int]:
+    def _forward_batches(self, batches: list[SubBatch]) -> list[int]:
         """
         Run a forward pass of the LlamaModel.
 
@@ -373,11 +363,12 @@ class LlamaModel:
         """
         self.swapper.set_block_tables(mappings)
 
-        with torch.cuda.stream(self.cpu_communication_stream):
-            for layer_id in range(self.model_config.num_layers):
-                self.swapper.swap_blocks(*swappings, is_swap_out, layer_id, layer_id)
+        if swappings[0]:
+            with torch.cuda.stream(self.cpu_communication_stream):
+                for layer_id in range(self.model_config.num_layers):
+                    self.swapper.swap_blocks(*swappings, is_swap_out, layer_id, layer_id)
 
-        return self.forward_batches(batches)
+        return self._forward_batches(batches)
     
 
     def turn_on_perf_monitor(self):
@@ -387,7 +378,7 @@ class LlamaModel:
         self.engine_config.monitor_performance = True
 
 
-    def flush_perf_results_and_turn_off_perf_monitor(self):
+    def turn_off_perf_monitor_and_flush_results(self):
         """
         Flush the performance results and turn off performance monitoring.
         """
@@ -396,3 +387,28 @@ class LlamaModel:
         self.perf_results = []
         return ret
         
+
+@ray.remote(num_gpus=1)
+class RemoteLlamaModel(LlamaModel):
+    """
+    RemoteLlamaModel - A remote Llama model that can be used for inference.
+    """
+    
+    @torch.inference_mode()
+    def __init__(
+        self,
+        engine_config: EngineConfig,
+        model_config: LlamaModelConfig,
+        rank: int=0
+    ):
+        """
+        Initialize the RemoteLlamaModel.
+        """
+        
+        dist.init_process_group(
+            backend="nccl", 
+            world_size=engine_config.tensor_parallel_degree, 
+            rank=rank
+        )
+        super().__init__(engine_config, model_config, rank)
+
