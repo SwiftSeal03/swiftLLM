@@ -133,14 +133,15 @@ class Request:
 def create_request(
     prompt_token_ids: list[int], 
     req_id: int, 
-    output_len: int=1e9, 
-    output_token_ids: list[int] | None = None
+    output_token_ids: list[int] | None = None,
+    quick_stop: bool = False
 ) -> Request:
-    ret = Request(RawRequest("", output_len))
+    ret = Request(RawRequest("", 0))
     ret.prompt_token_ids = prompt_token_ids
     ret.output_token_ids = output_token_ids or []
     ret.prompt_len = len(ret.prompt_token_ids)
     ret.output_len = len(ret.output_token_ids)
+    ret.max_output_len = ret.output_len + 1 if quick_stop else 10 ** 9
     ret.request_id = req_id
     return ret
 

@@ -69,7 +69,9 @@ class SingleProcExecutor(Executor):
     ):
         self.engine_config = engine_config
         self.model_config = model_config
-        self.model = LlamaModel(engine_config, model_config)
+        tpd = engine_config.tensor_parallel_degree
+        assert tpd == 1, f"SingleProcExecutor does not support tensor parallelism degree({tpd}) == 1"
+        self.model = LlamaModel(engine_config, model_config, rank=0)
 
     
     def init_kvcache_and_swap(self):
@@ -104,7 +106,7 @@ class RayExecutor(Executor):
         self.model_config = model_config
 
         num_workers = engine_config.tensor_parallel_degree
-        self.models = [RemoteLlamaModel.remote(engine_config, model_config, i) for i in range(num_workers)]
+        self.models = [RemoteLlamaModel.remote(engine_config, model_config, rank=i) for i in range(num_workers)]
     
     def init_kvcache_and_swap(self):
         ray.get([model.init_kvcache_and_swap.remote() for model in self.models])

@@ -33,6 +33,9 @@ class LlamaModelConfig:
             self.rope_scaling = 1.0
         assert model_config["hidden_act"] == "silu"
 
+        self.rank = None
+        self.world_size = None
+
     def get_kvslot_size(self, dtype: torch.dtype = torch.float16) -> int:
         """
         Get the size of one kv slot (the kv cache of one token) (in bytes)

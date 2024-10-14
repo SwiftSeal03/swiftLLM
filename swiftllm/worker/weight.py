@@ -11,7 +11,17 @@ class RegisteredWeightItem:
     attr_name: str
     key: str
     shape: tuple
+    split: tuple # same shape as above, each element is a boolean indicating whether to split the tensor on that dimension
     dtype: torch.dtype
+
+    @property
+    def shape_with_split(self):
+        return zip(self.shape, self.split)
+
+    def get_real_shape(self, ws: int):
+        return tuple(size // ws if split else size for size, split in self.shape_with_split)
+
+
 
 class WeightBase:
     """
@@ -24,8 +34,10 @@ class WeightBase:
     function, which should return the corresponding weight value (real/dummy).
     """
 
-    def __init__(self):
-        self.registered_weights = []
+    def __init__(self, model_config: LlamaModelConfig, dtype: torch.dtype):
+        self.model_config = model_config
+        self.dtype = dtype
+        self.registered_weights: list[RegisteredWeightItem] = []
 
     def register_weight(self, item: RegisteredWeightItem):
         self.registered_weights.append(item)
@@ -41,14 +53,24 @@ class WeightBase:
         """
         Load weights
         """
+        ws = self.model_config.world_size
         for item in self.registered_weights:
+            assert len(item.split) == len(item.shape), f"Length mismatch between split and shape for {item.attr_name}"
+            assert all(
+                not split or size % ws == 0 
+                for size, split in item.shape_with_split
+            ), f"Cannot split tensor {item.attr_name} with shape {item.shape} into {ws} parts"
+
             weight_value = getter(item)
+
             assert weight_value is not None, f"getter() returned None for {item.key} ({item})"
             assert isinstance(weight_value, torch.Tensor), f"Weight {item.key} is not a tensor"
-            assert weight_value.shape == item.shape, f"Shape of weight {item.key} does not match"
+            assert weight_value.shape == item.get_real_shape(ws), \
+                f"Shape of weight {item.key} does not match {weight_value.shape} != {item.get_real_shape(ws)}"
             assert weight_value.device.type == "cuda", f"Weight {item.key} is not on GPU"
             setattr(self, item.attr_name, weight_value.to(item.dtype))
         self._post_process_after_load(getter)
+
 
 
 class LlamaTransformerLayerWeight(WeightBase):
@@ -62,40 +84,43 @@ class LlamaTransformerLayerWeight(WeightBase):
         model_config: LlamaModelConfig,
         dtype: torch.dtype
     ):
-        super().__init__()
+        super().__init__(model_config, dtype)
 
         self.layer_id = layer_id
-        self.model_config = model_config
-        self.dtype = dtype
 
         self.register_weight(RegisteredWeightItem(
             "attn_norm",
             f"model.layers.{self.layer_id}.input_layernorm.weight",
             (self.model_config.hidden_size,),
+            (False,),
             self.dtype
         ))
         self.register_weight(RegisteredWeightItem(
             "q_proj",
             f"model.layers.{self.layer_id}.self_attn.q_proj.weight",
             (self.model_config.hidden_size, self.model_config.hidden_size),
+            (True, False),
             self.dtype
         ))
         self.register_weight(RegisteredWeightItem(
             "k_proj",
             f"model.layers.{self.layer_id}.self_attn.k_proj.weight",
             (self.model_config.num_kv_heads*self.model_config.head_dim, self.model_config.hidden_size),
+            (True, False),
             self.dtype
         ))
         self.register_weight(RegisteredWeightItem(
             "v_proj",
             f"model.layers.{self.layer_id}.self_attn.v_proj.weight",
             (self.model_config.num_kv_heads*self.model_config.head_dim, self.model_config.hidden_size),
+            (True, False),
             self.dtype
         ))
         self.register_weight(RegisteredWeightItem(
             "o_proj",
             f"model.layers.{self.layer_id}.self_attn.o_proj.weight",
             (self.model_config.hidden_size, self.model_config.hidden_size),
+            (False, True),
             self.dtype
         ))
 
@@ -103,24 +128,28 @@ class LlamaTransformerLayerWeight(WeightBase):
             "ffn_norm",
             f"model.layers.{self.layer_id}.post_attention_layernorm.weight",
             (self.model_config.hidden_size,),
+            (False,),
             self.dtype
         ))
         self.register_weight(RegisteredWeightItem(
             "up_proj",
             f"model.layers.{self.layer_id}.mlp.up_proj.weight",
             (self.model_config.ffn_inter_dim, self.model_config.hidden_size),
+            (True, False),
             self.dtype
         ))
         self.register_weight(RegisteredWeightItem(
             "gate_proj",
             f"model.layers.{self.layer_id}.mlp.gate_proj.weight",
             (self.model_config.ffn_inter_dim, self.model_config.hidden_size),
+            (True, False),
             self.dtype
         ))
         self.register_weight(RegisteredWeightItem(
             "down_proj",
             f"model.layers.{self.layer_id}.mlp.down_proj.weight",
             (self.model_config.hidden_size, self.model_config.ffn_inter_dim),
+            (False, True),
             self.dtype
         ))
 
@@ -132,33 +161,34 @@ class LlamaTransformerLayerWeight(WeightBase):
         del self.up_proj, self.gate_proj
 
 
+
 class LlamaWeight(WeightBase):
     def __init__(
         self,
         model_config: LlamaModelConfig,
         dtype: torch.dtype
     ):
-        super().__init__()
-
-        self.model_config = model_config
-        self.dtype = dtype
+        super().__init__(model_config, dtype)
 
         self.register_weight(RegisteredWeightItem(
             "wte",
             "model.embed_tokens.weight",
             (self.model_config.vocab_size, self.model_config.hidden_size),
+            (True, False),
             self.dtype
         ))
         self.register_weight(RegisteredWeightItem(
             "lm_head",
             "lm_head.weight",
             (self.model_config.vocab_size, self.model_config.hidden_size),
+            (True, False),
             self.dtype
         ))
         self.register_weight(RegisteredWeightItem(
             "final_norm",
             "model.norm.weight",
             (self.model_config.hidden_size,),
+            (False,),
             self.dtype
         ))
 
@@ -172,6 +202,7 @@ class LlamaWeight(WeightBase):
             layer.load_weights(getter)
 
 
+
 def load_weights(
     model_config: LlamaModelConfig,
     dtype: torch.dtype,
@@ -181,7 +212,10 @@ def load_weights(
     """
     Load weights from a given path
     """
+    rk = model_config.rank
+    ws = model_config.world_size
     if use_dummy:
+        assert rk == 0 and ws == 1, "Model sharding is not supported for dummy weights"
         def weight_getter_dummy(item: RegisteredWeightItem):
             return torch.empty(item.shape, dtype=item.dtype, device="cuda").uniform_(-0.001, 0.001)
         getter = weight_getter_dummy
@@ -206,12 +240,20 @@ def load_weights(
                 file_path = os.path.join(model_path, file_name)
                 # For safetensor files, since "opening" it is cheap, we open it every time
                 with safetensors.safe_open(file_path, framework="pt", device="cuda") as f:
-                    tensor = f.get_tensor(item.key)
+                    whole = f.get_slice(item.key)
+                    slices = [
+                        slice(rk * size // ws, (rk + 1) * size // ws) 
+                        if split else slice(0, size)
+                        for size, split in item.shape_with_split
+                    ]
+                    tensor = whole[slices]        
                 return tensor.to(item.dtype)
             getter = weight_getter_real
 
         else:
             # Use PyTorch
+            # TODO: support Model sharding for PyTorch files
+            assert rk == 0 and ws == 1, "Model sharding is not supported for PyTorch files"
             pytorch_index_path = os.path.join(model_path, "pytorch_model.bin.index.json")
             if os.path.exists(pytorch_index_path):
                 # The weight is stored in multiple files

@@ -26,11 +26,14 @@ class Swapper:
         self.engine_config = engine_config
         self.model_config = model_config
 
+        num_q_heads = model_config.num_q_heads // model_config.world_size
+        num_kv_heads = model_config.num_kv_heads // model_config.world_size
+
         # Initialize KV cache
         kvcache_shape = (
             model_config.num_layers + engine_config.extra_layer_for_cprf,
             engine_config.num_gpu_blocks,
-            model_config.num_kv_heads,
+            num_kv_heads,
             engine_config.block_size,
             model_config.head_dim
         )
@@ -43,7 +46,7 @@ class Swapper:
         kvswap_shape = (
             model_config.num_layers,
             engine_config.num_cpu_blocks,
-            model_config.num_kv_heads,
+            num_kv_heads,
             engine_config.block_size,
             model_config.head_dim
         )
@@ -51,14 +54,13 @@ class Swapper:
         self.v_swap = torch.zeros(kvswap_shape, dtype=torch.float16, device="cpu", pin_memory=True)
 
         # Initialize CPU QKV buffer
-        q_cpu_shape = (engine_config.max_batch_size, model_config.num_q_heads, model_config.head_dim)
-        o_cpu_shape = (engine_config.max_batch_size, model_config.num_q_heads * model_config.head_dim)
-        kv_cpu_shape = (engine_config.max_batch_size, model_config.num_kv_heads, model_config.head_dim)
-        self.q_cpu = torch.zeros(q_cpu_shape, dtype=torch.float16, device="cpu", pin_memory=True)
+        qo_cpu_shape = (engine_config.max_batch_size, num_q_heads, model_config.head_dim)
+        kv_cpu_shape = (engine_config.max_batch_size, num_kv_heads, model_config.head_dim)
+        self.q_cpu = torch.zeros(qo_cpu_shape, dtype=torch.float16, device="cpu", pin_memory=True)
         self.k_cpu = torch.zeros(kv_cpu_shape, dtype=torch.float16, device="cpu", pin_memory=True)
         self.v_cpu = torch.zeros(kv_cpu_shape, dtype=torch.float16, device="cpu", pin_memory=True)
         # We store float32 tensors for the output, but convert them to float16 after copying back to GPU
-        self.o_cpu = torch.zeros(o_cpu_shape, dtype=torch.float32, device="cpu", pin_memory=True)
+        self.o_cpu = torch.zeros(qo_cpu_shape, dtype=torch.float32, device="cpu", pin_memory=True)
 
         self.gpu_block_table = torch.zeros(
             (engine_config.max_seqs_in_block_table, engine_config.max_blocks_per_seq),

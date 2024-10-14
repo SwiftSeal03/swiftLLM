@@ -86,8 +86,6 @@ class ModelProfiler:
 
         nbatches = len(pref_lens)
         assert nbatches in (1, 2), "Only support 1 or 2 batches"
-        if cdec_lens:
-            print(cdec_lens)
 
         batches = []
         offs = 0
@@ -98,19 +96,23 @@ class ModelProfiler:
             ncdec = len(cdec_lens[i])
 
             for j in range(npref):
-                batch.add_pref(create_request([10] * pref_lens[i][j], offs + j), is_gpu=True)
+                batch.add_pref(create_request([10] * pref_lens[i][j], offs + j, [], True), is_gpu=True)
 
             for j in range(ngdec):
-                batch.add_gdec(create_request([10] * (gdec_lens[i][j] - 1), offs + npref + j, output_token_ids=[10]))
+                batch.add_gdec(create_request([10] * (gdec_lens[i][j] - 1), offs + npref + j, [10], True))
 
             for j in range(ncdec):
-                batch.add_cdec(create_request([10] * (cdec_lens[i][j] - 1), offs + npref + ngdec + j, output_token_ids=[10]))
+                batch.add_cdec(create_request([10] * (cdec_lens[i][j] - 1), offs + npref + ngdec + j, [10], True))
 
             offs += npref + ngdec + ncdec
-
-            batch.set_model_forward_args(self.model_config)
-            mappings = self.bm.alloc_blocks_for_batch(batch)
             batches.append(batch)
+
+        if self.bm is None:
+            for batch in batches:
+                batch.set_model_forward_args(self.model_config)
+            args = (([], []), ([], [])), ([], [])      
+        else: 
+            args = self.bm.prepare(batches, [], [])
                   
         start = 0.0
         for i in range(-nwarmup, nrepeat):
@@ -118,12 +120,13 @@ class ModelProfiler:
                 start = time.perf_counter()
                 self.executor.turn_on_perf_monitor()
             # Directly call this since we already allocated the blocks
-            self.executor.do_one_iteration(batches, mappings, ([], []))
-
+            output_tokens = self.executor.do_one_iteration(batches, *args)
         elapsed = time.perf_counter() - start
         print(f"Elapsed time: {elapsed * 1000 / nrepeat:.3f} ms")
 
-        self.bm.free_blocks_of_requests(sum([batch.all_reqs for batch in batches], []))
+        if self.bm is not None:
+            # The requests would all finish due to quick-stop.
+            self.bm.update_and_free(batches, output_tokens)
 
         res = self.executor.turn_off_perf_monitor_and_flush_results()
         return res
@@ -391,37 +394,48 @@ class ModelProfiler:
 
         Finally, we set the number of GPU blocks in the engine configuration.
         """
-        torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats()
+        if self.engine_config.profile_num_blocks:
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats()
 
-        engine_config = self.engine_config
-        model_config = self.model_config
+            engine_config = self.engine_config
+            model_config = self.model_config
+            ws = self.engine_config.tensor_parallel_degree
 
-        # Synthesis a prefill batch
-        N = engine_config.max_tokens_in_batch
-        S = engine_config.max_batch_size
-        self._run_test_case_seq(
-            pref_lens=[N // S] * (S - N % S) + [N // S + 1] * (N % S),
-            gdec_lens=[],
-            cdec_lens=[],
-            nrepeat=1, nwarmup=0
-        )
-        torch.cuda.synchronize()
-
-        # peak_memory = torch.cuda.max_memory_allocated()
-        # total_memory = torch.cuda.get_device_properties(0).total_memory
-        free_memory, total_memory = torch.cuda.mem_get_info()
-        peak_memory = total_memory - free_memory
-        useable_memory = total_memory * engine_config.gpu_mem_utilization
-        print(f"[executor.profile] GPU total memory: {total_memory/GB:.2f} GB, runtime peak memory: {peak_memory/GB:.2f} GB")
-        if useable_memory < peak_memory:
-            raise RuntimeError(
-                f"Peak memory {peak_memory/GB:.2f} GB exceeds usable memory {useable_memory/GB:.2f} GB "
-                f"({total_memory/GB:.2f} GB * {engine_config.gpu_mem_utilization})"
+            # Synthesis a prefill batch
+            N = engine_config.max_tokens_in_batch
+            S = engine_config.max_batch_size
+            self._run_test_case_seq(
+                pref_lens=[N // S] * (S - N % S) + [N // S + 1] * (N % S),
+                gdec_lens=[],
+                cdec_lens=[],
+                nrepeat=1, nwarmup=0
             )
-        block_size_bytes = engine_config.block_size * model_config.get_kvslot_size()
-        num_gpu_blocks = math.floor((useable_memory - peak_memory) / block_size_bytes)
+            torch.cuda.synchronize()
 
-        torch.cuda.empty_cache()
-        engine_config.num_gpu_blocks = num_gpu_blocks
-        engine_config.max_prefill_tokens = min(engine_config.max_prefill_tokens, num_gpu_blocks * engine_config.block_size)
+            # peak_memory = torch.cuda.max_memory_allocated()
+            # total_memory = torch.cuda.get_device_properties(0).total_memory
+            peak_memory = 0
+            for i in range(ws):
+                free_memory, total_memory = torch.cuda.mem_get_info(i)
+                single_peak_memory = total_memory - free_memory
+                peak_memory = max(peak_memory, single_peak_memory)
+            useable_memory = total_memory * engine_config.gpu_mem_utilization
+            print(f"[Engine.profiler] GPU total memory: {total_memory/GB:.2f} GB, runtime peak memory: {peak_memory/GB:.2f} GB")
+            if useable_memory < peak_memory:
+                raise RuntimeError(
+                    f"Peak memory {peak_memory/GB:.2f} GB exceeds usable memory {useable_memory/GB:.2f} GB "
+                    f"({total_memory/GB:.2f} GB * {engine_config.gpu_mem_utilization})"
+                )
+            block_size_bytes = engine_config.block_size * model_config.get_kvslot_size()
+            num_gpu_blocks = math.floor((useable_memory - peak_memory) / block_size_bytes)
+
+            torch.cuda.empty_cache()
+            engine_config.num_gpu_blocks = num_gpu_blocks
+            engine_config.max_prefill_tokens = min(engine_config.max_prefill_tokens, num_gpu_blocks * engine_config.block_size)
+
+        num_gpu_blocks = self.engine_config.num_gpu_blocks
+        num_cpu_blocks = self.engine_config.num_cpu_blocks
+        block_size_bytes = self.engine_config.block_size*self.model_config.get_kvslot_size()
+        print(f"[Engine.profiler] Number of GPU blocks: {num_gpu_blocks} ({num_gpu_blocks*block_size_bytes/GB:.2f} GB)")
+        print(f"[Engine.profiler] Number of CPU blocks: {num_cpu_blocks} ({num_cpu_blocks*block_size_bytes/GB:.2f} GB)")

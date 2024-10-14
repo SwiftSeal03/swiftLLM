@@ -11,7 +11,7 @@ ext_modules = [
             "src/entrypoints.cpp",
 			"src/block_swapping.cpp",
             "src/small_kernels.cu",
-            "src/attention.cu",
+            # "src/attention.cu",
             "src/linear.cu",
         ],
         extra_compile_args={

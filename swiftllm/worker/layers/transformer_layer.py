@@ -4,6 +4,7 @@ Transformer layer utilities in the Llama model
 
 import time
 import torch
+import torch.distributed as dist
 import vllm_flash_attn_2_cuda as flash_attn_cuda
 # import vllm_flash_attn
 
@@ -126,10 +127,6 @@ class LlamaTransformerLayer:
         # Set after KV cache initialization
         self.swapper = None
 
-        # Set before forward
-        self.batches = None
-        self.input_embedss = None
-        self.residual_bufs = None
 
     def set_swapper(self, swapper: Swapper):
         """
@@ -137,18 +134,6 @@ class LlamaTransformerLayer:
         """
         self.swapper = swapper
 
-    def set_batches_and_buffers(
-        self, 
-        batches: list[SubBatch],
-        input_embedss: list[torch.Tensor],
-        residual_bufs: list[torch.Tensor]
-    ):
-        """
-        Set the batches and buffers for the forward pass
-        """
-        self.batches = batches
-        self.input_embedss = input_embedss
-        self.residual_bufs = residual_bufs
 
     def _comm_wait_compute(self):
         """
@@ -156,24 +141,31 @@ class LlamaTransformerLayer:
         """
         self.cpu_communication_stream.wait_stream(torch.cuda.default_stream())
 
+
     def _compute_wait_comm(self):
         """
         Do computation after necessary communication
         """
         torch.cuda.default_stream().wait_stream(self.cpu_communication_stream)
 
+
+    def _maybe_allreduce(self, x: torch.Tensor):
+        if self.model_config.world_size > 1:
+            dist.all_reduce(x)
+
+
     def _transfer_qkv(
         self,
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        batch_id: int = 0,
+        batch: SubBatch,
         cur_stage: int = 0
     ):
         """
         Initiate transfer of QKV to CPU buffers
         """
-        batch = self.batches[batch_id]
+        self._comm_wait_compute()
         if batch.num_cdecs > 0:
             with torch.cuda.stream(self.cpu_communication_stream):
                 qc = self.swapper.q_cpu[:batch.num_cdecs]
@@ -184,14 +176,14 @@ class LlamaTransformerLayer:
                 vc.copy_(v[-batch.num_cdecs:], non_blocking=True)
                 self.events[cur_stage].qkvtr_e.record()
 
+
     def _swap_out_blocks(
         self,
-        batch_id: int = 0
+        batch: SubBatch,
     ):
         """
         Swap blocks from GPU to CPU, assume that new prefilled KVs are ready in the last stage
         """
-        batch = self.batches[batch_id]
         if batch.num_cprfs > 0:
             with torch.cuda.stream(self.cpu_communication_stream):
                 self.swapper.swap_blocks(
@@ -202,32 +194,33 @@ class LlamaTransformerLayer:
                     cpu_layer=self.layer_id
                 )
 
+
     def _preproj(
         self,
-        input_embds: torch.Tensor,
-        batch_id: int = 0,
+        embeddings: torch.Tensor,
+        batch: SubBatch,
         layer_off: int = 0
     ) -> tuple[torch.Tensor]:
         """
         Perform pre-projection, including RMSNorm, QKV calculation, and rotary embedding
         """
-        batch = self.batches[batch_id]
         weight = self.weight if not layer_off else self.next_layer_weight
 
+        self._maybe_allreduce(embeddings)
         fused_add_rmsnorm_inplace(
-            input_embds,
-            self.residual_bufs[batch_id],
+            embeddings,
+            batch.residual_buf,
             weight.attn_norm,
             self.model_config.rms_norm_eps
         )
 
         # Calculate QKV
-        q = linear(input_embds, weight.q_proj)		# [num_total_tokens, hidden_size]
-        k = linear(input_embds, weight.k_proj)		# [num_total_tokens, num_kv_heads*head_dim]
-        v = linear(input_embds, weight.v_proj)		# [num_total_tokens, num_kv_heads*head_dim]
-        q = q.view(-1, self.model_config.num_q_heads,  self.model_config.head_dim)
-        k = k.view(-1, self.model_config.num_kv_heads, self.model_config.head_dim)
-        v = v.view(-1, self.model_config.num_kv_heads, self.model_config.head_dim)
+        q = linear(embeddings, weight.q_proj)		# [iter_width, hidden_size / ws]
+        k = linear(embeddings, weight.k_proj)		# [iter_width, num_kv_heads / ws * head_dim]
+        v = linear(embeddings, weight.v_proj)		# [iter_width, num_kv_heads / ws * head_dim]
+        q = q.view(batch.iter_width, -1, self.model_config.head_dim)
+        k = k.view(batch.iter_width, -1, self.model_config.head_dim)
+        v = v.view(batch.iter_width, -1, self.model_config.head_dim)
 
         # Rotary emb
         rotary_embedding_inplace(
@@ -241,6 +234,8 @@ class LlamaTransformerLayer:
         if batch.num_prefs > 0 and self.swapper is not None:
             gpu_layer = (self.layer_id + layer_off) % self.model_config.num_layers
             itm_layer = self.model_config.num_layers if self.engine_config.extra_layer_for_cprf else gpu_layer
+            # NOTE: if swapping is too slow, there's risk that we writes to what's being swapped out
+            self._compute_wait_comm()
             store_kvcache(
                 k,
                 v,
@@ -257,22 +252,22 @@ class LlamaTransformerLayer:
             )
 
         return q, k, v
-    
+
+
     def _attention(
         self,
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        batch_id: int = 0,
+        batch: SubBatch,
         cur_stage: int = 0 # also as the offset of layer_id
     ):
         """
         Stores attention output of current batch into buffer o
         """
 
-        batch = self.batches[batch_id]
         events = self.events[cur_stage]
-        o = self.input_embedss[batch_id].view(-1, self.model_config.num_q_heads, self.model_config.head_dim)
+        o = batch.attn_out_buf.view(batch.iter_width, -1, self.model_config.head_dim)
         cur_layer_id = (self.layer_id + cur_stage) % self.model_config.num_layers
 
         if batch.num_prefs > 0:
@@ -339,7 +334,6 @@ class LlamaTransformerLayer:
         events.pf_record("gdec_e")
                 
         if batch.num_cdecs > 0:
-            og = o[-batch.num_cdecs:, :].view(-1, self.model_config.hidden_size)
             oc = self.swapper.o_cpu[:batch.num_cdecs]
             events.pf_time("lnch_m")
             self.events[cur_stage].qkvtr_e.synchronize()
@@ -360,24 +354,28 @@ class LlamaTransformerLayer:
             )
             events.pf_time("cdec_e")
             with torch.cuda.stream(self.cpu_communication_stream):
-                og.copy_(oc, non_blocking=True)
+                o[-batch.num_cdecs:, :].copy_(oc, non_blocking=True)
         else:
             events.pf_time_nocpu()
+        self._compute_wait_comm() # Wait for CPU decoding to finish
+
 
     def _postproj(
         self,
-        batch_id: int = 0
+        batch: SubBatch        
     ) -> torch.Tensor:
-        o = linear(self.input_embedss[batch_id], self.weight.o_proj)
-        fused_add_rmsnorm_inplace(o, self.residual_bufs[batch_id], self.weight.ffn_norm, self.model_config.rms_norm_eps)
-        up_gate_proj = linear(o, self.weight.up_gate_proj)
+        o = linear(batch.attn_out_buf, self.weight.o_proj)
+        self._maybe_allreduce(o)
+        fused_add_rmsnorm_inplace(o, batch.residual_buf, self.weight.ffn_norm, self.model_config.rms_norm_eps)
+        ug = linear(o, self.weight.up_gate_proj)
         del o
-        silu_and_mul_inplace(up_gate_proj)
-        ffn_out = linear(up_gate_proj[:, :self.model_config.ffn_inter_dim], self.weight.down_proj)
-        del up_gate_proj
-        return ffn_out
-    
-    def forward(self, first_embeds: torch.Tensor) -> torch.Tensor:
+        silu_and_mul_inplace(ug)
+        embeddings = linear(ug[:, :ug.shape[1] // 2], self.weight.down_proj)
+        del ug
+        return embeddings
+
+
+    def forward(self, batch: SubBatch, embeddings: torch.Tensor) -> torch.Tensor:
         """
         (fused) Add last layer's residual, and perform RMSNorm
         Before: input_embds is the output of the last FFN block, and residual_buf
@@ -388,26 +386,25 @@ class LlamaTransformerLayer:
         """
         self.events[0].pf_record("stage_s")
         self.events[0].pf_time("lnch_s")
-        self._compute_wait_comm() # Wait for swaps to finish before overwriting intermediate KV
-        q, k, v = self._preproj(first_embeds)
+        q, k, v = self._preproj(embeddings, batch)
         self.events[0].pf_record("linr_e")
-        self._comm_wait_compute() # Wait for qkv to be computed & stored
-        self._transfer_qkv(q, k, v)
-        self._attention(q, k, v)
+        self._transfer_qkv(q, k, v, batch)
+        self._attention(q, k, v, batch)
         del q, k, v
-        self._compute_wait_comm() # Wait for CPU decoding to finish
         self.events[1].pf_record("stage_s")
-        self._swap_out_blocks()
-        ffn_out = self._postproj()
+        self._swap_out_blocks(batch)
+        embeddings = self._postproj(batch)
         self.events[0].pf_time("lnch_e")
         self.events[1].pf_record("linr_e")
-        return ffn_out
+        return embeddings
+
 
     def _forward_pipeline_stage(
         self,
         q1: torch.Tensor,  # [num_tokens, num_q_heads, head_dim]
         k1: torch.Tensor,  # [num_tokens, num_kv_heads, head_dim]
         v1: torch.Tensor,  # [num_tokens, num_kv_heads, head_dim]
+        batches: list[SubBatch],
         cur_stage: int,
     ) -> tuple[torch.Tensor]:
         """
@@ -423,24 +420,24 @@ class LlamaTransformerLayer:
         """
         self.events[cur_stage].pf_record("stage_s")
         self.events[cur_stage].pf_time("lnch_s")
-        self._comm_wait_compute() # Wait for qkv to be computed & stored
-        self._transfer_qkv(q1, k1, v1, batch_id=cur_stage^1, cur_stage=cur_stage)
-        self._swap_out_blocks(batch_id=cur_stage)
-        f0 = self._postproj(batch_id=cur_stage)
-        q0, k0, v0 = self._preproj(f0, batch_id=cur_stage, layer_off=1)
-        del f0
+        self._transfer_qkv(q1, k1, v1, batches[cur_stage^1], cur_stage=cur_stage)
+        self._swap_out_blocks(batches[cur_stage])
+        e0 = self._postproj(batches[cur_stage])
+        q0, k0, v0 = self._preproj(e0, batches[cur_stage], layer_off=1)
+        del e0
         self.events[cur_stage].pf_record("linr_e")
-        self._attention(q1, k1, v1, batch_id=cur_stage^1, cur_stage=cur_stage)
-        self._compute_wait_comm() # Wait for CPU decoding & swap of last layer to finish
+        self._attention(q1, k1, v1, batches[cur_stage^1], cur_stage=cur_stage)
         self.events[cur_stage].pf_time("lnch_e")
 
         return q0, k0, v0
+
 
     def forward_double(
         self,
         q1: torch.Tensor,  # [num_tokens, num_q_heads, head_dim]
         k1: torch.Tensor,  # [num_tokens, num_kv_heads, head_dim]
         v1: torch.Tensor,  # [num_tokens, num_kv_heads, head_dim]
+        batches: list[SubBatch]
     ) -> tuple[torch.Tensor]:
         """
         Do all jobs for 1 transformer layer for 2 batches
@@ -450,60 +447,61 @@ class LlamaTransformerLayer:
             batch 0 : o0   |=>  post-projection[i] -> pre-projection[i+1]  |        attention[i+1]                     |=> [o0']
             batch 1 : qkv1 |=>       attention[i]                          | post-projection[i] -> pre-projection[i+1] |=> qkv1'
         """
-        q0, k0, v0 = self._forward_pipeline_stage(q1, k1, v1, cur_stage=0)
-        q1, k1, v1 = self._forward_pipeline_stage(q0, k0, v0, cur_stage=1)
+        q0, k0, v0 = self._forward_pipeline_stage(q1, k1, v1, batches, cur_stage=0)
+        q1, k1, v1 = self._forward_pipeline_stage(q0, k0, v0, batches, cur_stage=1)
 
         return q1, k1, v1
 
+
     def forward_first_stage(
         self,
+        embeddings: torch.Tensor,
+        batches: list[SubBatch]
     ) -> tuple[torch.Tensor]:
         """
         Do the first stage of the pipeline for 2 batches
 
-        batch0 : input_embeds0 |=> pre-projection -> attention       |=> [o0]
-        batch1 : input_embeds1 |=>                  pre-projection   |=> q1, k1, v1
+        batch0 : embeddings0 |=> pre-projection -> attention       |=> [o0]
+        batch1 : embeddings1 |=>                  pre-projection   |=> q1, k1, v1
         """
-        q0, k0, v0 = self._preproj(self.input_embedss[0], batch_id=0, layer_off=1)
+        embeddings = torch.split(embeddings, [batch.iter_width for batch in batches])
+        q0, k0, v0 = self._preproj(embeddings[0], batches[0], layer_off=1)
         self._compute_wait_comm() # Here we must make sure all swaps are done before the first attention
 
         self.events[1].pf_record("stage_s")
         self.events[1].pf_time("lnch_s")
-        self._comm_wait_compute() # Wait for qkv to be computed & stored
-        self._transfer_qkv(q0, k0, v0, batch_id=0, cur_stage=1)
-        q1, k1, v1 = self._preproj(self.input_embedss[1], batch_id=1, layer_off=1)
+        self._transfer_qkv(q0, k0, v0, batches[0], cur_stage=1)
+        q1, k1, v1 = self._preproj(embeddings[1], batches[1], layer_off=1)
         self.events[1].pf_record("linr_e")
-        self._attention(q0, k0, v0, batch_id=0, cur_stage=1)
-        self._compute_wait_comm() # Wait for CPU decoding & swap of last layer to finish
+        self._attention(q0, k0, v0, batches[0], cur_stage=1)
         self.events[1].pf_time("lnch_e")
 
         return q1, k1, v1
+
 
     def forward_last_stage(
         self,
         q1: torch.Tensor,  # [num_tokens, num_q_heads, head_dim]
         k1: torch.Tensor,  # [num_tokens, num_kv_heads, head_dim]
         v1: torch.Tensor,  # [num_tokens, num_kv_heads, head_dim]
-    ) -> tuple[torch.Tensor]:
+        batches: list[SubBatch]
+    ) -> torch.Tensor:
         """
-        Do the last stage of the pipeline for 2 batches
+        Do the last stage of the pipeline for 2 batches, return the concatenated output
 
         batch0 : o0   |=> post-projection              |=> [f0]
         batch1 : qkv1 |=> attention -> post-projection |=> [f1]
         """
         self.events[0].pf_record("stage_s")
         self.events[0].pf_time("lnch_s")
-        self._comm_wait_compute()
-        self._transfer_qkv(q1, k1, v1, batch_id=1, cur_stage=0)
-        self._swap_out_blocks(batch_id=0)
-        f0 = self._postproj(batch_id=0)
+        self._transfer_qkv(q1, k1, v1, batches[1], cur_stage=0)
+        self._swap_out_blocks(batches[0])
+        e0 = self._postproj(batches[0])
         self.events[0].pf_record("linr_e")
-        self._attention(q1, k1, v1, batch_id=1, cur_stage=0)
-        self._compute_wait_comm()
+        self._attention(q1, k1, v1, batches[1], cur_stage=0)
         self.events[0].pf_time("lnch_e")
 
-        f1 = self._postproj(batch_id=1)
+        e1 = self._postproj(batches[1])
 
-        return f0, f1
-    
-    
+        return torch.cat((e0, e1))
+ 

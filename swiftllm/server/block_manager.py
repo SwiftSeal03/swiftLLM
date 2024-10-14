@@ -7,6 +7,7 @@ model computations doesn't involve these classes.
 
 import torch
 from swiftllm.engine_config import EngineConfig
+from swiftllm.model_config import LlamaModelConfig
 from swiftllm.structs import Request, SubBatch
 
 
@@ -137,14 +138,17 @@ class BlockManager:
 
     def __init__(
         self, 
-        engine_config: EngineConfig
+        engine_config: EngineConfig,
+        model_config: LlamaModelConfig
     ):
+        self.engine_config = engine_config
+        self.model_config = model_config 
         self.extra_layer_for_cprf = engine_config.extra_layer_for_cprf
         self.gpu_block_manager = DeviceBlockManager("cuda", engine_config)
         self.cpu_block_manager = DeviceBlockManager("cpu", engine_config)
     
 
-    def alloc_blocks_for_batch(self, batch: SubBatch) -> tuple[tuple[list[int], list[int]], tuple[list[int], list[int]]]:
+    def _alloc_blocks_for_batch(self, batch: SubBatch) -> tuple[tuple[list[int], list[int]], tuple[list[int], list[int]]]:
         """
         Allocate blocks for a batch of sequences.
 
@@ -156,14 +160,14 @@ class BlockManager:
         )
     
 
-    def free_blocks_of_requests(self, reqs: list[Request]) -> tuple[list[int], list[int]]:
+    def _free_blocks_of_requests(self, reqs: list[Request]) -> tuple[list[int], list[int]]:
         """
         Free the blocks allocated for the specified requests.
         """
         return self.gpu_block_manager.free(reqs), self.cpu_block_manager.free(reqs)
 
 
-    def initiate_swap(
+    def _initiate_swap(
         self,
         reqs: list[Request],
         is_swap_out: bool,
@@ -183,4 +187,84 @@ class BlockManager:
         src_blk_pids = src_block_manager.free(reqs, int(use_itm))
         dst_blk_vids, dst_blk_pids = dst_block_manager.alloc(reqs)
         return src_blk_pids, dst_blk_vids, dst_blk_pids
+
+    
+    def prepare(
+        self,
+        batches: list[SubBatch], 
+        cur_swap_out: list[Request],
+        cur_swap_in: list[Request]
+    ) -> tuple[tuple[tuple[list[int], list[int]], tuple[list[int], list[int]]], tuple[list[int], list[int]], bool]:
+        """
+        Prepare KV cache and swapping related arguments for the model forward pass
+
+        Requires either cur_swap_out or cur_swap_in to be empty
+
+        Return a triple, the first element is yet another tuple of mappings:
+
+            (GPU block VIDs, GPU block PIDs), (CPU block VIDs, CPU block PIDs)
+
+        The second element is a tuple of lists of block IDs:
+
+            (source block PIDs, destination block PIDs)
+
+        The third element is a boolean indicating whether it's a swap out operation
+        """
+        assert not (cur_swap_out and cur_swap_in), "Swap out and swap in should be mutually exclusive"
+        assert len(batches) in (1, 2), "The number of batches should be at most 2"
+        
+        mappings = (([], []), ([], [])) # (GPU, CPU)
+        swappings = ([], []) # (swap in: CPU -> GPU / swap out: GPU -> CPU)
+        
+        # print(f"Preparing model forward args with {len(batches)} batches, swap out: {len(cur_swap_out)}, swap in: {len(cur_swap_in)}")
+        
+        # 1. Do conventional swaps
+        is_swap_out = bool(cur_swap_out)
+        sp, dv, dp = self._initiate_swap(cur_swap_out or cur_swap_in, is_swap_out)
+        mappings[is_swap_out][0].extend(dv)
+        mappings[is_swap_out][1].extend(dp)
+        swappings[0].extend(sp)
+        swappings[1].extend(dp)
+        
+        # 2. Allocate blocks for the batch, also prepare forward args
+        sum_batch_size = 0
+        sum_iter_width = 0
+        for batch in batches:
+            batch.set_model_forward_args(self.model_config)
+            assert batch.batch_size > 0, "Batch size should be greater than 0"
+            sum_batch_size += batch.batch_size
+            sum_iter_width += batch.iter_width  
+            (gv, gp), (cv, cp) = self._alloc_blocks_for_batch(batch)
+            mappings[0][0].extend(gv)
+            mappings[0][1].extend(gp)
+            mappings[1][0].extend(cv)
+            mappings[1][1].extend(cp)
+        assert sum_batch_size <= self.engine_config.max_batch_size, \
+            f"Batch size {sum_batch_size} exceeds max_batch_size {self.engine_config.max_batch_size}"
+        assert sum_iter_width <= self.engine_config.max_tokens_in_batch, \
+            f"Iteration width {sum_iter_width} exceeds max_tokens_in_batch {self.engine_config.max_tokens_in_batch}"
+        
+        # 3. Do cprf swaps, this should happen after the batch allocation
+        for batch in batches:
+            sp, dv, dp = self._initiate_swap(
+                batch.all_reqs[:batch.num_cprfs],
+                is_swap_out=True, use_itm=self.engine_config.extra_layer_for_cprf
+            )
+            batch.src_blk_ids = sp
+            batch.dst_blk_ids = dp
+            mappings[1][0].extend(dv)
+            mappings[1][1].extend(dp)
+
+        return mappings, swappings, is_swap_out
+
+
+    def update_and_free(self, batches: list[SubBatch], output_token_ids: list[int]):
+        """
+        Called at the end of each iteration,
+
+        Update the output token IDs of the requests and free the blocks allocated for the finished requests.
+        """
+        all_reqs = sum([b.all_reqs for b in batches], [])
+        finished_reqs = Request.update_output(all_reqs, output_token_ids)
+        self._free_blocks_of_requests(finished_reqs)
     

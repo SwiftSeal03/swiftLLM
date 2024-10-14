@@ -15,6 +15,7 @@ import ray
 from swiftllm.engine_config import EngineConfig
 from swiftllm.model_config import LlamaModelConfig
 from swiftllm.worker.weight import load_weights
+from swiftllm.worker.buffer import ModelForwardBuffers
 from swiftllm.worker.block_swapper import Swapper
 from swiftllm.structs import Request, SubBatch
 
@@ -131,7 +132,7 @@ class LlamaModel:
         self,
         engine_config: EngineConfig,
         model_config: LlamaModelConfig,
-        rank: int=0
+        rank: int
     ):
         """
         Initialize the LlamaModel.
@@ -142,7 +143,9 @@ class LlamaModel:
         """
         self.engine_config = engine_config
         self.model_config = model_config
-        self.rank = rank
+
+        model_config.rank = rank
+        model_config.world_size = engine_config.tensor_parallel_degree
 
         # CPU kernel library & stream
         if engine_config.library_path:
@@ -151,11 +154,14 @@ class LlamaModel:
 
         # Load weights
         self.weight = load_weights(
-            self.model_config,
+            model_config,
             torch.float16,
-            self.engine_config.model_path,
-            self.engine_config.use_dummy
+            engine_config.model_path,
+            engine_config.use_dummy
         )
+
+        # Initialize buffers
+        self.buffer = ModelForwardBuffers(engine_config, model_config)
 
         # Initialize layers
         self.pre_layer = LlamaPreLayer(self.model_config, self.weight)
@@ -210,7 +216,7 @@ class LlamaModel:
         self.sin_cached = torch.sin(freqs).to(torch.float16)
 
 
-    def _prepare_inputs(self, batch: SubBatch):
+    def _prepare_inputs(self, batches: list[SubBatch]):
         """
         Prepare the batch for the forward pass. 
         
@@ -218,111 +224,69 @@ class LlamaModel:
             1. seq_ids and seq_lens
             2. position_cos and position_sin
         """
-        batch.prgd_seq_ids = torch.tensor(batch.seq_ids_list[:batch.num_prgds], dtype=torch.int32, device='cuda')
-        batch.prgd_seq_lens = torch.tensor(batch.seq_lens_list[:batch.num_prgds], dtype=torch.int32, device='cuda')
-        batch.pref_st_locs_we = torch.tensor(
-            [0] + list(itertools.accumulate(batch.seq_lens_list[:batch.num_prefs])), 
-            dtype=torch.int32, device='cuda'
-        )
+        for batch in batches:
+            batch.prgd_seq_ids = torch.tensor(batch.seq_ids_list[:batch.num_prgds], dtype=torch.int32, device='cuda')
+            batch.prgd_seq_lens = torch.tensor(batch.seq_lens_list[:batch.num_prgds], dtype=torch.int32, device='cuda')
+            batch.pref_st_locs_we = torch.tensor(
+                [0] + list(itertools.accumulate(batch.seq_lens_list[:batch.num_prefs])), 
+                dtype=torch.int32, device='cuda'
+            )
 
-        position_indices = torch.tensor(
-            sum([list(range(req.prompt_len)) for req in batch.all_reqs[:batch.num_prefs]], []) + \
-                [req.seq_len - 1 for req in batch.all_reqs[batch.num_prefs:]],
-            dtype=torch.int32, device='cuda'
-        )
+            position_indices = torch.tensor(
+                sum([list(range(req.prompt_len)) for req in batch.all_reqs[:batch.num_prefs]], []) + \
+                    [req.seq_len - 1 for req in batch.all_reqs[batch.num_prefs:]],
+                dtype=torch.int32, device='cuda'
+            )
 
-        batch.position_cos = self.cos_cached[position_indices]
-        batch.position_sin = self.sin_cached[position_indices]
+            batch.position_cos = self.cos_cached[position_indices]
+            batch.position_sin = self.sin_cached[position_indices]
+
+            batch.attn_out_buf = torch.zeros(
+                (batch.iter_width, self.model_config.hidden_size // self.model_config.world_size), dtype=torch.float16, device='cuda'
+            )
+            batch.residual_buf = torch.zeros(
+                (batch.iter_width, self.model_config.hidden_size), dtype=torch.float16, device='cuda'
+            )
+            
+            batch.last_token_indices = torch.cat([
+                batch.pref_st_locs_we[1:] - 1,
+                torch.arange(batch.sum_pref_toks, batch.iter_width, dtype=torch.int32, device='cuda')
+            ])
+
+        self.buffer.alloc_for_batches(batches)
 
 
-    def _forward_sequential(self, batch: SubBatch) -> list[int]:
+    def _forward_sequential(self, batch: SubBatch, embeddings: torch.Tensor) -> torch.Tensor:
         """
-        Run a forward pass of the LlamaModel in a sequential manner.
+        Run a forward pass of the transformer layers in a sequential manner.
 
-        Returns the output tokens.
         """
-        self.events.pf_record("frwd_s")
-
-        # Main body of the forward pass
-        # start = time.perf_counter()
-        input_embds = self.pre_layer.forward(Request.get_input_tokens(batch.all_reqs))
-
         # Wait for swappings to finish
         torch.cuda.current_stream().wait_stream(self.cpu_communication_stream)
-
-        self.events.pf_record("fstg_s")
         self.events.pf_record("mnbd_s")
-        
-        residual_buf = torch.zeros_like(input_embds)
-        ffn_out = input_embds
         for layer in self.transformer_layers:
-            layer.set_batches_and_buffers([batch], [input_embds], [residual_buf])
-            ffn_out = layer.forward(ffn_out)
-
+            embeddings = layer.forward(batch, embeddings)
         self.events.pf_record("mnbd_e")
-        self.events.pf_record("lstg_e")
+        return embeddings
 
-        ffn_out += residual_buf
-        output_tokens = self.post_layer.forward(ffn_out, batch).tolist()
 
-        self.events.pf_record("frwd_e")
-        # duration = time.perf_counter() - start
-        # print(f"Forward time: {duration*1000:.2f}ms")
-
-        if self.engine_config.monitor_performance:
-            self.perf_results.append(ModelPerfResult(self.transformer_layers, self.events, False))
-        
-        return output_tokens
-
-    
-    def _forward_pipeline(self, batches: list[SubBatch]) -> list[int]:
+    def _forward_pipeline(self, batches: list[SubBatch], embeddings: torch.Tensor) -> torch.Tensor:
         """
-        Run a forward pass of the LlamaModel in a pipelined manner.
-
-        Returns the concatenated output tokens.
+        Run a forward pass of the transformer layers in a pipelined manner.
         """
-        self.events.pf_record("frwd_s")
+        assert len(batches) == 2
 
-        # input_embds would serve as a buffer for all attention outputs
-        input_embedss = self.pre_layer.forward(sum([Request.get_input_tokens(b.all_reqs) for b in batches], []))
-        residual_bufs = torch.zeros_like(input_embedss)
-        iter_widths = [b.iter_width for b in batches]
-        input_embedss = torch.split(input_embedss, iter_widths, dim=0)
-        residual_bufs = torch.split(residual_bufs, iter_widths, dim=0)
-
-        for layer in self.transformer_layers:
-            layer.set_batches_and_buffers(batches, input_embedss, residual_bufs)
-            
-        self.events.pf_record("fstg_s")
-
-        # First stage of the forward pass
-        q1, k1, v1 = self.transformer_layers[-1].forward_first_stage()
-
+        q1, k1, v1 = self.transformer_layers[-1].forward_first_stage(embeddings, batches)
         self.events.pf_record("mnbd_s")
 
-        # Main body of the forward pass
-        # In every iteration, input_embds0 is updated to newer version of batch 0's attention output and 
+        # In every iteration, attn_out_buf[0] is updated to newer version of batch 0's attention output and 
         # q1, k1, v1 are updated to batch 1's newer version of q, k, v
         for layer in self.transformer_layers[:-1]:
-            q1, k1, v1 = layer.forward_double(q1, k1, v1)
-
+            q1, k1, v1 = layer.forward_double(q1, k1, v1, batches)
         self.events.pf_record("mnbd_e")
 
-        # Last stage of the forward pass, also begin predicted swapping
-        f0, f1 = self.transformer_layers[-1].forward_last_stage(q1, k1, v1)
-
-        self.events.pf_record("lstg_e")
-
-        f0 += residual_bufs[0]
-        f1 += residual_bufs[1]
-        output_tokens = self.post_layer.forward_double(f0, f1, batches).tolist()
-
-        self.events.pf_record("frwd_e")
-
-        if self.engine_config.monitor_performance:
-            self.perf_results.append(ModelPerfResult(self.transformer_layers, self.events, True))
-        
-        return output_tokens
+        embeddings = self.transformer_layers[-1].forward_last_stage(q1, k1, v1, batches)
+        return embeddings
     
     
     @torch.inference_mode()
@@ -334,16 +298,31 @@ class LlamaModel:
 
         Returns the output tokens.
         """
-        for batch in batches:
-            self._prepare_inputs(batch)
+        self._prepare_inputs(batches)
+        self.events.pf_record("frwd_s")
+
+        # Main body of the forward pass
+        # start = time.perf_counter()
+        embeddings = self.pre_layer.forward(sum([Request.get_input_tokens(b.all_reqs) for b in batches], []))
+        self.events.pf_record("fstg_s")
 
         if len(batches) == 1:
-            return self._forward_sequential(batches[0])
+            embeddings = self._forward_sequential(batches[0], embeddings)
+        elif len(batches) == 2:
+            embeddings =  self._forward_pipeline(batches, embeddings)
+        else:
+            raise ValueError("Invalid number of batches")
+        self.events.pf_record("lstg_e")
+
+        output_tokens = self.post_layer.forward(batches, embeddings, self.buffer.cur_residual_buf)
+        self.events.pf_record("frwd_e")
+        # duration = time.perf_counter() - start
+        # print(f"Forward time: {duration*1000:.2f}ms")
+
+        if self.engine_config.monitor_performance:
+            self.perf_results.append(ModelPerfResult(self.transformer_layers, self.events, False))
         
-        if len(batches) == 2:
-            return self._forward_pipeline(batches)
-        
-        raise ValueError("Invalid number of batches")
+        return output_tokens
 
 
     def do_one_iteration(
@@ -361,7 +340,9 @@ class LlamaModel:
 
         Returns the output tokens.
         """
-        self.swapper.set_block_tables(mappings)
+
+        if self.swapper is not None:
+            self.swapper.set_block_tables(mappings)
 
         if swappings[0]:
             with torch.cuda.stream(self.cpu_communication_stream):
@@ -399,12 +380,11 @@ class RemoteLlamaModel(LlamaModel):
         self,
         engine_config: EngineConfig,
         model_config: LlamaModelConfig,
-        rank: int=0
+        rank: int
     ):
         """
         Initialize the RemoteLlamaModel.
         """
-        
         dist.init_process_group(
             backend="nccl", 
             world_size=engine_config.tensor_parallel_degree, 

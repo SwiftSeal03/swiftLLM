@@ -33,9 +33,10 @@ class EngineConfig:
     profile_result_path: str = None
 
     # Switches
-    extra_layer_for_cprf: bool = False # Fixed after initialization
-    monitor_performance: bool = False  # Can be altered while running
-    always_use_gpu: bool = False       # Can be altered while running
+    profile_num_blocks: bool = False    # Only used upon initialization
+    extra_layer_for_cprf: bool = False  # Fixed after initialization
+    monitor_performance: bool = False   # Can be altered while running
+    always_use_gpu: bool = False        # Can be altered while running
 
     # Parallel parameter
     tensor_parallel_degree: int = 1
@@ -133,4 +134,3 @@ class EngineConfig:
             action="store_true",
             help="Monitor performance",
         )
-        

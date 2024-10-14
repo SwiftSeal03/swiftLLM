@@ -34,6 +34,7 @@ class Engine:
             f"max_batch_size {engine_config.max_batch_size} exceeds max_tokens_in_batch {engine_config.max_tokens_in_batch}"
         assert engine_config.max_batch_size <= engine_config.max_seqs_in_block_table, \
             f"max_batch_size {engine_config.max_batch_size} exceeds max_seqs_in_block_table {engine_config.max_seqs_in_block_table}"
+        assert engine_config.tensor_parallel_degree >= 1, "Tensor parallel degree should be positive"
 
         # The following fields will be created on `init_model()`
         self.executor = None
@@ -52,15 +53,10 @@ class Engine:
 
         print("[Engine] Profiling kv blocks...")
         self.profiler = ModelProfiler(self.executor)
-        # self.profiler.profile_num_blocks()
-        num_gpu_blocks = self.engine_config.num_gpu_blocks
-        num_cpu_blocks = self.engine_config.num_cpu_blocks
-        block_size_bytes = self.engine_config.block_size*self.model_config.get_kvslot_size()
-        print(f"[Engine] Number of GPU blocks: {num_gpu_blocks} ({num_gpu_blocks*block_size_bytes/GB:.2f} GB)")
-        print(f"[Engine] Number of CPU blocks: {num_cpu_blocks} ({num_cpu_blocks*block_size_bytes/GB:.2f} GB)")
+        self.profiler.profile_num_blocks()
 
         print("[Engine] Initializing block manager...")
-        self.block_manager = BlockManager(self.engine_config)
+        self.block_manager = BlockManager(self.engine_config, self.model_config)
 
         print("[Engine] Allocating kv cache and swap...")
         self.executor.init_kvcache_and_swap()
@@ -69,91 +65,13 @@ class Engine:
         self.initialized = True
 
 
-    def prepare_model_forward_args(
-        self,
-        batches: list[SubBatch], 
-        cur_swap_out: list[Request],
-        cur_swap_in: list[Request]
-    ) -> tuple[tuple[tuple[list[int], list[int]], tuple[list[int], list[int]]], tuple[list[int], list[int]], bool]:
-        """
-        Prepare KV cache and swapping related arguments for the model forward pass
-
-        Requires either cur_swap_out or cur_swap_in to be empty
-
-        Return a triple, the first element is yet another tuple of mappings:
-
-            (GPU block VIDs, GPU block PIDs), (CPU block VIDs, CPU block PIDs)
-
-        The second element is a tuple of lists of block IDs:
-
-            (source block PIDs, destination block PIDs)
-
-        The third element is a boolean indicating whether it's a swap out operation
-        """
-        assert not (cur_swap_out and cur_swap_in), "Swap out and swap in should be mutually exclusive"
-        assert len(batches) in (1, 2), "The number of batches should be at most 2"
-        
-        mappings = (([], []), ([], [])) # (GPU, CPU)
-        swappings = ([], []) # (swap in: CPU -> GPU / swap out: GPU -> CPU)
-        
-        print(f"Preparing model forward args with {len(batches)} batches, swap out: {len(cur_swap_out)}, swap in: {len(cur_swap_in)}")
-        
-        # 1. Do conventional swaps
-        is_swap_out = bool(cur_swap_out)
-        sp, dv, dp = self.block_manager.initiate_swap(cur_swap_out or cur_swap_in, is_swap_out)
-        mappings[is_swap_out][0].extend(dv)
-        mappings[is_swap_out][1].extend(dp)
-        swappings[0].extend(sp)
-        swappings[1].extend(dp)
-        
-        # 2. Allocate blocks for the batch, also prepare forward args
-        sum_batch_size = 0
-        sum_iter_width = 0
-        for batch in batches:
-            batch.set_model_forward_args(self.model_config)
-            assert batch.batch_size > 0, "Batch size should be greater than 0"
-            sum_batch_size += batch.batch_size
-            sum_iter_width += batch.iter_width  
-            (gv, gp), (cv, cp) = self.block_manager.alloc_blocks_for_batch(batch)
-            mappings[0][0].extend(gv)
-            mappings[0][1].extend(gp)
-            mappings[1][0].extend(cv)
-            mappings[1][1].extend(cp)
-        assert sum_batch_size <= self.engine_config.max_batch_size, \
-            f"Batch size {sum_batch_size} exceeds max_batch_size {self.engine_config.max_batch_size}"
-        assert sum_iter_width <= self.engine_config.max_tokens_in_batch, \
-            f"Iteration width {sum_iter_width} exceeds max_tokens_in_batch {self.engine_config.max_tokens_in_batch}"
-        
-        # 3. Do cprf swaps, this should happen after the batch allocation
-        for batch in batches:
-            sp, dv, dp = self.block_manager.initiate_swap(
-                batch.all_reqs[:batch.num_cprfs],
-                is_swap_out=True, use_itm=self.engine_config.extra_layer_for_cprf
-            )
-            batch.src_blk_ids = sp
-            batch.dst_blk_ids = dp
-            mappings[1][0].extend(dv)
-            mappings[1][1].extend(dp)
-
-        return mappings, swappings, is_swap_out
-
-
-    def update_outputs_and_free_finished_reqs(self, batches: list[SubBatch], output_token_ids: list[int]):
-        """
-        Called at the end of each iteration
-        """
-        all_reqs = sum([b.all_reqs for b in batches], [])
-        finished_reqs = Request.update_output(all_reqs, output_token_ids)
-        self.block_manager.free_blocks_of_requests(finished_reqs)
-
-
     def step(self, batches: list[SubBatch], cur_swap_out: list[Request]=None, cur_swap_in: list[Request]=None):
         """
         Perform a step of the engine
         """
-        forward_args = self.prepare_model_forward_args(batches, cur_swap_out or [], cur_swap_in or [])
+        forward_args = self.block_manager.prepare(batches, cur_swap_out or [], cur_swap_in or [])
         output_token_ids = self.executor.do_one_iteration(batches, *forward_args)
-        self.update_outputs_and_free_finished_reqs(batches, output_token_ids)
+        self.block_manager.update_and_free(batches, output_token_ids)
 
 
 
@@ -272,7 +190,7 @@ class AsyncEngine(Engine):
                 continue
 
             # Prepare model forward arguments
-            forward_args = self.prepare_model_forward_args(batches, cur_swap_out, cur_swap_in)
+            forward_args = self.block_manager.prepare(batches, cur_swap_out, cur_swap_in)
             prepare_end = time.perf_counter()
             
             # Forward the model
@@ -280,7 +198,7 @@ class AsyncEngine(Engine):
             output_token_ids = await self._run_on_model_executor_async(self.executor.do_one_iteration, batches, *forward_args)
 
             # Deal with output tokens
-            self.update_outputs_and_free_finished_reqs(batches, output_token_ids)
+            self.block_manager.update_and_free(batches, output_token_ids)
             self.scheduler.remove_finished_requests()
             iter_end = time.perf_counter()
 
@@ -290,6 +208,7 @@ class AsyncEngine(Engine):
             )
             self.itr_end_times.append(iter_end)
             self.ntoken_of_itr.append(len(output_token_ids))
+    
     
     async def start_all_event_loops(self):
         """
