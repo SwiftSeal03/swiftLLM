@@ -108,6 +108,7 @@ class RayExecutor(Executor):
         num_workers = engine_config.tensor_parallel_degree
         self.models = [RemoteLlamaModel.remote(engine_config, model_config, rank=i) for i in range(num_workers)]
     
+    
     def init_kvcache_and_swap(self):
         ray.get([model.init_kvcache_and_swap.remote() for model in self.models])
 
@@ -117,8 +118,8 @@ class RayExecutor(Executor):
 
     
     def turn_on_perf_monitor(self):
-        ray.get([model.turn_on_perf_monitor.remote() for model in self.models])
+        ray.get(self.models[0].turn_on_perf_monitor.remote())
 
 
     def turn_off_perf_monitor_and_flush_results(self) -> list[ModelPerfResult]:
-        return ray.get([model.turn_off_perf_monitor_and_flush_results.remote() for model in self.models])
+        return ray.get(self.models[0].turn_off_perf_monitor_and_flush_results.remote())
