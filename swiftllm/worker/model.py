@@ -4,6 +4,7 @@ LlamaModel - A Llama model that can be used for inference.
 If performance monitoring is enabled, the model will record performance results.
 """
 
+import os
 import json
 import itertools
 
@@ -205,8 +206,9 @@ class LlamaModel:
     def _init_to_get_rotary(self):
         rope_scaling_factor = self.model_config.rope_scaling
         base = self.model_config.rope_theta
-        max_position_embeddings = self.model_config.max_position_embeddings
-        max_seq_len = max_position_embeddings * rope_scaling_factor
+        # max_position_embeddings = self.model_config.max_position_embeddings
+        # max_seq_len = max_position_embeddings * rope_scaling_factor
+        max_seq_len = self.engine_config.max_seq_len
 
         inv_freq = 1.0 / (base ** (torch.arange(0, self.model_config.head_dim, 2, device="cuda", dtype=torch.float32) / self.model_config.head_dim))
         t = torch.arange(max_seq_len + 128, device="cuda", dtype=torch.float32) / rope_scaling_factor
@@ -369,7 +371,7 @@ class LlamaModel:
         return ret
         
 
-@ray.remote(num_gpus=1)
+@ray.remote(num_cpus=12, num_gpus=1)
 class RemoteLlamaModel(LlamaModel):
     """
     RemoteLlamaModel - A remote Llama model that can be used for inference.
@@ -385,10 +387,10 @@ class RemoteLlamaModel(LlamaModel):
         """
         Initialize the RemoteLlamaModel.
         """
+        os.environ["OMP_NUM_THREADS"] = "12"
         dist.init_process_group(
             backend="nccl", 
             world_size=engine_config.tensor_parallel_degree, 
             rank=rank
         )
         super().__init__(engine_config, model_config, rank)
-
