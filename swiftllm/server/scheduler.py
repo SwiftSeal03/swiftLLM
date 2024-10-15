@@ -49,9 +49,8 @@ class ScheduleBudget:
     """
     A class that maintains the budget for scheduling
     """
-    def __init__(self, max_batch_size: int, max_prefill_tokens: int, max_tokens_in_batch: int):
+    def __init__(self, max_batch_size: int, max_tokens_in_batch: int):
         self.remaining_batch_size = max_batch_size
-        self.remaining_prefill_tokens = max_prefill_tokens
         self.remaining_tokens_in_batch = max_tokens_in_batch
     
     @property
@@ -61,28 +60,25 @@ class ScheduleBudget:
         """
         return self.remaining_batch_size < 0 or self.remaining_tokens_in_batch < 0
 
-    def check_and_substract(self, num_tokens, is_prefill = False) -> bool:
+    def check_and_substract(self, num_tokens) -> bool:
         """
         Check if the budget is enough. 
         
         If so, substract the tokens from the budget and return True. Otherwise, return False.
         """
         if self.remaining_batch_size >= 1 and \
-            self.remaining_tokens_in_batch >= num_tokens and \
-            self.remaining_prefill_tokens >= (num_tokens if is_prefill else 0):
+            self.remaining_tokens_in_batch >= num_tokens:
             self.remaining_batch_size -= 1
             self.remaining_tokens_in_batch -= num_tokens
-            self.remaining_prefill_tokens -= num_tokens if is_prefill else 0
             return True
         return False
 
-    def add(self, num_tokens, is_prefill = False) -> bool:
+    def add(self, num_tokens) -> bool:
         """
         Add tokens to the budget
         """
         self.remaining_batch_size += 1
         self.remaining_tokens_in_batch += num_tokens
-        self.remaining_prefill_tokens += num_tokens if is_prefill else 0
 
 class Scheduler:
     """
@@ -227,7 +223,6 @@ class Scheduler:
         # We have a budget mainly because we should avoid CUDA OOM
         budget = ScheduleBudget(
             self.engine_config.max_batch_size,
-            self.engine_config.max_prefill_tokens,
             self.engine_config.max_tokens_in_batch
         )
         pref_to_cpu = []
@@ -277,7 +272,7 @@ class Scheduler:
             if  itm_block_needed + cur_block_needed > self.engine_config.num_gpu_blocks or \
                 cpu_block_needed + cur_block_needed > cpu_threshold or \
                 self.request_id_manager.get_num_available_ids() < i or \
-                not budget.check_and_substract(candidate.prompt_len, True):
+                not budget.check_and_substract(candidate.prompt_len):
                 break
             # The newly prefilled sequences are the major part of swapping out. Here we use a simple heuristic.
             # 1. We prefer to put a sequence into GPU.

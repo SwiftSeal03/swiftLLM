@@ -88,8 +88,8 @@ class TablePerfPredictor(PerfPredictor):
         # Pref
         self.pref_S_list = sum([[2 ** (i-2) * 3, 2 ** i] for i in range(
             (engine_config.block_size - 1).bit_length(),
-            (engine_config.max_prefill_tokens - 1).bit_length()
-        )], []) + [engine_config.max_prefill_tokens]
+            (engine_config.max_tokens_in_batch - 1).bit_length()
+        )], []) + [engine_config.max_tokens_in_batch]
         self.pref_T_list = None
         self.pref_S_lb_idx = self._get_lb_idx_list(self.pref_S_list)
 

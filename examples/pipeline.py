@@ -54,7 +54,6 @@ if __name__ == '__main__':
 
         # The following are not used in the offline example
         max_batch_size = 512,
-        max_prefill_tokens = 20000,
         max_tokens_in_batch = 20000,
 
         library_path=library_path,
@@ -76,8 +75,8 @@ if __name__ == '__main__':
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
     tokenizer = AutoTokenizer.from_pretrained(model_path)
 
-    ngpu_prompts = 10
-    ncpu_prompts = 10
+    ngpu_prompts = 20
+    ncpu_prompts = 20
     nprompts = ncpu_prompts + ngpu_prompts
     with open(f"{home}/swiftLLM/examples/example.txt", "r") as f:
         prompt = ''.join(f.readlines())
@@ -110,7 +109,7 @@ if __name__ == '__main__':
 
     print("Prompt phase done")
 
-    # engine.executor.turn_on_perf_monitor()
+    engine.executor.turn_on_perf_monitor()
     for iteration in range(16):
         batches = [swiftllm.SubBatch() for _ in range(2)]
         for i in range(ngpu_prompts // 2):
@@ -137,5 +136,5 @@ if __name__ == '__main__':
             print(f"{prompt}|{output_text}")
             print(reqs[i].output_token_ids)
 
-    # res = engine.executor.flush_perf_results_and_turn_off_perf_monitor()
-    # print(res)
+    res = engine.executor.turn_off_perf_monitor_and_flush_results()
+    print(res)

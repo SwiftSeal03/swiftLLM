@@ -28,7 +28,6 @@ def init_engine():
 
         # The following are not used in the offline example
         max_batch_size = 512,
-        max_prefill_tokens = 20000,
         max_tokens_in_batch = 20000,
 
         library_path="/home/ubuntu/pacpu/build/libpacpu.so",

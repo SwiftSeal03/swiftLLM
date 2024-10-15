@@ -17,6 +17,8 @@ logger = logging.getLogger(__name__)
 logging.basicConfig(filename="e2e.log", level=logging.INFO)
 
 home = os.path.expanduser("~")
+tp = 2
+nparam = 70
 data_prefix = f"{home}/swiftLLM/data/d1008"
 os.makedirs(data_prefix, exist_ok=True)
 
@@ -128,7 +130,7 @@ async def main():
         "--model-path",
         help="Path to the model. Note: please download the model weights from HuggingFace in advance and specify the path here.",
         type=str,
-        default=f"{home}/weights/Llama-2-7b-hf"
+        default=f"{home}/weights/Llama-2-{nparam}b-hf"
     )
     parser.add_argument(
         "--streaming",
@@ -145,19 +147,19 @@ async def main():
         
         block_size = 16,
         gpu_mem_utilization = 0.995,
-        num_gpu_blocks = 500,
-        num_cpu_blocks = 1000,
-        max_seqs_in_block_table = 512,
-        max_blocks_per_seq = 256,
+        num_gpu_blocks = 1300,
+        num_cpu_blocks = 10000,
+        max_seqs_in_block_table = 1024,
+        max_blocks_per_seq = 1280,
 
-        max_batch_size = 256,
-        max_prefill_tokens = 1000,
-        max_tokens_in_batch = 1000,
+        max_batch_size = 512,
+        max_tokens_in_batch = 20480,
 
-        library_path=f"{home}/pacpu/build/libpacpu.so",
+        library_path=f"{home}/pacpu/build/libpacpu-llama2_{nparam}b-tp{tp}.so",
         profile_result_path=f"{home}/swiftLLM/profile_results/",
 
         # always_use_gpu=True
+        tensor_parallel_degree=tp,
         extra_layer_for_cprf=True
     )
 
@@ -176,7 +178,7 @@ async def main():
     print([len(tokenizer.encode(prompt)) for prompt in prompts])
 
     logger.info("Warming up...")
-    await run_mock_throughput_test(40, prompts[9], 20, False)
+    await run_mock_throughput_test(100, prompts[9], 200, False)
 
     # for gpu_only in [False, True]:
     #     await run_real_throughput_test(

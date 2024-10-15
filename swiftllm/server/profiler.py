@@ -167,6 +167,12 @@ class ModelProfiler:
             T_list.append(ModelPerfResult.mean(res, "avg_linr_time"))
         T_list = list(reversed(T_list))
 
+        with open(result_path, "w") as f:
+            json.dump({
+            "S_list": S_list,
+            "T_list": T_list
+            }, f, indent=2)
+
         plt.figure(figsize=(16, 12))
         plt.plot(S_list, T_list)
         plt.xlim(0)
@@ -175,12 +181,6 @@ class ModelProfiler:
         plt.ylabel("T_l(ms)")
         plt.savefig(self.engine_config.profile_result_path + "linr.png")
         plt.close()
-
-        with open(result_path, "w") as f:
-            json.dump({
-            "S_list": S_list,
-            "T_list": T_list
-            }, f, indent=2)
 
         return T_list
 
@@ -254,6 +254,12 @@ class ModelProfiler:
             )
             T_list.append(ModelPerfResult.mean(res, "avg_gdec_time"))
 
+        with open(result_path, "w") as f:
+            json.dump({
+            "N_list": N_list,
+            "T_list": T_list
+            }, f, indent=2)
+
         plt.figure(figsize=(16, 12))
         plt.plot(N_list, T_list)
         plt.xlim(0)
@@ -262,12 +268,6 @@ class ModelProfiler:
         plt.ylabel("T(ms)")
         plt.savefig(self.engine_config.profile_result_path + "gdec.png")
         plt.close()
-
-        with open(result_path, "w") as f:
-            json.dump({
-            "N_list": N_list,
-            "T_list": T_list
-            }, f, indent=2)
 
         return T_list
 
@@ -321,6 +321,13 @@ class ModelProfiler:
             label = "CPU"
         )
 
+        with open(result_path, "w") as f:
+            json.dump({
+            "S_list": S_list,
+            "N_lists": N_lists,
+            "T_lists": T_lists
+            }, f, indent=2)
+
         ax.set_xlim(0)
         ax.set_ylim(0)
         ax.set_xlabel("S_c")
@@ -328,13 +335,6 @@ class ModelProfiler:
         ax.set_zlabel("T(ms)")
         plt.savefig(self.engine_config.profile_result_path + "cdec.png")
         plt.close()
-
-        with open(result_path, "w") as f:
-            json.dump({
-            "S_list": S_list,
-            "N_lists": N_lists,
-            "T_lists": T_lists
-            }, f, indent=2)
 
         return T_lists
 
@@ -364,6 +364,12 @@ class ModelProfiler:
             )
             T_list.append(ModelPerfResult.mean(res, "avg_lnch_time"))
 
+        with open(result_path, "w") as f:
+            json.dump({
+            "S_list": S_list,
+            "T_list": T_list
+            }, f, indent=2)
+
         plt.figure(figsize=(16, 12))
         plt.plot(S_list, T_list)
         plt.xlim(0)
@@ -372,12 +378,6 @@ class ModelProfiler:
         plt.ylabel("T(ms)")
         plt.savefig(self.engine_config.profile_result_path + "lnch.png")
         plt.close()
-
-        with open(result_path, "w") as f:
-            json.dump({
-            "S_list": S_list,
-            "T_list": T_list
-            }, f, indent=2)
 
         T_mean = np.array(T_list).mean()
 
@@ -432,7 +432,9 @@ class ModelProfiler:
 
             torch.cuda.empty_cache()
             engine_config.num_gpu_blocks = num_gpu_blocks
-            engine_config.max_prefill_tokens = min(engine_config.max_prefill_tokens, num_gpu_blocks * engine_config.block_size)
+
+        assert self.engine_config.num_gpu_blocks * self.engine_config.block_size >= self.engine_config.max_tokens_in_batch, \
+            "Number of GPU blocks is not enough to hold the maximum batch size"
 
         num_gpu_blocks = self.engine_config.num_gpu_blocks
         num_cpu_blocks = self.engine_config.num_cpu_blocks

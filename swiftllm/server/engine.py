@@ -11,7 +11,6 @@ from swiftllm.engine_config import EngineConfig
 from swiftllm.model_config import LlamaModelConfig
 from swiftllm.server.executor import SingleProcExecutor, RayExecutor
 from swiftllm.server.profiler import ModelProfiler
-from swiftllm.utils import GB
 from swiftllm.structs import Request, RawRequest, StepOutput, SubBatch
 
 from swiftllm.server.tokenization_engine import TokenizationEngine
@@ -28,8 +27,6 @@ class Engine:
         self.model_config = LlamaModelConfig.load_from_model_path(engine_config.model_path)
         self.initialized = False
 
-        assert engine_config.max_prefill_tokens <= engine_config.max_tokens_in_batch, \
-            f"max_prefill_tokens {engine_config.max_prefill_tokens} exceeds max_tokens_in_batch {engine_config.max_tokens_in_batch}"
         assert engine_config.max_batch_size <= engine_config.max_tokens_in_batch, \
             f"max_batch_size {engine_config.max_batch_size} exceeds max_tokens_in_batch {engine_config.max_tokens_in_batch}"
         assert engine_config.max_batch_size <= engine_config.max_seqs_in_block_table, \
@@ -169,6 +166,8 @@ class AsyncEngine(Engine):
             for (request, _), prompt_token_id in zip(cur_untokenized_raw_requests, prompt_token_ids):
                 request.prompt_token_ids = prompt_token_id
                 request.prompt_len = len(prompt_token_id)
+                assert request.prompt_len + request.max_output_len <= self.engine_config.max_seq_len, \
+                    f"Request length {request.prompt_len + request.output_len} exceeds max_seq_len {self.engine_config.max_seq_len}"
                 new_requests.append(request)
 
             self.scheduler.on_requests_arrival(new_requests)
@@ -209,7 +208,7 @@ class AsyncEngine(Engine):
             self.itr_end_times.append(iter_end)
             self.ntoken_of_itr.append(len(output_token_ids))
     
-    
+
     async def start_all_event_loops(self):
         """
         Start all event loops
