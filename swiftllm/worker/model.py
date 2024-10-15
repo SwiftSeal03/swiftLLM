@@ -387,7 +387,7 @@ class RemoteLlamaModel(LlamaModel):
         """
         Initialize the RemoteLlamaModel.
         """
-        os.environ["OMP_NUM_THREADS"] = "12"
+
         dist.init_process_group(
             backend="nccl", 
             world_size=engine_config.tensor_parallel_degree, 
