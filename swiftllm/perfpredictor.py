@@ -83,7 +83,7 @@ class TablePerfPredictor(PerfPredictor):
         [engine_config.max_tokens_in_batch]
         self.linr_T_list = None
         self.linr_S_lb_idx = self._get_lb_idx_list(self.linr_S_list)
-        self.linr_S_threshold = 128
+        self.linr_S_threshold = 256 # NOTE: This is a heuristic value
 
         # Pref
         self.pref_S_list = sum([[2 ** (i-2) * 3, 2 ** i] for i in range(
@@ -122,7 +122,7 @@ class TablePerfPredictor(PerfPredictor):
         self.cdec_N_lb_idx = self._get_lb_idx_list(self.cdec_N_list_agg)
         
         # Lnch
-        self.lnch_T = 0.7
+        self.lnch_T = 0.5
         # self.lnch_T = self._profile_lnch(lnch_S_list)
 
     def _get_lb_idx_list(self, input_list: list[int]) -> list[int]:

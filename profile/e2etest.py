@@ -19,7 +19,7 @@ logging.basicConfig(filename="e2e.log", level=logging.INFO)
 home = os.path.expanduser("~")
 tp = 2
 nparam = 70
-data_prefix = f"{home}/swiftLLM/data/d1008"
+data_prefix = f"{home}/swiftLLM/data/d1016"
 os.makedirs(data_prefix, exist_ok=True)
 
 engine = None
@@ -33,7 +33,7 @@ async def send_request_and_wait_non_streaming_mode(prompt: str, output_len: int)
     start = time.perf_counter()
     (_, output_token_ids) = await engine.add_request_and_wait(raw_request)
     end = time.perf_counter()
-    print(f"Output: {tokenizer.decode(output_token_ids)}")
+    # print(f"Output: {tokenizer.decode(output_token_ids)}")
     # global last_output_token_ids
     # if last_output_token_ids and last_output_token_ids != output_token_ids:
     #     raise ValueError("Output token ids mismatch")
@@ -148,7 +148,7 @@ async def main():
         block_size = 16,
         gpu_mem_utilization = 0.995,
         num_gpu_blocks = 1300,
-        num_cpu_blocks = 10000,
+        num_cpu_blocks = 30000,
         max_seqs_in_block_table = 1024,
         max_blocks_per_seq = 1280,
 
@@ -188,11 +188,11 @@ async def main():
     #         gpu_only
     #     )
 
-    # for prompt in prompts:
-    #     if len(tokenizer.encode(prompt)) == 521:
-    #         for outlen in range(100, 1000, 200):
-    #             await run_mock_throughput_test(2000, prompt, outlen, False)
-    #             await run_mock_throughput_test(2000, prompt, outlen, True)
+    for prompt in prompts:
+        if len(tokenizer.encode(prompt)) == 1038:
+            for outlen in [50, 100, 200, 500]:
+                await run_mock_throughput_test(2000, prompt, outlen, False)
+                await run_mock_throughput_test(2000, prompt, outlen, True)
     # for prompt in prompts:
     #     if len(tokenizer.encode(prompt)) == 99:
     #         for rate in [0.8 + i * 0.2 for i in range(6)]:

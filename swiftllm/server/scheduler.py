@@ -207,8 +207,8 @@ class Scheduler:
         pipelined_time = (batches[0].perfdata.gpu_time + batches[1].perfdata.gpu_time) * self.model_config.num_layers
         seqential_rate = len(gpu_only_batch) / seqential_time
         pipelined_rate = sum(len(batches[i]) for i in range(2)) / pipelined_time
-        print(f"Sequential time: {seqential_time}, Pipelined time: {pipelined_time}")
-        print(f"Sequential rate: {seqential_rate}, Pipelined rate: {pipelined_rate}")
+        # print(f"Sequential time: {seqential_time}, Pipelined time: {pipelined_time}")
+        # print(f"Sequential rate: {seqential_rate}, Pipelined rate: {pipelined_rate}")
         if seqential_rate < pipelined_rate:
             return batches
         else:
@@ -383,11 +383,13 @@ class Scheduler:
     
         return self._get_next_batch_new()
     
-    def remove_finished_requests(self):
+    def remove_finished_requests(self, reqs: list[Request]):
         """
-        Remove the finished requests from the decoding queues
+        Remove the finished requests from the decoding queues, and free their request ids
         """
         def not_finished_func(req: Request) -> bool:
             return not req.is_finished()
         self.gpu_decoding_q = list(filter(not_finished_func, self.gpu_decoding_q))
         self.cpu_decoding_q = deque(filter(not_finished_func, self.cpu_decoding_q))
+
+        self.request_id_manager.free_ids([req.request_id for req in reqs])

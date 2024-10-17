@@ -76,11 +76,13 @@ class DeviceBlockManager:
     
     
     @torch.inference_mode()
-    def alloc(self, reqs: list[Request], split_point: int=0) -> tuple[list[int], list[int]]:
+    def alloc(self, reqs: list[Request], split_point: int=0, omit_last=False) -> tuple[list[int], list[int]]:
         """
         Allocate blocks for sequences, making sure that every request have enough blocks allocated for all its tokens.
 
         Those after split_point will be allocated in the first split, and the rest will be allocated in the second split.
+
+        If omit_last is set to True, we don't need to allocate block for the last token.
 
         Return new mapping from block virtual IDs to block physical IDs.
         """
@@ -88,7 +90,7 @@ class DeviceBlockManager:
             return [], []
 
         seq_ids = Request.get_ids(reqs)
-        seq_lens = torch.tensor(Request.get_lens(reqs), dtype=torch.int32)
+        seq_lens = torch.tensor(Request.get_lens(reqs), dtype=torch.int32) - int(omit_last)
         tgt_num_blks = (seq_lens - 1) // self.block_size + 1
         seq_num_blks = self.seq_num_blks[seq_ids]
 
@@ -185,7 +187,7 @@ class BlockManager:
         src_block_manager = self.gpu_block_manager if is_swap_out else self.cpu_block_manager
         dst_block_manager = self.cpu_block_manager if is_swap_out else self.gpu_block_manager
         src_blk_pids = src_block_manager.free(reqs, int(use_itm))
-        dst_blk_vids, dst_blk_pids = dst_block_manager.alloc(reqs)
+        dst_blk_vids, dst_blk_pids = dst_block_manager.alloc(reqs, omit_last=True)
         return src_blk_pids, dst_blk_vids, dst_blk_pids
 
     
@@ -258,13 +260,16 @@ class BlockManager:
         return mappings, swappings, is_swap_out
 
 
-    def update_and_free(self, batches: list[SubBatch], output_token_ids: list[int]):
+    def update_and_free(self, batches: list[SubBatch], output_token_ids: list[int]) -> list[Request]:
         """
         Called at the end of each iteration,
 
         Update the output token IDs of the requests and free the blocks allocated for the finished requests.
+
+        Return the finished requests.
         """
         all_reqs = sum([b.all_reqs for b in batches], [])
         finished_reqs = Request.update_output(all_reqs, output_token_ids)
         self._free_blocks_of_requests(finished_reqs)
+        return finished_reqs
     

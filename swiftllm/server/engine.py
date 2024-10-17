@@ -38,7 +38,7 @@ class Engine:
         self.event_loop = None
         self.profiler = None
         self.block_manager = None
-        self.executor_class = SingleProcExecutor if engine_config.tensor_parallel_degree == 0 else RayExecutor
+        self.executor_class = SingleProcExecutor if engine_config.tensor_parallel_degree == 1 else RayExecutor
 
     
     def initialize(self):
@@ -197,8 +197,8 @@ class AsyncEngine(Engine):
             output_token_ids = await self._run_on_model_executor_async(self.executor.do_one_iteration, batches, *forward_args)
 
             # Deal with output tokens
-            self.block_manager.update_and_free(batches, output_token_ids)
-            self.scheduler.remove_finished_requests()
+            finished_reqs = self.block_manager.update_and_free(batches, output_token_ids)
+            self.scheduler.remove_finished_requests(finished_reqs)
             iter_end = time.perf_counter()
 
             print(

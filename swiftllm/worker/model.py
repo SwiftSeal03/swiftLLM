@@ -4,7 +4,6 @@ LlamaModel - A Llama model that can be used for inference.
 If performance monitoring is enabled, the model will record performance results.
 """
 
-import os
 import json
 import itertools
 
@@ -371,7 +370,7 @@ class LlamaModel:
         return ret
         
 
-@ray.remote(num_cpus=12, num_gpus=1)
+@ray.remote(num_cpus=8, num_gpus=1)
 class RemoteLlamaModel(LlamaModel):
     """
     RemoteLlamaModel - A remote Llama model that can be used for inference.
