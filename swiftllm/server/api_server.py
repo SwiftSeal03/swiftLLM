@@ -25,7 +25,7 @@ async def generate(req: fastapi.Request) -> fastapi.Response:
     req_dict = await req.json()
     raw_request = swiftllm.RawRequest(
         prompt = req_dict["prompt"],
-        output_len = req_dict["output_len"]
+        max_output_len = req_dict["output_len"]
     )
 
     if req_dict.get("stream", False):
@@ -55,7 +55,7 @@ if __name__ == "__main__":
 
     host = args.pop("host")
     port = args.pop("port")
-    engine = swiftllm.Engine(swiftllm.EngineConfig(**args))
+    engine = swiftllm.AsyncEngine(swiftllm.EngineConfig(**args))
 
     uvicorn_config = uvicorn.Config(
         app,

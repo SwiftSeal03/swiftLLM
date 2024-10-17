@@ -19,7 +19,7 @@ logging.basicConfig(filename="e2e.log", level=logging.INFO)
 home = os.path.expanduser("~")
 tp = 2
 nparam = 70
-data_prefix = f"{home}/swiftLLM/data/d1016"
+data_prefix = f"{home}/swiftLLM/data/d1017"
 os.makedirs(data_prefix, exist_ok=True)
 
 engine = None
@@ -28,7 +28,7 @@ tokenizer = None
 # pylint: disable=missing-function-docstring
 
 last_output_token_ids = None
-async def send_request_and_wait_non_streaming_mode(prompt: str, output_len: int):
+async def send_request_and_wait_non_streaming_mode(prompt: str | list[int], output_len: int):
     raw_request = swiftllm.RawRequest(prompt, output_len)
     start = time.perf_counter()
     (_, output_token_ids) = await engine.add_request_and_wait(raw_request)
@@ -41,7 +41,7 @@ async def send_request_and_wait_non_streaming_mode(prompt: str, output_len: int)
     return start, end
 
 async def run_latency_test(
-    nrequests: int,
+    nreqs: int,
     prompt: str,
     output_len: int,
     req_rate: float,
@@ -49,12 +49,12 @@ async def run_latency_test(
 ):
     promptlen = len(tokenizer.encode(prompt))
     logger.info(
-        "Latency test: input_len=%d, output_len=%d, nrequests=%d, req_rate=%.2f, gpu_only=%s", 
-        promptlen, output_len, nrequests, req_rate, gpu_only
+        "Latency test: input_len=%d, output_len=%d, nreqs=%d, req_rate=%.2f, gpu_only=%s", 
+        promptlen, output_len, nreqs, req_rate, gpu_only
     )
     engine.engine_config.always_use_gpu = gpu_only
     tasks = []
-    for _ in range(nrequests):
+    for _ in range(nreqs):
         task = asyncio.create_task(send_request_and_wait_non_streaming_mode(prompt, output_len))
         tasks.append(task)
         await asyncio.sleep(1/req_rate)
@@ -64,7 +64,7 @@ async def run_latency_test(
     logger.info("Average completion time: %.3f s", average_completion_time)
 
 async def run_throughput_test(
-    prompts: list[str],
+    prompts: list[str] | list[list[int]],
     output_lens: list[int],
     gpu_only: bool,
     data_file: str
@@ -76,7 +76,7 @@ async def run_throughput_test(
     n = len(prompts)
     engine.itr_end_times = []
     engine.ntoken_of_itr = []
-    for i, prompt, output_len in zip(range(n), prompts, output_lens):
+    for prompt, output_len in zip(prompts, output_lens):
         task = asyncio.create_task(send_request_and_wait_non_streaming_mode(prompt, output_len))
         tasks.append(task)
     req_times = await asyncio.gather(*tasks)
@@ -95,15 +95,17 @@ async def run_throughput_test(
     logger.info("Throughput: %.3f req/s", throughput)
 
 async def run_mock_throughput_test(
-    nrequests: int,
-    prompt: str,
+    nreqs: int,
+    prompt: str | list[int],
     output_len: int,
     gpu_only: bool
 ):
-    promptlen = len(tokenizer.encode(prompt))
-    data_file = f"{data_prefix}/{nrequests}-{promptlen}-{output_len}-{gpu_only}.json"
-    logger.info("Mock throughput test: input_len=%d, output_len=%d, nrequests=%d, gpu_only=%s", promptlen, output_len, nrequests, gpu_only)
-    await run_throughput_test([prompt] * nrequests, [output_len] * nrequests, gpu_only, data_file)
+    if isinstance(prompt, str):
+        prompt = tokenizer.encode(prompt)
+    input_len = len(prompt)
+    data_file = f"{data_prefix}/{nreqs}-{input_len}-{output_len}-{gpu_only}.json"
+    logger.info("Mock throughput test: input_len=%d, output_len=%d, nreqs=%d, gpu_only=%s", input_len, output_len, nreqs, gpu_only)
+    await run_throughput_test([prompt] * nreqs, [output_len] * nreqs, gpu_only, data_file)
 
 async def run_real_throughput_test(
     dataset_name: str,
@@ -176,23 +178,27 @@ async def main():
         prompts = [' '.join(text[:i]) for i in range(1, len(text)+1, 2)]
     
     print([len(tokenizer.encode(prompt)) for prompt in prompts])
+    prompt_token_ids = tokenizer.encode(prompts[-1])
 
     logger.info("Warming up...")
-    await run_mock_throughput_test(100, prompts[9], 200, False)
+    await run_mock_throughput_test(nreqs=100, prompt=prompt_token_ids[:400], output_len=200, gpu_only=False)
 
     # for gpu_only in [False, True]:
     #     await run_real_throughput_test(
     #         "arxiv-summarization-test", 
     #         f"{home}/arxiv-dataset/test_input_prompts.txt", 
     #         f"{home}/arxiv-dataset/test_output_tokens.npy", 
-    #         gpu_only
+    #         gpu_onlye2e
     #     )
 
-    for prompt in prompts:
-        if len(tokenizer.encode(prompt)) == 1038:
-            for outlen in [50, 100, 200, 500]:
-                await run_mock_throughput_test(2000, prompt, outlen, False)
-                await run_mock_throughput_test(2000, prompt, outlen, True)
+    for outlen in [50, 100, 200, 500]:
+        inlen = 1000
+        assert inlen <= len(prompt_token_ids), "Input length exceeds the length of the prompt"
+        cur_prompt = prompt_token_ids[:inlen]
+        print(f"cur_prompt: {cur_prompt}")
+        for gpu_only in [False, True]:
+            await run_mock_throughput_test(nreqs=2000, prompt=cur_prompt, output_len=outlen, gpu_only=gpu_only)
+
     # for prompt in prompts:
     #     if len(tokenizer.encode(prompt)) == 99:
     #         for rate in [0.8 + i * 0.2 for i in range(6)]:

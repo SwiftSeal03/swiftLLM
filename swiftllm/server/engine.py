@@ -140,7 +140,16 @@ class AsyncEngine(Engine):
         Return the output token ids
         """
         request = Request(raw_request)
-        self.untokenized_raw_requests.append((request, raw_request.prompt))
+        if isinstance(raw_request.prompt, str):
+            self.untokenized_raw_requests.append((request, raw_request.prompt))
+        else:
+            # Already tokenized, directly add to the scheduler
+            request.prompt_token_ids = raw_request.prompt
+            request.prompt_len = len(raw_request.prompt)
+            assert request.prompt_len + request.max_output_len <= self.engine_config.max_seq_len, \
+                f"Request length {request.prompt_len + request.output_len} exceeds max_seq_len {self.engine_config.max_seq_len}"
+            self.scheduler.on_requests_arrival([request])
+
         await request.finished_event.wait()
         return (request, request.output_token_ids)
     

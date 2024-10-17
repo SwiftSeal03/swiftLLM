@@ -16,12 +16,12 @@ class RawRequest:
     """
     A request issued by user
     """
-    prompt: str
+    prompt: str | list[int]
     max_output_len: int
 
-    def __init__(self, prompt: str, output_len: int):
+    def __init__(self, prompt: str | list[int], max_output_len: int):
         self.prompt = prompt
-        self.max_output_len = output_len
+        self.max_output_len = max_output_len
 
 
 class Request:
