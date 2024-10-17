@@ -36,11 +36,11 @@ class LlamaModelConfig:
         self.rank = None
         self.world_size = None
 
-    def get_kvslot_size(self, dtype: torch.dtype = torch.float16) -> int:
+    def get_kvslot_size(self, extra_layer: bool, dtype: torch.dtype = torch.float16) -> int:
         """
         Get the size of one kv slot (the kv cache of one token) (in bytes)
         """
-        return (2 * self.num_layers * self.num_kv_heads * self.head_dim) * dtype.itemsize
+        return (2 * (self.num_layers + extra_layer) * self.num_kv_heads * self.head_dim) * dtype.itemsize
 
     @property
     def softmax_scale(self) -> float:

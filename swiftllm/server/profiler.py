@@ -427,7 +427,7 @@ class ModelProfiler:
                     f"Peak memory {peak_memory/GB:.2f} GB exceeds usable memory {useable_memory/GB:.2f} GB "
                     f"({total_memory/GB:.2f} GB * {engine_config.gpu_mem_utilization})"
                 )
-            block_size_bytes = engine_config.block_size * model_config.get_kvslot_size()
+            block_size_bytes = engine_config.block_size * model_config.get_kvslot_size(engine_config.extra_layer_for_cprf)
             num_gpu_blocks = math.floor((useable_memory - peak_memory) / block_size_bytes)
 
             torch.cuda.empty_cache()
@@ -438,6 +438,6 @@ class ModelProfiler:
 
         num_gpu_blocks = self.engine_config.num_gpu_blocks
         num_cpu_blocks = self.engine_config.num_cpu_blocks
-        block_size_bytes = self.engine_config.block_size*self.model_config.get_kvslot_size()
+        block_size_bytes = self.engine_config.block_size * self.model_config.get_kvslot_size(self.engine_config.extra_layer_for_cprf)
         print(f"[Engine.profiler] Number of GPU blocks: {num_gpu_blocks} ({num_gpu_blocks*block_size_bytes/GB:.2f} GB)")
         print(f"[Engine.profiler] Number of CPU blocks: {num_cpu_blocks} ({num_cpu_blocks*block_size_bytes/GB:.2f} GB)")
