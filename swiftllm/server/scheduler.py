@@ -297,11 +297,11 @@ class Scheduler:
             candidate = self.waiting_q.popleft()
             candidate.request_id = self.request_id_manager.get_id()
 
-        if self.gpu_decoding_q or self.cpu_decoding_q or pref_to_gpu or pref_to_cpu or self.waiting_q:
-            print(
-                f"Gdecs: {len(self.gpu_decoding_q)}, Cdecs: {len(self.cpu_decoding_q)}, "
-                f"Pr2gs: {len(pref_to_gpu)}, Pr2cs: {len(pref_to_cpu)}, Waiting: {len(self.waiting_q)}"
-            )     
+        # if self.gpu_decoding_q or self.cpu_decoding_q or pref_to_gpu or pref_to_cpu or self.waiting_q:
+        #     print(
+        #         f"Gdecs: {len(self.gpu_decoding_q)}, Cdecs: {len(self.cpu_decoding_q)}, "
+        #         f"Pr2gs: {len(pref_to_gpu)}, Pr2cs: {len(pref_to_cpu)}, Waiting: {len(self.waiting_q)}"
+        #     )     
 
         self.gpu_decoding_q.extend(pref_to_gpu)
         self.cpu_decoding_q.extend(pref_to_cpu)
