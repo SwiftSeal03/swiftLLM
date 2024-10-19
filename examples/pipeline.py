@@ -23,7 +23,7 @@ if __name__ == '__main__':
         "--model-path",
         help="Path to the model. Note: please download the model weights from HuggingFace in advance and specify the path here.",
         type=str,
-        default=f"{home}/weights/Llama-2-{nparam}b-hf"
+        default=f"{home}/weights/Llama-3-{nparam}B"
     )
     parser.add_argument(
         "--library-path",
@@ -46,9 +46,9 @@ if __name__ == '__main__':
         use_dummy = False,
 
         block_size = 16,
-        gpu_mem_utilization = 0.995,
-        num_gpu_blocks = 1300,
-        num_cpu_blocks = 500,
+        gpu_mem_utilization = 0.99,
+        num_gpu_blocks_override = 1300,
+        swap_space = 10,
         max_seqs_in_block_table = 1024,
         max_blocks_per_seq = 512,
 
@@ -60,7 +60,6 @@ if __name__ == '__main__':
         profile_result_path=profile_result_path,
 
         extra_layer_for_cprf=True,
-
         tensor_parallel_degree=tp
     )
 

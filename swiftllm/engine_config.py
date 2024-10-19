@@ -18,8 +18,8 @@ class EngineConfig:
     # PagedAttention-related parameters
     block_size: int
     gpu_mem_utilization: float
-    num_cpu_blocks: int
-    num_gpu_blocks: int # Could be derived from the profiler
+    num_gpu_blocks_override: int # -1 for not overriding
+    swap_space: int
     max_seqs_in_block_table: int
     max_blocks_per_seq: int
 
@@ -28,17 +28,20 @@ class EngineConfig:
     max_tokens_in_batch: int
 
     # External paths
-    library_path: str = None
-    profile_result_path: str = None
+    library_path: str
+    profile_result_path: str
 
     # Switches
-    profile_num_blocks: bool = False    # Only used upon initialization
-    extra_layer_for_cprf: bool = False  # Fixed after initialization
+    extra_layer_for_cprf: bool = True   # Fixed after initialization
     monitor_performance: bool = False   # Can be altered while running
     always_use_gpu: bool = False        # Can be altered while running
 
     # Parallel parameter
     tensor_parallel_degree: int = 1
+
+    # Derived parameters
+    num_cpu_blocks: int = -1
+    num_gpu_blocks: int = -1
 
     @property
     def max_seq_len(self) -> int:
@@ -91,10 +94,16 @@ class EngineConfig:
             help="Fraction of GPU memory to be used",
         )
         parser.add_argument(
-            "--num-cpu-blocks",
+            "--num-gpu-blocks-override",
             type=int,
-            default=10000,
-            help="Number of CPU blocks",
+            default=-1,
+            help="Override the number of GPU blocks",
+        )
+        parser.add_argument(
+            "--swap-space",
+            type=int,
+            default=20,
+            help="Swap space in GB",
         )
         parser.add_argument(
             "--max-seqs-in-block-table",
@@ -127,9 +136,14 @@ class EngineConfig:
             type=str,
             help="Path to the external library",
         )
-
         parser.add_argument(
-            "--monitor-performance",
-            action="store_true",
-            help="Monitor performance",
+            "--profile-result-path",
+            type=str,
+            help="Path to the profiling results",
+        )
+        parser.add_argument(
+            "--tensor-parallel-degree",
+            type=int,
+            default=1,
+            help="Degree of tensor parallelism",
         )

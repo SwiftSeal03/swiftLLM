@@ -192,10 +192,14 @@ class LlamaModel:
     
 
     @torch.inference_mode()
-    def init_kvcache_and_swap(self):
+    def init_kvcache_and_swap(self, engine_config: EngineConfig):
         """
         Initialize the key-value cache on both CPU and GPU.
+
+        Update engine config
         """
+        self.engine_config.num_cpu_blocks = engine_config.num_cpu_blocks
+        self.engine_config.num_gpu_blocks = engine_config.num_gpu_blocks
         self.swapper = Swapper(self.engine_config, self.model_config)
 
         for layer in self.transformer_layers:
@@ -203,7 +207,7 @@ class LlamaModel:
 
 
     def _init_to_get_rotary(self):
-        rope_scaling_factor = self.model_config.rope_scaling
+        rope_scaling_factor = self.model_config.rope_scaling_factor
         base = self.model_config.rope_theta
         # max_position_embeddings = self.model_config.max_position_embeddings
         # max_seq_len = max_position_embeddings * rope_scaling_factor

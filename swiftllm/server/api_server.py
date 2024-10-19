@@ -13,7 +13,7 @@ TIMEOUT_KEEP_ALIVE = 5  # in seconds
 app = fastapi.FastAPI()
 engine = None
 
-@app.post("/generate")
+@app.post("/v1/completions")
 async def generate(req: fastapi.Request) -> fastapi.Response:
     """
     Generate completion for the request.
@@ -25,7 +25,7 @@ async def generate(req: fastapi.Request) -> fastapi.Response:
     req_dict = await req.json()
     raw_request = swiftllm.RawRequest(
         prompt = req_dict["prompt"],
-        max_output_len = req_dict["output_len"]
+        max_output_len = req_dict["max_tokens"]
     )
 
     if req_dict.get("stream", False):
@@ -41,7 +41,7 @@ async def generate(req: fastapi.Request) -> fastapi.Response:
         # TODO Abort the request when the client disconnects
         (_, output_token_ids) = await engine.add_request_and_wait(raw_request)
         return fastapi.responses.JSONResponse(
-            content={"output_token_ids": output_token_ids}
+            content={"choices": [{"text": output_token_ids}]}
         )
 
 if __name__ == "__main__":
@@ -67,7 +67,7 @@ if __name__ == "__main__":
     uvicorn_server = uvicorn.Server(uvicorn_config)
 
     async def main_coroutine():
-        await engine.initialize()
+        await engine.initialize_async()
 
         uvicorn_task = asyncio.create_task(uvicorn_server.serve())
         engine_task = asyncio.create_task(engine.start_all_event_loops())

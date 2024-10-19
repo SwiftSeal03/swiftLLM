@@ -3,8 +3,10 @@ The main engine of the server
 """
 
 import time
+import sys
 import asyncio
 import functools
+import logging
 from typing import AsyncGenerator
 
 from swiftllm.engine_config import EngineConfig
@@ -16,6 +18,9 @@ from swiftllm.structs import Request, RawRequest, StepOutput, SubBatch
 from swiftllm.server.tokenization_engine import TokenizationEngine
 from swiftllm.server.scheduler import Scheduler
 from swiftllm.server.block_manager import BlockManager
+
+logger = logging.getLogger(__name__)
+logging.basicConfig(stream=sys.stdout, level=logging.INFO, datefmt='%Y-%m-%d %H:%M:%S')
 
 class Engine:
     """
@@ -45,20 +50,20 @@ class Engine:
         """
         Initialize the engine
         """
-        print("[Engine] Initializing executor...")
+        logger.info("Initializing model...")
         self.executor = self.executor_class(self.engine_config, self.model_config)
 
-        print("[Engine] Profiling kv blocks...")
+        logger.info("Profiling model...")
         self.profiler = ModelProfiler(self.executor)
         self.profiler.profile_num_blocks()
 
-        print("[Engine] Initializing block manager...")
+        logger.info("Initializing block manager...")
         self.block_manager = BlockManager(self.engine_config, self.model_config)
 
-        print("[Engine] Allocating kv cache and swap...")
+        logger.info("Initializing KV cache and swap...")
         self.executor.init_kvcache_and_swap()
 
-        print("[Engine] Model initialized")
+        logger.info("Model initialized")
         self.initialized = True
 
 
@@ -105,17 +110,17 @@ class AsyncEngine(Engine):
 
         super().initialize()
 
-        print("[Engine] Initializing performance table...")
+        logger.info("Initializing performance table...")
         self.profiler.init_profile_tables(self.block_manager)
 
-        print("[Engine] Initializing scheduler...")
+        logger.info("Initializing scheduler...")
         self.scheduler = Scheduler(self.engine_config, self.model_config, self.profiler.pp)
 
-        print("[Engine] Initializing tokenization engine...")
+        logger.info("Initializing tokenization engine...")        
         # pylint: disable=no-member
         self.tokenization_engine = TokenizationEngine.remote(self.engine_config)
 
-        print("[Engine] Async Engine initialized")
+        logger.info("Engine initialized")
         self.initialized = True
 
 
@@ -189,8 +194,6 @@ class AsyncEngine(Engine):
         """
         while True:
             # Get the next batch from the scheduler
-            start = time.perf_counter()
-
             batches, cur_swap_out, cur_swap_in = self.scheduler.get_next_batch()
             if not (len(batches) or len(cur_swap_in) or len(cur_swap_out)):
                 # Nothing to do, sleep for a bit
@@ -199,10 +202,11 @@ class AsyncEngine(Engine):
 
             # Prepare model forward arguments
             forward_args = self.block_manager.prepare(batches, cur_swap_out, cur_swap_in)
-            prepare_end = time.perf_counter()
             
             # Forward the model
-            print(f"Forwarding model with {len(batches)} batches with sizes {[b.batch_size for b in batches]}, swap out: {len(cur_swap_out)}, swap in: {len(cur_swap_in)}")
+            if any(b.num_prefs for b in batches):
+                logger.info(f"Forwarding batches with sizes {[b.batch_size for b in batches]},"
+                            f"swap out: {len(cur_swap_out)}, swap in: {len(cur_swap_in)}")
             output_token_ids = await self._run_on_model_executor_async(self.executor.do_one_iteration, batches, *forward_args)
 
             # Deal with output tokens
@@ -210,10 +214,10 @@ class AsyncEngine(Engine):
             self.scheduler.remove_finished_requests(finished_reqs)
             iter_end = time.perf_counter()
 
-            print(
-                f"Time: {iter_end-start:.3f}s, scheduler: {prepare_end-start:.3f}s, "
-                f"forward: {iter_end-prepare_end:.3f}s"
-            )
+            # logger.info(
+            #     f"Time: {iter_end-start:.3f}s, scheduler: {prepare_end-start:.3f}s, "
+            #     f"forward: {iter_end-prepare_end:.3f}s"
+            # )
             self.itr_end_times.append(iter_end)
             self.ntoken_of_itr.append(len(output_token_ids))
     

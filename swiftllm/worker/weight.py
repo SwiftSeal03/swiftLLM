@@ -246,7 +246,7 @@ def load_weights(
                         if split else slice(0, size)
                         for size, split in item.shape_with_split
                     ]
-                    tensor = whole[slices]        
+                    tensor = whole[slices]
                 return tensor.to(item.dtype)
             getter = weight_getter_real
 

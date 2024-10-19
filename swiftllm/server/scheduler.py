@@ -2,6 +2,8 @@
 A smart scheduler for the SwiftLLM engine that does batch picking and mode selection.
 """
 
+import sys
+import logging
 from collections import deque
 
 from swiftllm.engine_config import EngineConfig
@@ -9,6 +11,9 @@ from swiftllm.model_config import LlamaModelConfig
 from swiftllm.utils import cdiv
 from swiftllm.structs import Request, SubBatch
 from swiftllm.perfpredictor import PerfPredictor
+
+logger = logging.getLogger(__name__)
+logging.basicConfig(stream=sys.stdout, level=logging.INFO, datefmt='%Y-%m-%d %H:%M:%S')
 
 class RequestIdManager:
     """
@@ -297,11 +302,11 @@ class Scheduler:
             candidate = self.waiting_q.popleft()
             candidate.request_id = self.request_id_manager.get_id()
 
-        # if self.gpu_decoding_q or self.cpu_decoding_q or pref_to_gpu or pref_to_cpu or self.waiting_q:
-        #     print(
-        #         f"Gdecs: {len(self.gpu_decoding_q)}, Cdecs: {len(self.cpu_decoding_q)}, "
-        #         f"Pr2gs: {len(pref_to_gpu)}, Pr2cs: {len(pref_to_cpu)}, Waiting: {len(self.waiting_q)}"
-        #     )     
+        if pref_to_gpu or pref_to_cpu:
+            logger.info(
+                "Gdecs: %d, Cdecs: %d, Pr2gs: %d, Pr2cs: %d, Waiting: %d",
+                len(self.gpu_decoding_q), len(self.cpu_decoding_q), len(pref_to_gpu), len(pref_to_cpu), len(self.waiting_q)
+            )
 
         self.gpu_decoding_q.extend(pref_to_gpu)
         self.cpu_decoding_q.extend(pref_to_cpu)

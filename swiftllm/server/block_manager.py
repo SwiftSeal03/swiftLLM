@@ -65,7 +65,7 @@ class DeviceBlockManager:
         is_block_free = self.is_block_free[split_id]
         if num_blocks > self.num_free_blocks[split_id]:
             raise RuntimeError(
-                f"No enough free blocks available on {self.device_name} ({self.num_blocks} in total, "
+                f"No enough free blocks available on {self.device_name} split {split_id} ({self.num_blocks} in total, "
                 f"{self.num_free_blocks[split_id]} free, {num_blocks} requested)"
             )
             
@@ -157,8 +157,8 @@ class BlockManager:
         Return new block VIDs to block PIDs mappings on both CPU and GPU. 
         """
         return (
-            self.gpu_block_manager.alloc(batch.all_reqs[:batch.num_prgds], split_point=batch.num_cprfs * self.extra_layer_for_cprf),
-            self.cpu_block_manager.alloc(batch.all_reqs[batch.num_prgds:])
+            self.gpu_block_manager.alloc(batch.all_reqs[:batch.num_prgds], split_point=batch.num_cprfs * self.extra_layer_for_cprf, omit_last=False),
+            self.cpu_block_manager.alloc(batch.all_reqs[batch.num_prgds:], omit_last=False)
         )
     
 
@@ -173,7 +173,8 @@ class BlockManager:
         self,
         reqs: list[Request],
         is_swap_out: bool,
-        use_itm: bool = False # Only true when swapping out from intermediate cache to CPU
+        use_itm: bool = False, # Only true when swapping out from intermediate cache to CPU
+        omit_last: bool = True # Normally we don't need to allocate block new token(s), except for CPU prefills
     ) -> tuple[list[int], list[int], list[int]]:
         """
         Do all the set-up work for swapping in/out sequences.
@@ -187,7 +188,7 @@ class BlockManager:
         src_block_manager = self.gpu_block_manager if is_swap_out else self.cpu_block_manager
         dst_block_manager = self.cpu_block_manager if is_swap_out else self.gpu_block_manager
         src_blk_pids = src_block_manager.free(reqs, int(use_itm))
-        dst_blk_vids, dst_blk_pids = dst_block_manager.alloc(reqs, omit_last=True)
+        dst_blk_vids, dst_blk_pids = dst_block_manager.alloc(reqs, omit_last=omit_last)
         return src_blk_pids, dst_blk_vids, dst_blk_pids
 
     
@@ -249,8 +250,8 @@ class BlockManager:
         # 3. Do cprf swaps, this should happen after the batch allocation
         for batch in batches:
             sp, dv, dp = self._initiate_swap(
-                batch.all_reqs[:batch.num_cprfs],
-                is_swap_out=True, use_itm=self.engine_config.extra_layer_for_cprf
+                batch.all_reqs[:batch.num_cprfs], is_swap_out=True, 
+                use_itm=self.engine_config.extra_layer_for_cprf, omit_last=False
             )
             batch.src_blk_ids = sp
             batch.dst_blk_ids = dp

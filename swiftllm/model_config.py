@@ -27,10 +27,12 @@ class LlamaModelConfig:
         self.ffn_inter_dim = model_config["intermediate_size"]
         self.rotary_base = model_config.get("rope_theta", model_config.get("rotary_base", 10000))
         self.rms_norm_eps = model_config["rms_norm_eps"]
-        self.rope_scaling = model_config.get("rope_scaling", 1.0)
         self.rope_theta = model_config.get("rope_theta", 10000)
-        if self.rope_scaling is None:
-            self.rope_scaling = 1.0
+        rope_scaling = model_config.get("rope_scaling", None)
+        if rope_scaling is None:
+           self.rope_scaling_factor = 1.0
+        else:
+            self.rope_scaling_factor = rope_scaling['factor']
         assert model_config["hidden_act"] == "silu"
 
         self.rank = None

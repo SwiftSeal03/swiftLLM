@@ -132,7 +132,7 @@ async def main():
         "--model-path",
         help="Path to the model. Note: please download the model weights from HuggingFace in advance and specify the path here.",
         type=str,
-        default=f"{home}/weights/Llama-2-{nparam}b-hf"
+        default=f"{home}/weights/Llama-3-{nparam}B"
     )
     parser.add_argument(
         "--streaming",
@@ -149,12 +149,12 @@ async def main():
         
         block_size = 16,
         gpu_mem_utilization = 0.995,
-        num_gpu_blocks = 1300,
-        num_cpu_blocks = 30000,
+        num_gpu_blocks_override = 1333,
+        swap_space=140,
         max_seqs_in_block_table = 1024,
-        max_blocks_per_seq = 1280,
+        max_blocks_per_seq = (20480 - 1) // 16 + 1,
 
-        max_batch_size = 512,
+        max_batch_size = 1024,
         max_tokens_in_batch = 20480,
 
         library_path=f"{home}/pacpu/build/libpacpu-llama2_{nparam}b-tp{tp}.so",

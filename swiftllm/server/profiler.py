@@ -4,8 +4,11 @@ This module provides a profiler for the Llama model.
 
 import time
 import os
+import sys
 import json
 import math
+import logging
+
 import torch
 from tqdm import tqdm
 import numpy as np
@@ -18,6 +21,9 @@ from swiftllm.utils import GB
 from swiftllm.worker.model import ModelPerfResult
 from swiftllm.server.block_manager import BlockManager
 from swiftllm.server.executor import Executor
+
+logger = logging.getLogger(__name__)
+logging.basicConfig(stream=sys.stdout, level=logging.INFO, datefmt='%Y-%m-%d %H:%M:%S')
 
 class ModelProfiler:
     """
@@ -286,6 +292,8 @@ class ModelProfiler:
                 table = json.load(f)
             if table["S_list"] == S_list and table["N_lists"] == N_lists:
                 return table["T_lists"]
+            if table["S_list"][-1] >= S_list[-1] and table["N_lists"][-1][-1] >= N_lists[-1][-1]:
+                return table["T_lists"]
             
         print(f"Profiling CPU attention part with S_list={S_list}, N_lists={N_lists} ...")
             
@@ -394,12 +402,15 @@ class ModelProfiler:
 
         Finally, we set the number of GPU blocks in the engine configuration.
         """
-        if self.engine_config.profile_num_blocks:
+        engine_config = self.engine_config
+        model_config = self.model_config
+        block_size_bytes = engine_config.block_size * model_config.get_kvslot_size(engine_config.extra_layer_for_cprf)
+        engine_config.num_cpu_blocks = engine_config.swap_space * GB // block_size_bytes
+
+        if self.engine_config.num_gpu_blocks_override == -1:
             torch.cuda.empty_cache()
             torch.cuda.reset_peak_memory_stats()
 
-            engine_config = self.engine_config
-            model_config = self.model_config
             ws = self.engine_config.tensor_parallel_degree
 
             # Synthesis a prefill batch
@@ -427,17 +438,16 @@ class ModelProfiler:
                     f"Peak memory {peak_memory/GB:.2f} GB exceeds usable memory {useable_memory/GB:.2f} GB "
                     f"({total_memory/GB:.2f} GB * {engine_config.gpu_mem_utilization})"
                 )
-            block_size_bytes = engine_config.block_size * model_config.get_kvslot_size(engine_config.extra_layer_for_cprf)
-            num_gpu_blocks = math.floor((useable_memory - peak_memory) / block_size_bytes)
-
+            
             torch.cuda.empty_cache()
-            engine_config.num_gpu_blocks = num_gpu_blocks
+            engine_config.num_gpu_blocks = math.floor((useable_memory - peak_memory) / block_size_bytes)
+        else:
+            engine_config.num_gpu_blocks = engine_config.num_gpu_blocks_override
 
-        assert self.engine_config.num_gpu_blocks * self.engine_config.block_size >= self.engine_config.max_tokens_in_batch, \
-            "Number of GPU blocks is not enough to hold the maximum batch size"
+        assert engine_config.num_gpu_blocks * self.engine_config.block_size >= self.engine_config.max_tokens_in_batch, \
+            f"Number of GPU blocks {self.engine_config.num_gpu_blocks} is not enough to hold the maximum batch size"
 
-        num_gpu_blocks = self.engine_config.num_gpu_blocks
-        num_cpu_blocks = self.engine_config.num_cpu_blocks
-        block_size_bytes = self.engine_config.block_size * self.model_config.get_kvslot_size(self.engine_config.extra_layer_for_cprf)
-        print(f"[Engine.profiler] Number of GPU blocks: {num_gpu_blocks} ({num_gpu_blocks*block_size_bytes/GB:.2f} GB)")
-        print(f"[Engine.profiler] Number of CPU blocks: {num_cpu_blocks} ({num_cpu_blocks*block_size_bytes/GB:.2f} GB)")
+        num_gpu_blocks = engine_config.num_gpu_blocks
+        num_cpu_blocks = engine_config.num_cpu_blocks
+        logger.info(f"[Engine.profiler] Number of GPU blocks: {num_gpu_blocks} ({num_gpu_blocks * block_size_bytes/GB:.2f} GB)")
+        logger.info(f"[Engine.profiler] Number of CPU blocks: {num_cpu_blocks} ({num_cpu_blocks * block_size_bytes/GB:.2f} GB)")

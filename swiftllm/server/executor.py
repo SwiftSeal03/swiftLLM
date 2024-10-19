@@ -75,7 +75,7 @@ class SingleProcExecutor(Executor):
 
     
     def init_kvcache_and_swap(self):
-        self.model.init_kvcache_and_swap()
+        self.model.init_kvcache_and_swap(self.engine_config)
 
     
     def do_one_iteration(self, *args) -> list[int]:
@@ -110,7 +110,7 @@ class RayExecutor(Executor):
     
     
     def init_kvcache_and_swap(self):
-        ray.get([model.init_kvcache_and_swap.remote() for model in self.models])
+        ray.get([model.init_kvcache_and_swap.remote(self.engine_config) for model in self.models])
 
     
     def do_one_iteration(self, *args) -> list[int]:
