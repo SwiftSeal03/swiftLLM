@@ -11,7 +11,7 @@ home = os.path.expanduser("~")
 with open(f"{home}/swiftLLM/evaluation/config.json") as f:
     config = json.load(f)
 
-model_path = f"/home/aleria/weights/{config['model']}/"
+model_path = f"{home}/weights/{config['model']}/"
 tokenizer = AutoTokenizer.from_pretrained(model_path)
 
 async def request_completions(
