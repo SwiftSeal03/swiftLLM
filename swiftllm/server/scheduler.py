@@ -128,13 +128,6 @@ class Scheduler:
 
     def _get_remains(self, batches: list[SubBatch]) -> float:
         assert len(batches) == 2
-        print([
-            [batches[j^1].perfdata.linr_T,
-            batches[j].perfdata.pref_T, 
-            batches[j].perfdata.gdec_T,
-            batches[j].perfdata.cpu_time]
-            for j in range(2)
-        ])
         return [
             batches[j^1].perfdata.linr_T + 
             batches[j].perfdata.pref_T + 
@@ -205,7 +198,6 @@ class Scheduler:
                 batches[next_batch_idx].pop_cdec()
                 continue
             next_batch_idx = remains[1] > remains[0]
-            print("Remains: ", remains)
 
         if not batches[1]:
             return [gpu_only_batch] # This is to prevent division by zero
