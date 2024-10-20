@@ -23,8 +23,8 @@ os.makedirs(res_dir, exist_ok=True)
 api_url = "http://localhost:8000/v1/completions"
 server_name = None
 
-with open(f"{home}/swiftLLM/evaluation/config.json") as f:
-    config = json.load(f)
+with open(f"{home}/swiftLLM/evaluation/config.json") as cf:
+    config = json.load(cf)
 
 
 async def request_completions_task(prompt: list[int], output_len: int):
@@ -34,27 +34,31 @@ async def request_completions_task(prompt: list[int], output_len: int):
     return start, end
 
 
-async def run_latency_test(
+async def run_test(
     prompts: list[list[int]],
     output_lens: list[int],
     res_prefix: str,
-    rate: float
+    rate: float = -1 # -1 means throughput test
 ):
-    res_file = f"{res_prefix}-lat-{str(rate).replace('.', '_')}.json"
+    if rate > 0:
+        res_file = f"{res_prefix}-lat-{str(rate).replace('.', '_')}.json"
+    else:
+        res_file = f"{res_prefix}-tp.json"
 
     if os.path.exists(res_file):
-        logger.info("Latency test result file already exists: %s", res_file)
+        logger.info("Test result file already exists: %s", res_file)
         with open(res_file, "r") as f:
             data = json.load(f)
             times = [(d["start"], d["end"]) for d in data]
     else:
-        logger.info("Running latency test, saving results to %s", res_file)
+        logger.info("Running test, saving results to %s", res_file)
         
         tasks = []
         for prompt, output_len in tqdm(zip(prompts, output_lens)):
             task = asyncio.create_task(request_completions_task(prompt, output_len))
             tasks.append(task)
-            await asyncio.sleep(1 / rate)
+            if rate > 0:
+                await asyncio.sleep(1 / rate)
         times = await asyncio.gather(*tasks)
         with open(res_file, "w") as f:
             json.dump([{
@@ -64,39 +68,19 @@ async def run_latency_test(
                 "end": end
             } for (start, end), prompt, output_len in zip(times, prompts, output_lens)], f, indent=4)
 
-    comp_times = [end - start for start, end in times]
-    pertok_times = [comp_time / (len(prompt) + output_len) for comp_time, prompt, output_len in zip(comp_times, prompts, output_lens)]
-    average_completion_time = sum(comp_times) / len(comp_times)
-    average_pertok_time = sum(pertok_times) / len(pertok_times)
-    logger.info("Average completion time: %.3f s", average_completion_time)
-    logger.info("Average per-token completion time: %.3f s", average_pertok_time)
-
-
-async def run_throughput_test(
-  prompts: list[list[int]],
-  output_lens: list[int],
-  res_prefix: str
-):
-    res_file = f"{res_prefix}-tp.json"
-    logger.info("Running throughput test, saving results to %s", res_file)
-    
-    tasks = []
-    for prompt, output_len in zip(prompts, output_lens):
-        task = asyncio.create_task(request_completions_task(prompt, output_len))
-        tasks.append(task)
-    req_times = await asyncio.gather(*tasks)
-    req_end_times = sorted([end for _, end in req_times])
-    with open(res_file, "w") as f:
-        deltas = [req_end_times[i] - req_end_times[i-1] for i in range(1, len(req_end_times))]
-        json.dump({
-            "req_end_deltas": deltas
-        }, f, indent=4)
-    
-    # Omit first 10% and last 30% of requests to leave out warm-up and cool-down periods
-    n = len(prompts)
-    req_end_times = req_end_times[n // 10: n - n // 10 * 3 + 1]
-    throughput = (len(req_end_times) - 1) / (req_end_times[-1] - req_end_times[0])
-    logger.info("Throughput: %.3f req/s", throughput)
+    if rate > 0:
+        comp_times = [end - start for start, end in times]
+        pertok_times = [comp_time / (len(prompt) + output_len) for comp_time, prompt, output_len in zip(comp_times, prompts, output_lens)]
+        average_completion_time = sum(comp_times) / len(comp_times)
+        average_pertok_time = sum(pertok_times) / len(pertok_times)
+        logger.info("Average completion time: %.3f s", average_completion_time)
+        logger.info("Average per-token completion time: %.3f s", average_pertok_time)
+    else:
+        n = len(prompts)
+        req_end_times = sorted([end for _, end in times])
+        req_end_times = req_end_times[n // 10: n - n // 10 * 3 + 1]
+        throughput = (len(req_end_times) - 1) / (req_end_times[-1] - req_end_times[0])
+        logger.info("Throughput: %.3f req/s", throughput)
 
 
 def _get_rand_array(n: int, avg_val: int, ratio: float):
@@ -143,23 +127,23 @@ async def one_round(name: str):
     #     await run_latency_test(*prepare_real_test("arxiv"), 0.18)
     #     await run_latency_test(*prepare_real_test("arxiv"), 0.20)
     #     await run_latency_test(*prepare_real_test("arxiv"), 0.22)
-    await run_throughput_test(*prepare_mock_test(2000, 2000, 50))
-    await run_throughput_test(*prepare_mock_test(2000, 2000, 100))
-    await run_throughput_test(*prepare_mock_test(2000, 2000, 200))
-    await run_throughput_test(*prepare_mock_test(2000, 1000, 50))
-    await run_throughput_test(*prepare_mock_test(2000, 1000, 100))
-    await run_throughput_test(*prepare_mock_test(2000, 1000, 200))
-    await run_throughput_test(*prepare_mock_test(2000, 500, 50))
-    await run_throughput_test(*prepare_mock_test(2000, 500, 100))
-    await run_throughput_test(*prepare_mock_test(2000, 500, 200))
+    await run_test(*prepare_mock_test(2000, 2000, 50))
+    await run_test(*prepare_mock_test(2000, 2000, 100))
+    await run_test(*prepare_mock_test(2000, 2000, 200))
+    await run_test(*prepare_mock_test(2000, 1000, 50))
+    await run_test(*prepare_mock_test(2000, 1000, 100))
+    await run_test(*prepare_mock_test(2000, 1000, 200))
+    await run_test(*prepare_mock_test(2000, 500, 50))
+    await run_test(*prepare_mock_test(2000, 500, 100))
+    await run_test(*prepare_mock_test(2000, 500, 200))
     stop_server()
     await asyncio.sleep(10)
 
 
 async def main():
-    await one_round("base")
     await one_round("ours")
     # await one_round("vllm")
+    # await one_round("base")
 
 
 if __name__ == "__main__":
