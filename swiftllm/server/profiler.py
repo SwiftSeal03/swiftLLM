@@ -322,13 +322,27 @@ class ModelProfiler:
                 )
                 T_lists[-1].append(ModelPerfResult.mean(res, "avg_cdec_time"))
 
+        nS = len(S_list)
+        nN = len(self.pp.cdec_N_list_agg)
+        for i in range(nS):
+            for j in reversed(range(nN)):
+                if T_lists[i][j] == 0.0:
+                    assert i > 0 and j < nN - 1
+                    T_lists[i][j] = T_lists[i - 1][j] + T_lists[i][j + 1] - T_lists[i - 1][j + 1]
+
+        for i in reversed(range(nS)):
+            for j in range(nN):
+                if T_lists[i][j] == float("inf"):
+                    assert i < nS - 1 and j > 0
+                    T_lists[i][j] = T_lists[i + 1][j] + T_lists[i][j - 1] - T_lists[i + 1][j - 1]
+
         T_array = np.array(T_lists)
 
         plt.figure(figsize=(16, 12))
         ax = plt.axes(projection='3d')
         ax.plot_surface(
-            np.outer(S_list, np.ones(len(self.pp.cdec_N_list_agg))),
-            np.outer(np.ones(len(S_list)), self.pp.cdec_N_list_agg),
+            np.outer(S_list, np.ones(nN)),
+            np.outer(np.ones(nS), self.pp.cdec_N_list_agg),
             T_array,
             label = "CPU"
         )
