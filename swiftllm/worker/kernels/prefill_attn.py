@@ -4,7 +4,7 @@ import triton.language as tl
 
 from swiftllm.model_config import LlamaModelConfig
 from swiftllm.engine_config import EngineConfig
-from swiftllm.worker.infer_state import LlamaInferState
+from swiftllm.structs import SubBatch
 
 @triton.jit
 def _fwd_prefill_attention(
@@ -106,7 +106,7 @@ def prefill_attention(
     o: torch.Tensor,    # [num_prefill_tokens, num_q_heads, head_dim]
     model_config: LlamaModelConfig,
     engine_config: EngineConfig,
-    infer_state: LlamaInferState,
+    batch: SubBatch,
 ):
     is_rtx4090 = '4090' in torch.cuda.get_device_name(0)
     BLOCK_Q = 128 if not is_rtx4090 else 128
@@ -116,20 +116,21 @@ def prefill_attention(
     # small, large block size introduces unnecessary computation when computing
     # the attention score.
     # note: We restrict BLOCK_Q and BLOCK_K >= 16 due to a limitation proposed by tl.dot
-    BLOCK_Q = min(BLOCK_Q, triton.next_power_of_2(max(infer_state.max_prefill_len, 16)))
-    BLOCK_K = min(BLOCK_K, triton.next_power_of_2(max(infer_state.max_prefill_len, 16)))
+    BLOCK_Q = min(BLOCK_Q, triton.next_power_of_2(max(batch.max_pref_toks, 16)))
+    BLOCK_K = min(BLOCK_K, triton.next_power_of_2(max(batch.max_pref_toks, 16)))
 
     # Please refer to `paged_attn.py` for the reason of multiplying softmax_scale
     # by log2(e)
-    softmax_scale2 = infer_state.softmax_scale * 1.442695040888963
+    softmax_scale2 = model_config.softmax_scale * 1.442695040888963
 
     assert BLOCK_Q % BLOCK_K == 0
-    grid = (infer_state.num_prefill_seqs, model_config.num_q_heads, triton.cdiv(infer_state.max_prefill_len, BLOCK_Q))
+    grid = (batch.num_prefs, model_config.num_q_heads, triton.cdiv(batch.max_pref_toks, BLOCK_Q))
     num_warps = 8
     _fwd_prefill_attention[grid](
         o, q, k, v,
         softmax_scale2,
-        infer_state.prefill_seq_start_locs, infer_state.prefill_seq_lens,
+        batch.pref_st_locs_we[:-1], 
+        batch.prgd_seq_lens[:batch.num_prefs],
         model_config.num_q_heads, model_config.num_kv_heads,
         model_config.num_q_heads // model_config.num_kv_heads,
         model_config.head_dim,

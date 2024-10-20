@@ -259,7 +259,7 @@ class ModelProfiler:
         for N in tqdm(N_list):
             res = self._run_test_case_seq(
                 pref_lens=[],
-                gdec_lens=[L] * (N // L) + [N % L],
+                gdec_lens=[L] * ((N - 1) // L) + [(N - 1) % L + 1],
                 cdec_lens=[]
             )
             T_list.append(ModelPerfResult.mean(res, "avg_gdec_time"))
