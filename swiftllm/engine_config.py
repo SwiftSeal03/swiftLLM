@@ -32,7 +32,7 @@ class EngineConfig:
     profile_result_path: str
 
     # Switches
-    extra_layer_for_cprf: bool = True   # Fixed after initialization
+    extra_layer_for_cprf: bool          # Fixed after initialization
     monitor_performance: bool = False   # Can be altered while running
     always_use_gpu: bool = False        # Can be altered while running
 
@@ -146,4 +146,14 @@ class EngineConfig:
             type=int,
             default=1,
             help="Degree of tensor parallelism",
+        )
+        parser.add_argument(
+            "--always-use-gpu",
+            action="store_true",
+            help="Always use GPU",
+        )
+        parser.add_argument(
+            "--extra-layer-for-cprf",
+            action="store_true",
+            help="Use an extra layer for CPRF",
         )

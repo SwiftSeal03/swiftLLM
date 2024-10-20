@@ -151,6 +151,8 @@ class ModelProfiler:
                 table = json.load(f)
             if table["S_list"] == S_list:
                 return table["T_list"]
+            if table["S_list"][-1] >= S_list[-1]:
+                return table["T_list"]
         else:
             table = {
                 "S_list": [],
@@ -246,6 +248,8 @@ class ModelProfiler:
             with open(result_path, "r") as f:
                 res = json.load(f)
             if res["N_list"] == N_list:
+                return res["T_list"]
+            if res["N_list"][-1] >= N_list[-1]:
                 return res["T_list"]
             
         print(f"Profiling GPU attention part with N_list={N_list} ...")
@@ -404,8 +408,9 @@ class ModelProfiler:
         """
         engine_config = self.engine_config
         model_config = self.model_config
-        block_size_bytes = engine_config.block_size * model_config.get_kvslot_size(engine_config.extra_layer_for_cprf)
-        engine_config.num_cpu_blocks = engine_config.swap_space * GB // block_size_bytes
+        gpu_block_size_bytes = engine_config.block_size * model_config.get_kvslot_size(engine_config.extra_layer_for_cprf)
+        cpu_block_size_bytes = engine_config.block_size * model_config.get_kvslot_size(False)
+        engine_config.num_cpu_blocks = engine_config.swap_space * GB // cpu_block_size_bytes
 
         if self.engine_config.num_gpu_blocks_override == -1:
             torch.cuda.empty_cache()
@@ -440,7 +445,7 @@ class ModelProfiler:
                 )
             
             torch.cuda.empty_cache()
-            engine_config.num_gpu_blocks = math.floor((useable_memory - peak_memory) / block_size_bytes)
+            engine_config.num_gpu_blocks = math.floor((useable_memory - peak_memory) / gpu_block_size_bytes)
         else:
             engine_config.num_gpu_blocks = engine_config.num_gpu_blocks_override
 
@@ -449,5 +454,5 @@ class ModelProfiler:
 
         num_gpu_blocks = engine_config.num_gpu_blocks
         num_cpu_blocks = engine_config.num_cpu_blocks
-        logger.info(f"[Engine.profiler] Number of GPU blocks: {num_gpu_blocks} ({num_gpu_blocks * block_size_bytes/GB:.2f} GB)")
-        logger.info(f"[Engine.profiler] Number of CPU blocks: {num_cpu_blocks} ({num_cpu_blocks * block_size_bytes/GB:.2f} GB)")
+        logger.info(f"[Engine.profiler] Number of GPU blocks: {num_gpu_blocks} ({num_gpu_blocks * gpu_block_size_bytes/GB:.2f} GB)")
+        logger.info(f"[Engine.profiler] Number of CPU blocks: {num_cpu_blocks} ({num_cpu_blocks * cpu_block_size_bytes/GB:.2f} GB)")

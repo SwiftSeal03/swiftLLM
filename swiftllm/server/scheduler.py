@@ -239,7 +239,7 @@ class Scheduler:
         swap_out_threshold = self.engine_config.num_gpu_blocks
         # swap_in_threshold = round(swap_out_threshold * 0.95)
         # swap_out_threshold = self.engine_config.num_gpu_blocks
-        swap_in_threshold = swap_out_threshold * 0.95
+        swap_in_threshold = round(swap_out_threshold * 0.95)
         cpu_threshold = self.engine_config.num_cpu_blocks - self.engine_config.num_gpu_blocks
         
         # Step 1: Try to launch as many GPU decoding requests as possible
@@ -314,36 +314,6 @@ class Scheduler:
         return batches, swpout_reqs, swpin_reqs
 
     def _get_next_batch_old(self) -> tuple[list[SubBatch], list[Request], list[Request]]:
-        print(f"Waiting: {len(self.waiting_q)}, Gdecs: {len(self.gpu_decoding_q)}, Cdecs: {len(self.cpu_decoding_q)}")
-        if not self.cpu_decoding_q:
-            # Try to launch a new prefill batch
-            cur_batch = SubBatch()
-            cur_batch_block_needed = 0
-            cur_num_tokens_sum = 0
-            while self.waiting_q:
-                cur_seq: Request = self.waiting_q[0]
-                cur_seq_block_needed = self._get_block_needed(cur_seq)
-                if  len(cur_batch)+1 <= self.engine_config.max_batch_size and \
-                    len(self.gpu_decoding_q)+len(cur_batch)+1 <= self.engine_config.max_batch_size and \
-                    cur_batch_block_needed + cur_seq_block_needed + self.num_decoding_gpu_blocks <= self.engine_config.num_gpu_blocks and \
-                    cur_num_tokens_sum + cur_seq.prompt_len <= self.engine_config.max_tokens_in_batch:
-                    cur_batch.add_pref(cur_seq, True)
-                    cur_batch_block_needed += cur_seq_block_needed
-                    cur_num_tokens_sum += cur_seq.prompt_len
-                    self.waiting_q.popleft()
-                    
-                else:
-                    # Strict FCFS
-                    break
-            if len(cur_batch):
-                # Going to launch a prefill batch
-                # If you want decoding requests to be piggybacked, you can do it here
-                for req in cur_batch.gprf_reqs:
-                    req.request_id = self.request_id_manager.get_id()
-                self.gpu_decoding_q.extend(cur_batch.gprf_reqs)
-                self.num_decoding_gpu_blocks += cur_batch_block_needed
-                return [cur_batch], [], []
-        
         # Try to launch a decoding batch
         self.num_decoding_gpu_blocks = sum(self._get_block_needed(req) for req in self.gpu_decoding_q)
         newly_swapped_out = []
@@ -354,11 +324,40 @@ class Scheduler:
             self.num_decoding_gpu_blocks -= self._get_block_needed(victim)
             newly_swapped_out.append(victim)
         newly_swapped_out.reverse()   # Keep it in the order of arrival time
+        self.cpu_decoding_q.extendleft(newly_swapped_out)
+
+        if not self.cpu_decoding_q:
+            cur_batch = SubBatch()
+            cur_batch_block_needed = self.num_decoding_gpu_blocks
+            for req in self.gpu_decoding_q:
+                cur_batch.add_gdec(req)
+
+            # Try to launch a new prefill batch
+            while self.waiting_q:
+                cur_seq: Request = self.waiting_q[0]
+                cur_seq_block_needed = self._get_block_needed(cur_seq)
+                if  len(cur_batch)+1 <= self.engine_config.max_batch_size and \
+                    cur_batch_block_needed + cur_seq_block_needed <= self.engine_config.num_gpu_blocks and \
+                    cur_batch.perfdata.s + cur_seq.prompt_len <= self.engine_config.max_tokens_in_batch:
+                    cur_batch.add_pref(cur_seq, True)
+                    cur_batch_block_needed += cur_seq_block_needed
+                    self.waiting_q.popleft()  
+                else:
+                    # Strict FCFS
+                    break
+            if len(cur_batch):
+                # Going to launch a prefill batch
+                # If you want decoding requests to be piggybacked, you can do it here
+                for req in cur_batch.gprf_reqs:
+                    req.request_id = self.request_id_manager.get_id()
+                if len(cur_batch.gprf_reqs) > 0:
+                    logger.info(f"Waiting: {len(self.waiting_q)}, Prefs: {len(cur_batch.gprf_reqs)}, Gdecs: {len(self.gpu_decoding_q)}, Cdecs: {len(self.cpu_decoding_q)}")
+                self.gpu_decoding_q.extend(cur_batch.gprf_reqs)
+                self.num_decoding_gpu_blocks = cur_batch_block_needed
+                return [cur_batch], [], []
  
         newly_swapped_in = []
-        if newly_swapped_out:
-            self.cpu_decoding_q.extendleft(newly_swapped_out)
-        else:
+        if not newly_swapped_out:
             # No swap-out triggered, try to swap in some requests if possible
             while self.cpu_decoding_q:
                 cur_seq = self.cpu_decoding_q[0]
@@ -375,7 +374,7 @@ class Scheduler:
         cur_batch = SubBatch(self.predictor)
         for req in self.gpu_decoding_q:
             cur_batch.add_gdec(req)
-        return [cur_batch] if cur_batch else [], newly_swapped_out, newly_swapped_in
+        return ([cur_batch] if cur_batch else []), newly_swapped_out, newly_swapped_in
 
     def get_next_batch(self) -> tuple[list[SubBatch], list[Request], list[Request]]:
         """

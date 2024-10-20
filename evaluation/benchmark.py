@@ -5,6 +5,8 @@ import logging
 import json
 import random
 
+from tqdm import tqdm
+
 # pylint: disable=import-error
 from api_client import request_completions
 from server import start_server, stop_server
@@ -39,26 +41,32 @@ async def run_latency_test(
     rate: float
 ):
     res_file = f"{res_prefix}-lat-{str(rate).replace('.', '_')}.json"
-    
-    logger.info("Running latency test, saving results to %s", res_file)
-    
-    tasks = []
-    for prompt, output_len in zip(prompts, output_lens):
-        task = asyncio.create_task(request_completions_task(prompt, output_len))
-        tasks.append(task)
-        await asyncio.sleep(1 / rate)
-    times = await asyncio.gather(*tasks)
-    with open(res_file, "w") as f:
-        json.dump([{
-            "input_len": len(prompt),
-            "output_len": output_len,
-            "start": start,
-            "end": end
-        } for (start, end), prompt, output_len in zip(times, prompts, output_lens)], f, indent=4)
+
+    if os.path.exists(res_file):
+        logger.info("Latency test result file already exists: %s", res_file)
+        with open(res_file, "r") as f:
+            data = json.load(f)
+            times = [(d["start"], d["end"]) for d in data]
+    else:
+        logger.info("Running latency test, saving results to %s", res_file)
+        
+        tasks = []
+        for prompt, output_len in tqdm(zip(prompts, output_lens)):
+            task = asyncio.create_task(request_completions_task(prompt, output_len))
+            tasks.append(task)
+            await asyncio.sleep(1 / rate)
+        times = await asyncio.gather(*tasks)
+        with open(res_file, "w") as f:
+            json.dump([{
+                "input_len": len(prompt),
+                "output_len": output_len,
+                "start": start,
+                "end": end
+            } for (start, end), prompt, output_len in zip(times, prompts, output_lens)], f, indent=4)
 
     comp_times = [end - start for start, end in times]
     pertok_times = [comp_time / (len(prompt) + output_len) for comp_time, prompt, output_len in zip(comp_times, prompts, output_lens)]
-    average_completion_time = sum(times) / len(times)
+    average_completion_time = sum(comp_times) / len(comp_times)
     average_pertok_time = sum(pertok_times) / len(pertok_times)
     logger.info("Average completion time: %.3f s", average_completion_time)
     logger.info("Average per-token completion time: %.3f s", average_pertok_time)
@@ -126,16 +134,32 @@ def prepare_real_test(
     return prompts, output_lens, res_file
 
 
-async def main():
+async def one_round(name: str):
     global server_name
-    server_name = "vllm"
-    # start_server(server_name)
-    # await run_mock_throughput_test(1, [10] * 19900, 10)
-    # await run_throughput_test(*prepare_real_test("arxiv"))
-    await run_latency_test(*prepare_real_test("arxiv"), 0.18)
-    await run_latency_test(*prepare_real_test("arxiv"), 0.20)
-    await run_latency_test(*prepare_real_test("arxiv"), 0.22)
-    # stop_server()
+    server_name = name
+    start_server(server_name)
+    # await run_latency_test(*prepare_real_test("arxiv"), 0.14)
+    # if name == "ours":
+    #     await run_latency_test(*prepare_real_test("arxiv"), 0.18)
+    #     await run_latency_test(*prepare_real_test("arxiv"), 0.20)
+    #     await run_latency_test(*prepare_real_test("arxiv"), 0.22)
+    await run_throughput_test(*prepare_mock_test(2000, 2000, 50))
+    await run_throughput_test(*prepare_mock_test(2000, 2000, 100))
+    await run_throughput_test(*prepare_mock_test(2000, 2000, 200))
+    await run_throughput_test(*prepare_mock_test(2000, 1000, 50))
+    await run_throughput_test(*prepare_mock_test(2000, 1000, 100))
+    await run_throughput_test(*prepare_mock_test(2000, 1000, 200))
+    await run_throughput_test(*prepare_mock_test(2000, 500, 50))
+    await run_throughput_test(*prepare_mock_test(2000, 500, 100))
+    await run_throughput_test(*prepare_mock_test(2000, 500, 200))
+    stop_server()
+    await asyncio.sleep(10)
+
+
+async def main():
+    await one_round("base")
+    await one_round("ours")
+    # await one_round("vllm")
 
 
 if __name__ == "__main__":

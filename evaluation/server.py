@@ -47,26 +47,37 @@ def start_server(name: str):
                 stdout=f,
                 stderr=f
             )
-        elif name == "ours":
+        elif name == "ours" or name == "base":
             nl = config['num_layers']
+            if name == "base":
+                cmd=["--always-use-gpu"]
+                num_gpu_blocks_override = config["num_gpu_blocks_override"]
+                swap_space = config["swap_space"] // 8
+            else:
+                cmd=["--extra-layer-for-cprf"]
+                num_gpu_blocks_override = config["num_gpu_blocks_override"] * nl // (nl + 1)
+                swap_space = config["swap_space"]
+
+            cmd = [
+                "numactl", "-N", "0", "-m", "0",
+                sys.executable, "-m", "swiftllm.server.api_server",
+                "--port", "8000",
+                "--model-path", f"{home}/weights/{config['model']}/",
+                "--block-size", str(config["block_size"]),
+                "--max-blocks-per-seq", str((config["max_num_batched_tokens"] - 1) // config["block_size"] + 1),
+                "--max-seqs-in-block-table", str(config["max_num_seqs"]),
+                "--max-batch-size", str(config["max_num_seqs"]),
+                "--max-tokens-in-batch", str(config["max_num_batched_tokens"]),
+                "--tensor-parallel-degree", str(config["tensor_parallel_size"]),
+                # "--gpu-mem-utilization", str(config["gpu_memory_utilization"]),
+                "--num-gpu-blocks-override", str(num_gpu_blocks_override),
+                "--swap-space", str(swap_space),
+                "--library-path", f"{home}/pacpu/build/{config['library']}",
+                "--profile-result-path", f"{home}/swiftLLM/profile_results/",
+            ] + cmd
+
             server_proc = subprocess.Popen(
-                [
-                    "numactl", "-N", "0", "-m", "0",
-                    sys.executable, "-m", "swiftllm.server.api_server",
-                    "--port", "8000",
-                    "--model-path", f"{home}/weights/{config['model']}/",
-                    "--block-size", str(config["block_size"]),
-                    "--max-blocks-per-seq", str((config["max_num_batched_tokens"] - 1) // config["block_size"] + 1),
-                    "--max-seqs-in-block-table", str(config["max_num_seqs"]),
-                    "--max-batch-size", str(config["max_num_seqs"]),
-                    "--max-tokens-in-batch", str(config["max_num_batched_tokens"]),
-                    "--tensor-parallel-degree", str(config["tensor_parallel_size"]),
-                    # "--gpu-mem-utilization", str(config["gpu_memory_utilization"]),
-                    "--num-gpu-blocks-override", str(config["num_gpu_blocks_override"] * nl // (nl + 1)),
-                    "--swap-space", str(config["swap_space"]),
-                    "--library-path", f"{home}/pacpu/build/{config['library']}",
-                    "--profile-result-path", f"{home}/swiftLLM/profile_results/",
-                ], 
+                cmd, 
                 stdout=f,
                 stderr=f
             )
@@ -75,9 +86,9 @@ def start_server(name: str):
         
         pid = server_proc.pid
         logger.info("Server started with pid %d", pid)
-        for i in range(18):
+        for i in range(24 if name == "vllm" else 14):
             time.sleep(5)
-            logger.info("Server starting, %d s passed ..." % (i * 5))
+            logger.info("Server starting, %d s passed ...", (i * 5))
         logger.info("Server started")
 
 

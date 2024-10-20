@@ -38,7 +38,7 @@ class LlamaModelConfig:
         self.rank = None
         self.world_size = None
 
-    def get_kvslot_size(self, extra_layer: bool, dtype: torch.dtype = torch.float16) -> int:
+    def get_kvslot_size(self, extra_layer: bool = False, dtype: torch.dtype = torch.float16) -> int:
         """
         Get the size of one kv slot (the kv cache of one token) (in bytes)
         """
