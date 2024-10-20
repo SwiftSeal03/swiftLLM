@@ -34,7 +34,7 @@ def start_server(name: str):
                     "--tensor-parallel-size", str(config["tensor_parallel_size"]),
                     # "--gpu-memory-utilization", str(config["gpu_memory_utilization"]),
                     "--num-gpu-blocks-override", str(config["num_gpu_blocks_override"]),
-                    "--swap-space", str(config["swap_space"] / 2),
+                    "--swap-space", str(config["swap_space"] / config["tensor_parallel_size"]),
                     "--enforce-eager",
                     "--disable-custom-all-reduce",
                     "--disable-frontend-multiprocessing",
