@@ -5,6 +5,7 @@ import logging
 import json
 import random
 
+import numpy as np
 from tqdm import tqdm
 
 # pylint: disable=import-error
@@ -54,11 +55,13 @@ async def run_test(
         logger.info("Running test, saving results to %s", res_file)
         
         tasks = []
+        np.random.seed(0)
+        gaps = np.random.exponential(1 / rate, len(prompts)).tolist() if rate > 0 else [0] * len(prompts)
         for prompt, output_len in tqdm(zip(prompts, output_lens)):
             task = asyncio.create_task(request_completions_task(prompt, output_len))
             tasks.append(task)
             if rate > 0:
-                await asyncio.sleep(1 / rate)
+                await asyncio.sleep(gaps.pop(0))
         times = await asyncio.gather(*tasks)
         with open(res_file, "w") as f:
             json.dump([{
@@ -110,7 +113,7 @@ def prepare_real_test(
 ) -> tuple[list[list[int]], list[int], str]:
     input_file = f"{home}/neo-data/tokens/{dataset_name}-{config['model']}.json"
     with open(input_file, "r") as f:
-        datas = json.load(f)[:500]
+        datas = json.load(f)[:2000]
         prompts = [data["prompt"] for data in datas]
         output_lens = [data["max_tokens"] for data in datas]
         
@@ -122,27 +125,30 @@ async def one_round(name: str):
     global server_name
     server_name = name
     start_server(server_name)
-    # await run_latency_test(*prepare_real_test("arxiv"), 0.14)
     # if name == "ours":
-    #     await run_latency_test(*prepare_real_test("arxiv"), 0.18)
-    #     await run_latency_test(*prepare_real_test("arxiv"), 0.20)
-    #     await run_latency_test(*prepare_real_test("arxiv"), 0.22)
-    await run_test(*prepare_mock_test(2000, 2000, 50))
-    await run_test(*prepare_mock_test(2000, 2000, 100))
-    await run_test(*prepare_mock_test(2000, 2000, 200))
-    await run_test(*prepare_mock_test(2000, 1000, 50))
-    await run_test(*prepare_mock_test(2000, 1000, 100))
-    await run_test(*prepare_mock_test(2000, 1000, 200))
-    await run_test(*prepare_mock_test(2000, 500, 50))
-    await run_test(*prepare_mock_test(2000, 500, 100))
-    await run_test(*prepare_mock_test(2000, 500, 200))
+    #     await run_test(*prepare_real_test("arxiv"), 0.18)
+    #     await run_test(*prepare_real_test("arxiv"), 0.20)
+    #     await run_test(*prepare_real_test("arxiv"), 0.22)
+    # await run_test(*prepare_real_test("azure_code"))
+    await run_test(*prepare_real_test("azure_code"), 2.6)
+    await run_test(*prepare_real_test("azure_code"), 2.8)
+    await run_test(*prepare_real_test("azure_code"), 2.9)
+    # await run_test(*prepare_mock_test(2000, 2000, 50))
+    # await run_test(*prepare_mock_test(2000, 2000, 100))
+    # await run_test(*prepare_mock_test(2000, 2000, 200))
+    # await run_test(*prepare_mock_test(2000, 1000, 50))
+    # await run_test(*prepare_mock_test(2000, 1000, 100))
+    # await run_test(*prepare_mock_test(2000, 1000, 200))
+    # await run_test(*prepare_mock_test(2000, 500, 50))
+    # await run_test(*prepare_mock_test(2000, 500, 100))
+    # await run_test(*prepare_mock_test(2000, 500, 200))
     stop_server()
     await asyncio.sleep(10)
 
 
 async def main():
     await one_round("ours")
-    # await one_round("vllm")
+    await one_round("vllm")
     # await one_round("base")
 
 
