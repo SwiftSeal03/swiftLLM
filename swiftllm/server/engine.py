@@ -90,8 +90,6 @@ class AsyncEngine(Engine):
         self.tokenization_engine = None
 
         self.untokenized_raw_requests: list[tuple[Request, str]] = []
-        self.itr_end_times = []
-        self.ntoken_of_itr = []
         
 
     async def _run_on_model_executor_async(self, func, *args, **kwargs):
@@ -197,7 +195,7 @@ class AsyncEngine(Engine):
             batches, cur_swap_out, cur_swap_in = self.scheduler.get_next_batch()
             if not (len(batches) or len(cur_swap_in) or len(cur_swap_out)):
                 # Nothing to do, sleep for a bit
-                await asyncio.sleep(0.005)
+                await asyncio.sleep(0.001)
                 continue
 
             # Prepare model forward arguments
@@ -212,14 +210,6 @@ class AsyncEngine(Engine):
             # Deal with output tokens
             finished_reqs = self.block_manager.update_and_free(batches, output_token_ids)
             self.scheduler.remove_finished_requests(finished_reqs)
-            iter_end = time.perf_counter()
-
-            # logger.info(
-            #     f"Time: {iter_end-start:.3f}s, scheduler: {prepare_end-start:.3f}s, "
-            #     f"forward: {iter_end-prepare_end:.3f}s"
-            # )
-            self.itr_end_times.append(iter_end)
-            self.ntoken_of_itr.append(len(output_token_ids))
     
 
     async def start_all_event_loops(self):
