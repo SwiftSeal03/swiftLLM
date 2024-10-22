@@ -32,7 +32,7 @@ class EngineConfig:
     profile_result_path: str
 
     # Switches
-    extra_layer_for_cprf: bool          # Fixed after initialization
+    extra_layer_for_cprf: bool = False  # Fixed after initialization
     monitor_performance: bool = False   # Can be altered while running
     always_use_gpu: bool = False        # Can be altered while running
 
