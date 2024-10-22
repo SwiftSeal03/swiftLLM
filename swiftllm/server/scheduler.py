@@ -174,7 +174,7 @@ class Scheduler:
         # Step 2: adjust the number of prefilled sequences in gpu_only_batch
         while gpu_only_batch.get_num_prefs():
             req, is_gpu = gpu_only_batch.pop_pref()
-            if gpu_only_batch.perfdata.s < self.predictor.linr_S_threshold:
+            if is_gpu or gpu_only_batch.perfdata.s < self.predictor.linr_S_threshold:
                 gpu_only_batch.add_pref(req, is_gpu)
                 break
 
@@ -205,7 +205,7 @@ class Scheduler:
         # Step 4: reduce the number of prefilled sequences in the first batch if CPU is idle for too long
         while batches[0].get_num_prefs():
             req, is_gpu = batches[0].pop_pref()
-            if batches[0].perfdata.s < self.predictor.linr_S_threshold or min(self._get_remains(batches)) < 0:
+            if is_gpu or batches[0].perfdata.s < self.predictor.linr_S_threshold or min(self._get_remains(batches)) < 0:
                 batches[0].add_pref(req, is_gpu)
                 break
 
