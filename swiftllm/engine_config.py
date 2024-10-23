@@ -33,6 +33,7 @@ class EngineConfig:
 
     # Switches
     extra_layer_for_cprf: bool = False  # Fixed after initialization
+    disable_partial_offl: bool = False   # Fixed after initialization
     monitor_performance: bool = False   # Can be altered while running
     always_use_gpu: bool = False        # Can be altered while running
 
@@ -146,6 +147,11 @@ class EngineConfig:
             type=int,
             default=1,
             help="Degree of tensor parallelism",
+        )
+        parser.add_argument(
+            "--disable-partial-offl",
+            action="store_true",
+            help="Disable partial offloading",
         )
         parser.add_argument(
             "--always-use-gpu",

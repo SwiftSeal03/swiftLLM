@@ -49,14 +49,18 @@ def start_server(name: str):
                 stdout=f,
                 stderr=f
             )
-        elif name == "ours" or name == "base":
+        elif name == "ours" or name == "base" or name == "fsdc":
             nl = config['num_layers']
             if name == "base":
                 cmd=["--always-use-gpu"]
                 num_gpu_blocks_override = config["num_gpu_blocks_override"]
                 swap_space = config["swap_space"] // 8
-            else:
+            elif name == "ours":
                 cmd=["--extra-layer-for-cprf"]
+                num_gpu_blocks_override = config["num_gpu_blocks_override"] * nl // (nl + 1)
+                swap_space = config["swap_space"]
+            else:
+                cmd=["--disable-partial-offl", "--extra-layer-for-cprf"]
                 num_gpu_blocks_override = config["num_gpu_blocks_override"] * nl // (nl + 1)
                 swap_space = config["swap_space"]
 
