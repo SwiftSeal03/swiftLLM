@@ -129,27 +129,23 @@ async def one_round(name: str):
     #     await run_test(*prepare_real_test("arxiv"), 0.18)
     #     await run_test(*prepare_real_test("arxiv"), 0.20)
     #     await run_test(*prepare_real_test("arxiv"), 0.22)
-    # await run_test(*prepare_real_test("azure_code"))
-    await run_test(*prepare_real_test("azure_code"), 2.6)
-    await run_test(*prepare_real_test("azure_code"), 2.8)
-    await run_test(*prepare_real_test("azure_code"), 2.9)
-    # await run_test(*prepare_mock_test(2000, 2000, 50))
+    await run_test(*prepare_real_test("azure_code"))
+    # await run_test(*prepare_real_test("azure_code"), 2.8)
+    # await run_test(*prepare_real_test("azure_code"), 2.9)
+    # await run_test(*prepare_mock_test(2000, 1000, 75))
+    # await run_test(*prepare_mock_test(2000, 500, 25))
+    # await run_test(*prepare_mock_test(2000, 500, 75))
     # await run_test(*prepare_mock_test(2000, 2000, 100))
     # await run_test(*prepare_mock_test(2000, 2000, 200))
-    # await run_test(*prepare_mock_test(2000, 1000, 50))
-    # await run_test(*prepare_mock_test(2000, 1000, 100))
-    # await run_test(*prepare_mock_test(2000, 1000, 200))
-    # await run_test(*prepare_mock_test(2000, 500, 50))
-    # await run_test(*prepare_mock_test(2000, 500, 100))
-    # await run_test(*prepare_mock_test(2000, 500, 200))
     stop_server()
     await asyncio.sleep(10)
 
 
 async def main():
     await one_round("ours")
-    await one_round("vllm")
+    # await one_round("vllm")
     # await one_round("base")
+    # await one_round("fsdc")
 
 
 if __name__ == "__main__":
