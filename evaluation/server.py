@@ -18,14 +18,18 @@ def start_server(name: str):
     """
     # pylint: disable=global-statement
     global server_proc
-    with open(f"{home}/swiftLLM/evaluation/config.json") as f:
+    is_parallel_4 = name.endswith("_4")
+    config_file = "config" if not is_parallel_4 else "config_4"
+    with open(f"{home}/swiftLLM/evaluation/{config_file}.json") as f:
         config = json.load(f)
 
-    with open(f"{home}/swiftLLM/evaluation/server.log", "w") as f:
+    numacmd = ["numactl", "-N", "0", "-m", "0"] if is_parallel_4 else ["numactl", "-N", "0-1", "-m", "0-1"]
+    name = name.replace("_4", "")
+
+    with open(f"{home}/swiftLLM/evaluation/{name}-server.log", "w") as f:
         if name == "vllm":
             server_proc = subprocess.Popen(
-                [
-                    "numactl", "-N", "0", "-m", "0",
+                numacmd + [
                     "vllm", "serve", f"{home}/weights/{config['model']}/", "--port", "8000",
                     "--block-size", str(config["block_size"]),
                     "--max-model-len", str(config["max_model_len"]),
@@ -49,7 +53,7 @@ def start_server(name: str):
                 stdout=f,
                 stderr=f
             )
-        elif name == "ours" or name == "base" or name == "fsdc":
+        elif name == "ours" or name == "base" or name == "fsdc" or name == "ours_4":
             nl = config['num_layers']
             if name == "base":
                 cmd=["--always-use-gpu"]
@@ -63,9 +67,8 @@ def start_server(name: str):
                 cmd=["--disable-partial-offl", "--extra-layer-for-cprf"]
                 num_gpu_blocks_override = config["num_gpu_blocks_override"] * nl // (nl + 1)
                 swap_space = config["swap_space"]
-
-            cmd = [
-                "numactl", "-N", "0", "-m", "0",
+            
+            cmd = numacmd + [
                 sys.executable, "-m", "swiftllm.server.api_server",
                 "--port", "8000",
                 "--model-path", f"{home}/weights/{config['model']}/",
