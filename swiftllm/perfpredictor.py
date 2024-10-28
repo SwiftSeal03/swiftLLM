@@ -78,9 +78,12 @@ class TablePerfPredictor(PerfPredictor):
         engine_config: EngineConfig
     ):
         # Linr
-        self.linr_S_list = list(range(1, 512)) + \
-        list(range(512, engine_config.max_tokens_in_batch, 128)) + \
-        [engine_config.max_tokens_in_batch]
+        self.linr_S_list = list(range(1, 512)) + [
+            2 ** i for i in range(
+                9,
+                (engine_config.max_tokens_in_batch - 1).bit_length()
+            )
+        ] + [engine_config.max_tokens_in_batch]
         self.linr_T_list = None
         self.linr_S_lb_idx = self._get_lb_idx_list(self.linr_S_list)
         self.linr_S_threshold = 128 # NOTE: This is a heuristic value

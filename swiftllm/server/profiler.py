@@ -48,10 +48,10 @@ class ModelProfiler:
         self.bm = block_manager
         self.pp = TablePerfPredictor(engine_config)
 
-        self.pp.linr_T_list = self._profile_linr(self.pp.linr_S_list)
-        self.pp.pref_T_list = self._profile_pref(self.pp.pref_S_list)
-        self.pp.gdec_T_list = self._profile_gdec(self.pp.gdec_N_list)
-        self.pp.cdec_T_lists = self._profile_cdec(self.pp.cdec_S_list, self.pp.cdec_N_lists)
+        self.pp.linr_S_list, self.pp.linr_T_list = self._profile_linr(self.pp.linr_S_list)
+        self.pp.pref_S_list, self.pp.pref_T_list = self._profile_pref(self.pp.pref_S_list)
+        self.pp.gdec_N_list, self.pp.gdec_T_list = self._profile_gdec(self.pp.gdec_N_list)
+        self.pp.cdec_S_list, self.pp.cdec_N_lists, self.pp.cdec_T_lists = self._profile_cdec(self.pp.cdec_S_list, self.pp.cdec_N_lists)
       
 
     def _run_test_case_seq(
@@ -149,10 +149,8 @@ class ModelProfiler:
         if os.path.exists(result_path):
             with open(result_path, "r") as f:
                 table = json.load(f)
-            if table["S_list"] == S_list:
-                return table["T_list"]
             if table["S_list"][-1] >= S_list[-1]:
-                return table["T_list"]
+                return table["S_list"], table["T_list"]
         else:
             table = {
                 "S_list": [],
@@ -190,7 +188,7 @@ class ModelProfiler:
         plt.savefig(self.engine_config.profile_result_path + "linr.png")
         plt.close()
 
-        return T_list
+        return S_list, T_list
 
     def _profile_pref(
         self,
@@ -203,9 +201,9 @@ class ModelProfiler:
 
         if os.path.exists(result_path):
             with open(result_path, "r") as f:
-                res = json.load(f)
-            if res["S_list"] == S_list:
-                return res["T_list"]
+                table = json.load(f)
+            if table["S_list"][-1] >= S_list[-1]:
+                return table["S_list"], table["T_list"]
             
         print(f"Profiling prefill part with S_list={S_list}...")
 
@@ -233,7 +231,7 @@ class ModelProfiler:
             "T_list": T_list
             }, f, indent=2)
 
-        return T_list
+        return S_list, T_list
 
     def _profile_gdec(
         self,
@@ -247,10 +245,8 @@ class ModelProfiler:
         if os.path.exists(result_path):
             with open(result_path, "r") as f:
                 res = json.load(f)
-            if res["N_list"] == N_list:
-                return res["T_list"]
             if res["N_list"][-1] >= N_list[-1]:
-                return res["T_list"]
+                return res["N_list"], res["T_list"]
             
         print(f"Profiling GPU attention part with N_list={N_list} ...")
 
@@ -279,7 +275,7 @@ class ModelProfiler:
         plt.savefig(self.engine_config.profile_result_path + "gdec.png")
         plt.close()
 
-        return T_list
+        return N_list, T_list   
 
     def _profile_cdec(
         self,
@@ -294,10 +290,8 @@ class ModelProfiler:
         if os.path.exists(result_path):
             with open(result_path, "r") as f:
                 table = json.load(f)
-            if table["S_list"] == S_list and table["N_lists"] == N_lists:
-                return table["T_lists"]
             if table["S_list"][-1] >= S_list[-1] and table["N_lists"][-1][-1] >= N_lists[-1][-1]:
-                return table["T_lists"]
+                return table["S_list"], table["N_lists"], table["T_lists"]
             
         print(f"Profiling CPU attention part with S_list={S_list}, N_lists={N_lists} ...")
             
@@ -362,7 +356,7 @@ class ModelProfiler:
         plt.savefig(self.engine_config.profile_result_path + "cdec.png")
         plt.close()
 
-        return T_lists
+        return S_list, N_lists, T_lists
 
     def _profile_lnch(
         self,
@@ -432,7 +426,7 @@ class ModelProfiler:
 
             ws = self.engine_config.tensor_parallel_degree
 
-            # Synthesis a prefill batch
+            # Synthesize a prefill batch
             N = engine_config.max_tokens_in_batch
             S = engine_config.max_batch_size
             self._run_test_case_seq(

@@ -288,9 +288,7 @@ class Scheduler:
         cpu_block_needed = sum(self._get_block_needed(req) for req in self.cpu_decoding_q) # for bounding new prefillings
         for i, candidate in enumerate(self.waiting_q):
             cur_block_needed = self._get_block_needed(candidate)
-            if  itm_block_needed + cur_block_needed > self.num_itm_blocks or \
-                cpu_block_needed + cur_block_needed > cpu_threshold or \
-                self.request_id_manager.get_num_available_ids() < i or \
+            if  self.request_id_manager.get_num_available_ids() < i or \
                 not budget.check_and_substract(candidate.prompt_len):
                 break
             # The newly prefilled sequences are the major part of swapping out. Here we use a simple heuristic.
@@ -300,6 +298,11 @@ class Scheduler:
             if not pref_to_cpu and gpu_block_needed + cur_block_needed <= self.num_gpu_blocks:
                 gpu_block_needed += cur_block_needed
                 pref_to_gpu.append(candidate)
+                continue
+
+            if  itm_block_needed + cur_block_needed > self.num_itm_blocks or \
+                cpu_block_needed + cur_block_needed > cpu_threshold:
+                break
             else:
                 cpu_block_needed += cur_block_needed
                 itm_block_needed += cur_block_needed
