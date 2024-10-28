@@ -23,7 +23,7 @@ def start_server(name: str):
     with open(f"{home}/swiftLLM/evaluation/{config_file}.json") as f:
         config = json.load(f)
 
-    numacmd = ["numactl", "-N", "0", "-m", "0"] if is_parallel_4 else ["numactl", "-N", "0-1", "-m", "0-1"]
+    numacmd = ["numactl", "-N", "0", "-m", "0"] if not is_parallel_4 else ["numactl", "-N", "0-1", "-m", "0-1"]
     name = name.replace("_4", "")
 
     with open(f"{home}/swiftLLM/evaluation/{name}-server.log", "w") as f:
