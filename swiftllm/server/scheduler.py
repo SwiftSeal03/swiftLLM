@@ -255,6 +255,7 @@ class Scheduler:
         # swap_out_threshold = self.num_gpu_blocks
         swap_in_threshold = round(swap_out_threshold * 0.95)
         cpu_threshold = self.engine_config.num_cpu_blocks - self.engine_config.num_gpu_blocks
+        cpu_threshold = min(cpu_threshold, self.engine_config.num_cpu_blocks * 7 // 10)
         
         # Step 1: Try to launch as many GPU decoding requests as possible
         gpu_block_needed = sum(self._get_block_needed(req) for req in self.gpu_decoding_q)

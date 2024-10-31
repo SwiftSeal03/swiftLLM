@@ -5,7 +5,7 @@ Transformer layer utilities in the Llama model
 import time
 import torch
 import torch.distributed as dist
-import vllm_flash_attn_2_cuda as flash_attn_cuda
+# import vllm_flash_attn_2_cuda as flash_attn_cuda
 # import vllm_flash_attn
 
 # pylint: disable=no-name-in-module
@@ -28,6 +28,7 @@ from swiftllm.worker.kernels.linear import linear
 # from swiftllm.worker.kernels.silu_and_mul import silu_and_mul_inplace
 # from swiftllm.worker.kernels.rmsnorm import fused_add_rmsnorm_inplace
 from swiftllm.worker.kernels.paged_attn import paged_attention
+from swiftllm.worker.kernels.prefill_attn import prefill_attention
 
 class TransformerEvents:
     """
@@ -276,28 +277,28 @@ class LlamaTransformerLayer:
                 # Here the performance of vLLM's flash attention is better than us,
                 # so use vllm_flash_attn
             # pylint: disable=c-extension-no-member
-            flash_attn_cuda.varlen_fwd(
-                q[:batch.sum_pref_toks],
-                k[:batch.sum_pref_toks],
-                v[:batch.sum_pref_toks],
-                o[:batch.sum_pref_toks],
-                batch.pref_st_locs_we,
-                batch.pref_st_locs_we,
-                None,
-                None,  # block table
-                None,  # alibi slopes
-                batch.max_pref_toks,
-                batch.max_pref_toks,
-                0.0,
-                self.model_config.softmax_scale,
-                False,
-                True,  # causal
-                -1,    # window size 0
-                -1,    # window size 1
-                0.0,   # softcap
-                False, # return softmax
-                None
-            )
+            # flash_attn_cuda.varlen_fwd(
+            #     q[:batch.sum_pref_toks],
+            #     k[:batch.sum_pref_toks],
+            #     v[:batch.sum_pref_toks],
+            #     o[:batch.sum_pref_toks],
+            #     batch.pref_st_locs_we,
+            #     batch.pref_st_locs_we,
+            #     None,
+            #     None,  # block table
+            #     None,  # alibi slopes
+            #     batch.max_pref_toks,
+            #     batch.max_pref_toks,
+            #     0.0,
+            #     self.model_config.softmax_scale,
+            #     False,
+            #     True,  # causal
+            #     -1,    # window size 0
+            #     -1,    # window size 1
+            #     0.0,   # softcap
+            #     False, # return softmax
+            #     None
+            # )
             # o[:batch.sum_pref_toks, :] = vllm_flash_attn.flash_attn_varlen_func(
             #     q[:batch.sum_pref_toks],
             #     k[:batch.sum_pref_toks],
@@ -309,6 +310,10 @@ class LlamaTransformerLayer:
             #     softmax_scale=self.model_config.softmax_scale,
             #     causal=True
             # ).reshape(-1, self.model_config.hidden_size)
+            prefill_attention(
+                q, k, v, o[:batch.sum_pref_toks],
+                self.model_config, self.engine_config, batch
+            )
         events.pf_record("pref_e")
 
         # Actually we can further separate KV-cache storing for prefilling and decoding,
