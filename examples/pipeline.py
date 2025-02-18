@@ -48,7 +48,7 @@ if __name__ == '__main__':
         block_size = 16,
         gpu_mem_utilization = 0.99,
         num_gpu_blocks_override = 1300,
-        swap_space = 10,
+        swap_space = 2,
         max_seqs_in_block_table = 1024,
         max_blocks_per_seq = 512,
 
@@ -74,8 +74,8 @@ if __name__ == '__main__':
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
     tokenizer = AutoTokenizer.from_pretrained(model_path)
 
-    ngpu_prompts = 0
-    ncpu_prompts = 100
+    ngpu_prompts = 10
+    ncpu_prompts = 10
     nprompts = ncpu_prompts + ngpu_prompts
     with open(f"{home}/swiftLLM/examples/example.txt", "r") as f:
         prompt = ''.join(f.readlines())
@@ -109,7 +109,7 @@ if __name__ == '__main__':
 
     print("Prompt phase done")
 
-    engine.executor.turn_on_perf_monitor()
+    # engine.executor.turn_on_perf_monitor()
     for iteration in range(16):
         batches = [swiftllm.SubBatch() for _ in range(2)]
         for i in range(ngpu_prompts // 2):
@@ -120,10 +120,10 @@ if __name__ == '__main__':
             batches[1].add_gdec(reqs[i])
         for i in range(nprompts // 2 + ngpu_prompts // 2, nprompts):
             batches[0].add_cdec(reqs[i])
-        reqs.append(swiftllm.create_request(input_ids, len(reqs)))
-        reqs.append(swiftllm.create_request(input_ids, len(reqs)))
-        batches[0].add_pref(reqs[-2], is_gpu=False)
-        batches[1].add_pref(reqs[-1], is_gpu=False)
+        # reqs.append(swiftllm.create_request(input_ids, len(reqs)))
+        # reqs.append(swiftllm.create_request(input_ids, len(reqs)))
+        # batches[0].add_pref(reqs[-2], is_gpu=False)
+        # batches[1].add_pref(reqs[-1], is_gpu=False)
 
         start = time.perf_counter()
         engine.step(batches)
@@ -136,5 +136,5 @@ if __name__ == '__main__':
             print(f"{prompt}|{output_text}")
             print(reqs[i].output_token_ids)
 
-    res = engine.executor.turn_off_perf_monitor_and_flush_results()
-    print(res)
+    # res = engine.executor.turn_off_perf_monitor_and_flush_results()
+    # print(res)
