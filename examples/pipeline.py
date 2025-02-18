@@ -13,8 +13,8 @@ import swiftllm
 
 if __name__ == '__main__':
     home = os.path.expanduser("~")
-    tp = 2
-    nparam = 70
+    tp = 1
+    nparam = 8
     parser = argparse.ArgumentParser()
     parser.description = """
         An example script to demonstrate how to use the swiftllm model executor directly for inferencing without using the engine
@@ -29,7 +29,7 @@ if __name__ == '__main__':
         "--library-path",
         help="Path to the shared library",
         type=str,
-        default=f"{home}/pacpu/build/libpacpu-llama2_{nparam}b-tp{tp}.so"
+        default=f"{home}/pacpu/build/libpacpu-llama3_{nparam}b-tp{tp}.so"
     )
     parser.add_argument(
         "--profile-result-path",
@@ -74,14 +74,15 @@ if __name__ == '__main__':
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
     tokenizer = AutoTokenizer.from_pretrained(model_path)
 
-    ngpu_prompts = 20
-    ncpu_prompts = 20
+    ngpu_prompts = 0
+    ncpu_prompts = 100
     nprompts = ncpu_prompts + ngpu_prompts
     with open(f"{home}/swiftLLM/examples/example.txt", "r") as f:
         prompt = ''.join(f.readlines())
 
     # Prompt phase
     input_ids = tokenizer(prompt)['input_ids']
+    print("Prompt length: ", len(input_ids))
     reqs = [None] * nprompts
     gpu_req_ids = list(range(ngpu_prompts // 2)) + list(range(nprompts // 2, nprompts // 2 + ngpu_prompts // 2))
     gpu_reqs = []
@@ -121,8 +122,8 @@ if __name__ == '__main__':
             batches[0].add_cdec(reqs[i])
         reqs.append(swiftllm.create_request(input_ids, len(reqs)))
         reqs.append(swiftllm.create_request(input_ids, len(reqs)))
-        # batches[0].add_pref(reqs[-2], is_gpu=True)
-        # batches[1].add_pref(reqs[-1], is_gpu=True)
+        batches[0].add_pref(reqs[-2], is_gpu=False)
+        batches[1].add_pref(reqs[-1], is_gpu=False)
 
         start = time.perf_counter()
         engine.step(batches)

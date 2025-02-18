@@ -27,14 +27,18 @@ def start_server(name: str):
     name = name.replace("_4", "")
 
     with open(f"{home}/swiftLLM/evaluation/{name}-server.log", "w") as f:
-        if name == "vllm":
+        wait_time_intvs = 10
+        if name[:4] == "vllm":
+            wait_time_intvs = 10
+            chunk_size_str = name[4:] if name != "vllm" else str(config["num_gpu_blocks_override"] * config["block_size"])
+            max_num_seqs = min(int(chunk_size_str), config["max_num_seqs"])
             server_proc = subprocess.Popen(
                 numacmd + [
                     "vllm", "serve", f"{home}/weights/{config['model']}/", "--port", "8000",
                     "--block-size", str(config["block_size"]),
                     "--max-model-len", str(config["max_model_len"]),
-                    "--max-num-seqs", str(config["max_num_seqs"]),
-                    "--max-num-batched-tokens", str(config["num_gpu_blocks_override"] * config["block_size"]),
+                    "--max-num-seqs", str(max_num_seqs),
+                    "--max-num-batched-tokens", chunk_size_str,
                     "--tensor-parallel-size", str(config["tensor_parallel_size"]),
                     # "--gpu-memory-utilization", str(config["gpu_memory_utilization"]),
                     "--num-gpu-blocks-override", str(config["num_gpu_blocks_override"]),
@@ -46,14 +50,14 @@ def start_server(name: str):
                     "--disable-frontend-multiprocessing",
                     "--tokenizer-pool-size", "1",
                     "--enable-chunked-prefill",
-                    "--preemption-mode", "swap",
+                    "--preemption-mode", "recompute",
                     "--dtype", "float16"
                 ], 
                 env=os.environ | {"VLLM_ALLOW_LONG_MAX_MODEL_LEN": "1"},
                 stdout=f,
                 stderr=f
             )
-        elif name == "ours" or name == "base" or name == "fsdc" or name == "ours_4":
+        elif name in ["ours", "base", "fsdc", "ours_4"]:
             nl = config['num_layers']
             if name == "base":
                 cmd=["--always-use-gpu"]
@@ -95,7 +99,7 @@ def start_server(name: str):
         
         pid = server_proc.pid
         logger.info("Server started with pid %d", pid)
-        for i in range(24 if name == "vllm" else 14):
+        for i in range(wait_time_intvs):
             time.sleep(5)
             logger.info("Server starting, %d s passed ...", (i * 5))
         logger.info("Server started")
